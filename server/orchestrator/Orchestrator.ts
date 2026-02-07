@@ -523,6 +523,7 @@ export function createOrchestratorFromEnv(): Orchestrator {
     recvWindowMs: Number(process.env.BINANCE_RECV_WINDOW_MS || 5000),
     defaultMarginType: (String(process.env.DEFAULT_MARGIN_TYPE || 'ISOLATED').toUpperCase() === 'CROSSED' ? 'CROSSED' : 'ISOLATED'),
     defaultLeverage: Number(process.env.DEFAULT_SYMBOL_LEVERAGE || 20),
+    dualSidePosition: String(process.env.POSITION_MODE || 'ONE-WAY').toUpperCase() === 'HEDGE',
   });
 
   return new Orchestrator(connector, {

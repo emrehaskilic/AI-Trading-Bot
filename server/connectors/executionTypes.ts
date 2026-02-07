@@ -117,4 +117,5 @@ export interface ExecutionConnectorConfig {
   recvWindowMs: number;
   defaultMarginType?: MarginType;
   defaultLeverage?: number;
+  dualSidePosition?: boolean;
 }

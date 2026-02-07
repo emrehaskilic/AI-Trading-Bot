@@ -57,13 +57,13 @@ export interface ExecutionConnectorStatus {
 export interface ExecutionDebugEvent {
   channel: 'execution';
   type:
-    | 'order_attempt'
-    | 'order_result'
-    | 'order_error'
-    | 'request_debug'
-    | 'request_error'
-    | 'why_not_sent'
-    | 'readiness';
+  | 'order_attempt'
+  | 'order_result'
+  | 'order_error'
+  | 'request_debug'
+  | 'request_error'
+  | 'why_not_sent'
+  | 'readiness';
   order_attempt_id?: string;
   decision_id?: string;
   symbol?: string;
@@ -204,7 +204,7 @@ export class ExecutionConnector {
     try {
       await this.syncServerTimeOffset();
       await this.loadExchangeInfo();
-      await this.loadPositionMode();
+      await this.syncPositionMode();
       await this.startUserStream();
       this.reconnectMarketData();
       await this.syncState();
@@ -855,7 +855,7 @@ export class ExecutionConnector {
 
   private async ensureSymbolExecutionReady(symbol: string) {
     await this.loadExchangeInfo();
-    await this.loadPositionMode();
+    await this.syncPositionMode();
 
     const rules = this.symbolRules.get(symbol);
     if (!rules) {
@@ -926,13 +926,37 @@ export class ExecutionConnector {
     this.exchangeInfoLoaded = true;
   }
 
-  private async loadPositionMode() {
+  private async syncPositionMode() {
+    // 1. Get current mode
     const response = await this.signedRequest({
       path: '/fapi/v1/positionSide/dual',
       method: 'GET',
       requiresAuth: true,
     });
-    this.dualSidePosition = String(response?.dualSidePosition) === 'true';
+    const current = String(response?.dualSidePosition) === 'true';
+
+    // 2. Decide target (prefer config, default to false/One-Way for this bot)
+    const target = this.config.dualSidePosition !== undefined ? this.config.dualSidePosition : false;
+
+    if (current !== target) {
+      console.log(`[CONNECTOR] Mismatch in Position Mode: Account is ${current ? 'Hedge' : 'One-Way'}, Bot wants ${target ? 'Hedge' : 'One-Way'}. Attempting to switch...`);
+      try {
+        await this.signedRequest({
+          path: '/fapi/v1/positionSide/dual',
+          method: 'POST',
+          params: { dualSidePosition: String(target) },
+          requiresAuth: true,
+        });
+        this.dualSidePosition = target;
+        console.log(`[CONNECTOR] Successfully switched to ${target ? 'Hedge' : 'One-Way'} mode.`);
+      } catch (e: any) {
+        console.warn(`[CONNECTOR] Failed to switch position mode: ${e.message}. Bot will proceed with current account mode: ${current ? 'Hedge' : 'One-Way'}`);
+        this.dualSidePosition = current;
+      }
+    } else {
+      this.dualSidePosition = current;
+    }
+
     this.emitStatus();
   }
 
