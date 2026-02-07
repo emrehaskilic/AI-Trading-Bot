@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { GateResult, OrchestratorMetricsInput } from './types';
 
 type LogKind = 'metrics' | 'execution' | 'decision';
 
@@ -8,6 +9,14 @@ type QueueItem = {
   eventTimeMs: number;
   payload: any;
 };
+
+export interface MetricsLogLine {
+  canonical_time_ms: number;
+  exchange_event_time_ms: number | null;
+  symbol: string;
+  gate: GateResult;
+  metrics: OrchestratorMetricsInput;
+}
 
 export interface OrchestratorLoggerConfig {
   dir: string;
@@ -33,8 +42,8 @@ export class OrchestratorLogger {
     }, 10_000);
   }
 
-  logMetrics(eventTimeMs: number, payload: any) {
-    this.enqueue({ kind: 'metrics', eventTimeMs, payload });
+  logMetrics(payload: MetricsLogLine) {
+    this.enqueue({ kind: 'metrics', eventTimeMs: payload.canonical_time_ms, payload });
   }
 
   logExecution(eventTimeMs: number, payload: any) {

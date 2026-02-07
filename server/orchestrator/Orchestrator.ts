@@ -117,7 +117,7 @@ export class Orchestrator {
     };
 
     if (shouldLog) {
-      this.logger.logMetrics(canonical_time_ms, {
+      this.logger.logMetrics({
         canonical_time_ms,
         exchange_event_time_ms,
         symbol,
