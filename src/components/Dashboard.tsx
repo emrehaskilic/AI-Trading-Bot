@@ -82,10 +82,10 @@ export const Dashboard: React.FC = () => {
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
   // Settings inputs - initialize with defaults, only update from server on first load/explicit sync
-  const [initialBalanceUsdt, setInitialBalanceUsdt] = useState<number>(1000);
-  const [walletUsagePercent, setWalletUsagePercent] = useState<number>(10);
-  const [leverage, setLeverage] = useState<number>(10);
-  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [initialBalanceInput, setInitialBalanceInput] = useState<string>('1000');
+  const [walletUsageInput, setWalletUsageInput] = useState<string>('10');
+  const [leverageInput, setLeverageInput] = useState<string>('10');
+  const settingsLoadedRef = React.useRef(false);
 
   const [executionStatus, setExecutionStatus] = useState<ExecutionStatus>(defaultExecutionStatus);
 
@@ -123,11 +123,11 @@ export const Dashboard: React.FC = () => {
         setExecutionStatus(data);
 
         // Sync local settings only if not yet loaded (prevents overwrite while typing)
-        if (!settingsLoaded && data.settings) {
-          setInitialBalanceUsdt(data.settings.initialBalanceUsdt);
-          setWalletUsagePercent(data.settings.walletUsagePercent);
-          setLeverage(data.settings.leverage);
-          setSettingsLoaded(true);
+        if (!settingsLoadedRef.current && data.settings) {
+          setInitialBalanceInput(String(data.settings.initialBalanceUsdt));
+          setWalletUsageInput(String(data.settings.walletUsagePercent));
+          setLeverageInput(String(data.settings.leverage));
+          settingsLoadedRef.current = true;
 
           // Also sync selected symbols if server has them
           if (data.selectedSymbols && data.selectedSymbols.length > 0) {
@@ -280,11 +280,21 @@ export const Dashboard: React.FC = () => {
     const res = await fetch(`${proxyUrl}/api/execution/settings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ initialBalanceUsdt, walletUsagePercent, leverage }),
+      body: JSON.stringify({
+        initialBalanceUsdt: Number(initialBalanceInput) || 1000,
+        walletUsagePercent: Number(walletUsageInput) || 10,
+        leverage: Number(leverageInput) || 1
+      }),
     });
     const data = await res.json();
     if (res.ok) {
       setExecutionStatus(data.status as ExecutionStatus);
+      // Update inputs to reflect any server-side clamping/validation results
+      if (data.settings) {
+        setInitialBalanceInput(String(data.settings.initialBalanceUsdt));
+        setWalletUsageInput(String(data.settings.walletUsagePercent));
+        setLeverageInput(String(data.settings.leverage));
+      }
     }
   };
 
@@ -416,11 +426,29 @@ export const Dashboard: React.FC = () => {
           <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4 space-y-3">
             <h2 className="text-sm font-semibold text-zinc-300">Risk & Capital</h2>
             <label className="text-xs text-zinc-400 block">Initial Balance (USDT)</label>
-            <input type="number" value={initialBalanceUsdt} onChange={(e) => setInitialBalanceUsdt(Number(e.target.value || 0))} className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm" />
+            <input
+              type="number"
+              value={initialBalanceInput}
+              onChange={(e) => setInitialBalanceInput(e.target.value)}
+              className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm"
+            />
             <label className="text-xs text-zinc-400 block">Wallet Usage (%)</label>
-            <input type="number" min={0} max={100} value={walletUsagePercent} onChange={(e) => setWalletUsagePercent(Number(e.target.value || 0))} className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm" />
+            <input
+              type="number"
+              min={0}
+              max={100}
+              value={walletUsageInput}
+              onChange={(e) => setWalletUsageInput(e.target.value)}
+              className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm"
+            />
             <label className="text-xs text-zinc-400 block">Leverage (no hard cap, env MAX_LEVERAGE applies)</label>
-            <input type="number" min={1} value={leverage} onChange={(e) => setLeverage(Number(e.target.value || 1))} className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm" />
+            <input
+              type="number"
+              min={1}
+              value={leverageInput}
+              onChange={(e) => setLeverageInput(e.target.value)}
+              className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm"
+            />
             <button onClick={saveSettings} className="w-full px-3 py-2 bg-emerald-700 hover:bg-emerald-600 rounded text-xs font-semibold">Apply Settings</button>
           </div>
         </div>
