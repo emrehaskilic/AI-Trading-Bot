@@ -1,9 +1,13 @@
 import { DecisionAction, GateResult, OrchestratorMetricsInput, SymbolState } from './types';
+import { hardStopTriggered } from './HardStopGuard';
+import { liquidationRiskTriggered } from './LiquidationGuard';
 
 export interface DecisionDependencies {
   expectedPrice: (symbol: string, side: 'BUY' | 'SELL', type: 'MARKET' | 'LIMIT', limitPrice?: number) => number | null;
   getRiskPerTradePercent: () => number;
   getMaxLeverage: () => number;
+  hardStopLossPct: number;
+  liquidationEmergencyMarginRatio: number;
 }
 
 export class DecisionEngine {
@@ -27,8 +31,18 @@ export class DecisionEngine {
     const cvdSlope = metrics.legacyMetrics?.cvdSlope as number;
     const obiDeep = metrics.legacyMetrics?.obiDeep as number;
     const printsPerSecond = metrics.prints_per_second as number;
+    const freezeActive = state.execQuality.freezeActive;
 
     const inCooldown = event_time_ms < state.cooldown_until_ms;
+    const liquidationTriggered = liquidationRiskTriggered(state, {
+      emergencyMarginRatio: this.deps.liquidationEmergencyMarginRatio,
+    });
+    const hardStop = hardStopTriggered(state, { maxLossPct: this.deps.hardStopLossPct });
+    const emergencyReason = liquidationTriggered
+      ? 'emergency_exit_liquidation_risk'
+      : hardStop
+      ? 'emergency_exit_hard_stop'
+      : null;
 
     if (state.halted && state.hasOpenEntryOrder) {
       actions.push({
@@ -40,7 +54,7 @@ export class DecisionEngine {
     }
 
     if (state.position === null) {
-      if (!state.halted && !state.hasOpenEntryOrder && state.openOrders.size === 0 && !inCooldown) {
+      if (!state.halted && !freezeActive && !state.hasOpenEntryOrder && state.openOrders.size === 0 && !inCooldown) {
         const side = deltaZ > 0 ? 'BUY' : deltaZ < 0 ? 'SELL' : null;
         if (side) {
           const price = this.deps.expectedPrice(symbol, side, 'MARKET');
@@ -50,7 +64,7 @@ export class DecisionEngine {
               expectedPrice: price,
               deltaZ,
               obiDeep,
-              execPoor: state.execQuality.poor,
+              execPoor: state.execQuality.quality === 'BAD',
             });
 
             if (probeQuantity > 0) {
@@ -68,10 +82,21 @@ export class DecisionEngine {
           }
         }
       }
-      return actions.length > 0 ? actions : [{ type: 'NOOP', symbol, event_time_ms, reason: state.halted ? 'halt_mode' : inCooldown ? 'cooldown' : 'flat_wait' }];
+      return actions.length > 0
+        ? actions
+        : [{ type: 'NOOP', symbol, event_time_ms, reason: state.halted ? 'halt_mode' : freezeActive ? 'freeze_active' : inCooldown ? 'cooldown' : 'flat_wait' }];
     }
 
     const position = state.position;
+
+    if (emergencyReason) {
+      actions.push(this.exitAction(symbol, event_time_ms, position.side === 'LONG' ? 'SELL' : 'BUY', emergencyReason));
+      return actions;
+    }
+
+    if (freezeActive) {
+      return actions.length > 0 ? actions : [{ type: 'NOOP', symbol, event_time_ms, reason: 'freeze_active' }];
+    }
 
     const pnlDrawdown = position.peakPnlPct - position.unrealizedPnlPct;
     if (position.peakPnlPct > 0.5 && pnlDrawdown > 0.2) {
@@ -86,15 +111,11 @@ export class DecisionEngine {
       actions.push(this.exitAction(symbol, event_time_ms, 'BUY', 'reversal_exit_short'));
     }
 
-    if (state.execQuality.poor && state.execQuality.recentLatencyMs.length >= 3) {
-      actions.push(this.exitAction(symbol, event_time_ms, position.side === 'LONG' ? 'SELL' : 'BUY', 'emergency_exit_exec_quality'));
-    }
-
     const canAdd =
       !state.halted &&
       position.addsUsed < 2 &&
       position.unrealizedPnlPct > 0.10 &&
-      !state.execQuality.poor &&
+      state.execQuality.quality === 'GOOD' &&
       ((position.side === 'LONG' && deltaZ > 0) || (position.side === 'SHORT' && deltaZ < 0));
 
     if (canAdd) {
@@ -102,12 +123,12 @@ export class DecisionEngine {
       const price = this.deps.expectedPrice(symbol, side, 'MARKET');
       if (price && price > 0) {
         const qty = this.computeProbeQuantity({
-          availableBalance: state.availableBalance,
-          expectedPrice: price,
-          deltaZ,
-          obiDeep,
-          execPoor: state.execQuality.poor,
-        });
+            availableBalance: state.availableBalance,
+            expectedPrice: price,
+            deltaZ,
+            obiDeep,
+            execPoor: state.execQuality.quality === 'BAD',
+          });
         if (qty > 0) {
           actions.push({
             type: 'ADD_POSITION',

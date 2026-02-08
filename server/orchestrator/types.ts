@@ -81,8 +81,15 @@ export interface PositionState {
   peakPnlPct: number;
 }
 
+export type ExecQualityLevel = 'GOOD' | 'BAD' | 'UNKNOWN';
+
 export interface ExecutionQualityState {
-  poor: boolean;
+  quality: ExecQualityLevel;
+  metricsPresent: boolean;
+  freezeActive: boolean;
+  lastLatencyMs: number | null;
+  lastSlippageBps: number | null;
+  lastSpreadPct: number | null;
   recentLatencyMs: number[];
   recentSlippageBps: number[];
 }
@@ -97,6 +104,7 @@ export interface SymbolState {
   hasOpenEntryOrder: boolean;
   cooldown_until_ms: number;
   last_exit_event_time_ms: number;
+  marginRatio: number | null;
   execQuality: ExecutionQualityState;
 }
 
@@ -125,6 +133,15 @@ export interface DecisionRecord {
   exchange_event_time_ms: number | null;
   gate: GateResult;
   actions: DecisionAction[];
+  execution_mode: 'NORMAL' | 'DEGRADED' | 'FREEZE';
+  exec_quality: ExecQualityLevel;
+  exec_metrics_present: boolean;
+  freeze_active: boolean;
+  emergency_exit_allowed: boolean;
+  emergency_exit_allowed_reason: string | null;
+  invariant_violated: boolean;
+  invariant_reason: string | null;
+  data_gaps: string[];
   stateSnapshot: {
     halted: boolean;
     availableBalance: number;
@@ -139,6 +156,8 @@ export interface OrchestratorConfig {
   gate: GateConfig;
   riskPerTradePercent: number;
   maxLeverage: number;
+  hardStopLossPct: number;
+  liquidationEmergencyMarginRatio: number;
   cooldownMinMs: number;
   cooldownMaxMs: number;
   loggerQueueLimit: number;

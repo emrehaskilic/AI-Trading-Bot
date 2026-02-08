@@ -23,21 +23,27 @@ export class Orchestrator {
   private readonly expectedByOrderId = new Map<string, { expectedPrice: number | null; sentAtMs: number; tag: 'entry' | 'add' | 'exit' }>();
   private readonly decisionLedger: DecisionRecord[] = [];
   private readonly executionSymbols = new Set<string>();
+  private readonly realizedPnlBySymbol = new Map<string, number>();
+
   private capitalSettings = {
     initialBalanceUsdt: 1000,
     walletUsagePercent: 10,
     leverage: 10,
   };
-  private readonly realizedPnlBySymbol = new Map<string, number>();
 
   constructor(
     private readonly connector: ExecutionConnector,
     private readonly config: OrchestratorConfig
   ) {
+    this.capitalSettings.walletUsagePercent = config.riskPerTradePercent;
+    this.capitalSettings.leverage = Math.min(this.capitalSettings.leverage, config.maxLeverage);
+
     this.decisionEngine = new DecisionEngine({
       expectedPrice: (symbol, side, type, limitPrice) => this.connector.expectedPrice(symbol, side, type, limitPrice),
       getRiskPerTradePercent: () => this.capitalSettings.walletUsagePercent,
       getMaxLeverage: () => this.capitalSettings.leverage,
+      hardStopLossPct: this.config.hardStopLossPct,
+      liquidationEmergencyMarginRatio: this.config.liquidationEmergencyMarginRatio,
     });
 
     this.logger = new OrchestratorLogger({
@@ -63,6 +69,7 @@ export class Orchestrator {
       }
       this.ingestExecutionReplay(event);
     });
+
     this.connector.onDebug((event) => {
       this.logger.logExecution(event.ts, event);
     });
@@ -77,6 +84,7 @@ export class Orchestrator {
     if (this.executionSymbols.size > 0 && !this.executionSymbols.has(symbol)) {
       return;
     }
+
     this.connector.ensureSymbol(symbol);
 
     const canonical_time_ms = metrics.canonical_time_ms ?? Date.now();
@@ -108,6 +116,7 @@ export class Orchestrator {
     if (this.executionSymbols.size > 0 && !this.executionSymbols.has(symbol)) {
       return;
     }
+
     this.connector.ensureSymbol(symbol);
     this.enqueueMetrics(
       symbol,
@@ -154,6 +163,7 @@ export class Orchestrator {
     if (this.executionSymbols.size > 0 && !this.executionSymbols.has(symbol)) {
       return;
     }
+
     this.connector.ensureSymbol(symbol);
 
     const envelope: ExecutionEventEnvelope = {
@@ -167,7 +177,6 @@ export class Orchestrator {
   }
 
   async flush() {
-    // Wait until all actor queues are drained.
     while (Array.from(this.actors.values()).some((a) => !a.isIdle())) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
@@ -199,7 +208,12 @@ export class Orchestrator {
         openOrders: new Map(st.openOrders),
         position: st.position ? { ...st.position } : null,
         execQuality: {
-          poor: st.execQuality.poor,
+          quality: st.execQuality.quality,
+          metricsPresent: st.execQuality.metricsPresent,
+          freezeActive: st.execQuality.freezeActive,
+          lastLatencyMs: st.execQuality.lastLatencyMs,
+          lastSlippageBps: st.execQuality.lastSlippageBps,
+          lastSpreadPct: st.execQuality.lastSpreadPct,
           recentLatencyMs: [...st.execQuality.recentLatencyMs],
           recentSlippageBps: [...st.execQuality.recentSlippageBps],
         },
@@ -211,37 +225,47 @@ export class Orchestrator {
   getExecutionStatus() {
     const connectorStatus = this.connector.getStatus();
     const selectedSymbols = Array.from(this.executionSymbols);
-    const primarySymbol = selectedSymbols[0] || null; // Legacy support
+    const primarySymbol = selectedSymbols[0] || null;
 
-    // Aggregated PnL
     let totalRealized = 0;
     let totalUnrealized = 0;
     let totalWallet = 0;
     let totalAvailable = 0;
-
-    // We can get wallet balance from any actor state if available, or just use the first valid one
-    // Ideally, wallet balance is account-wide.
     let walletFound = false;
 
-    if (this.executionSymbols.size > 0) {
-      for (const sym of this.executionSymbols) {
-        const state = this.actors.get(sym)?.state;
-        if (state) {
-          if (!walletFound) {
-            totalWallet = state.walletBalance;
-            totalAvailable = state.availableBalance;
-            walletFound = true;
-          }
-          totalRealized += (this.realizedPnlBySymbol.get(sym) || 0);
-          totalUnrealized += (state.position?.unrealizedPnlPct || 0);
-        }
+    for (const sym of selectedSymbols) {
+      const state = this.actors.get(sym)?.state;
+      if (!state) {
+        continue;
       }
+      if (!walletFound) {
+        totalWallet = state.walletBalance;
+        totalAvailable = state.availableBalance;
+        walletFound = true;
+      }
+      totalRealized += this.realizedPnlBySymbol.get(sym) || 0;
+      totalUnrealized += state.position?.unrealizedPnlPct || 0;
     }
+
+    const openPositions = selectedSymbols.reduce((acc, sym) => {
+      const pos = this.actors.get(sym)?.state.position;
+      if (pos) {
+        acc[sym] = {
+          side: pos.side,
+          size: pos.qty,
+          entryPrice: pos.entryPrice,
+          leverage: this.capitalSettings.leverage,
+        };
+      }
+      return acc;
+    }, {} as Record<string, { side: 'LONG' | 'SHORT'; size: number; entryPrice: number; leverage: number }>);
+
+    const primaryPosition = primarySymbol ? openPositions[primarySymbol] || null : null;
 
     return {
       connection: connectorStatus,
-      selectedSymbol: primarySymbol, // Legacy
-      selectedSymbols, // New
+      selectedSymbol: primarySymbol,
+      selectedSymbols,
       settings: this.capitalSettings,
       wallet: {
         totalWalletUsdt: totalWallet,
@@ -250,24 +274,8 @@ export class Orchestrator {
         unrealizedPnl: totalUnrealized,
         totalPnl: totalRealized + totalUnrealized,
       },
-      openPosition: primarySymbol ? (this.actors.get(primarySymbol)?.state?.position ? {
-        side: this.actors.get(primarySymbol)!.state.position!.side,
-        size: this.actors.get(primarySymbol)!.state.position!.qty,
-        entryPrice: this.actors.get(primarySymbol)!.state.position!.entryPrice,
-        leverage: this.capitalSettings.leverage,
-      } : null) : null,
-      openPositions: selectedSymbols.reduce((acc, sym) => {
-        const pos = this.actors.get(sym)?.state.position;
-        if (pos) {
-          acc[sym] = {
-            side: pos.side,
-            size: pos.qty,
-            entryPrice: pos.entryPrice,
-            leverage: this.capitalSettings.leverage
-          };
-        }
-        return acc;
-      }, {} as any)
+      openPosition: primaryPosition,
+      openPositions,
     };
   }
 
@@ -295,22 +303,7 @@ export class Orchestrator {
 
   async disconnectExecution() {
     for (const symbol of this.executionSymbols) {
-      try {
-        await this.connector.cancelAllOpenOrders(symbol);
-      } catch (e: any) {
-        // Best effort
-        this.logger.logExecution(Date.now(), {
-          event_time_ms: Date.now(),
-          symbol,
-          event: {
-            type: 'ERROR',
-            symbol,
-            event_time_ms: Date.now(),
-            error: 'Disconnect cancel failed: ' + (e.message || String(e))
-          } as any, // Cast to any because ERROR type might not be fully defined in ExecutionTypes or similar
-          state: this.actors.get(symbol)?.state as any
-        });
-      }
+      await this.connector.cancelAllOpenOrders(symbol);
     }
     await this.connector.disconnect();
   }
@@ -320,10 +313,9 @@ export class Orchestrator {
   }
 
   async setExecutionSymbols(symbols: string[]) {
-    const normalized = symbols.map(s => s.toUpperCase());
+    const normalized = symbols.map((s) => s.toUpperCase());
     const newSet = new Set(normalized);
 
-    // Identify removed symbols
     for (const existing of this.executionSymbols) {
       if (!newSet.has(existing)) {
         await this.connector.cancelAllOpenOrders(existing);
@@ -333,10 +325,9 @@ export class Orchestrator {
     }
 
     this.executionSymbols.clear();
-    for (const s of newSet) {
-      this.executionSymbols.add(s);
-      // Pre-create actor so it receives sync events
-      this.getActor(s);
+    for (const symbol of newSet) {
+      this.executionSymbols.add(symbol);
+      this.getActor(symbol);
     }
 
     this.connector.setSymbols(normalized);
@@ -356,13 +347,38 @@ export class Orchestrator {
       onActions: async (actions) => {
         await this.executeActions(symbol, actions);
       },
-      onDecisionLogged: ({ symbol: s, canonical_time_ms, exchange_event_time_ms, gate, actions, state }) => {
+      onDecisionLogged: ({
+        symbol: s,
+        canonical_time_ms,
+        exchange_event_time_ms,
+        gate,
+        actions,
+        executionMode,
+        execQuality,
+        execMetricsPresent,
+        freezeActive,
+        emergencyExitAllowed,
+        emergencyExitAllowedReason,
+        invariantViolated,
+        invariantReason,
+        dataGaps,
+        state,
+      }) => {
         const record: DecisionRecord = {
           symbol: s,
           canonical_time_ms,
           exchange_event_time_ms,
           gate,
           actions,
+          execution_mode: executionMode,
+          exec_quality: execQuality,
+          exec_metrics_present: execMetricsPresent,
+          freeze_active: freezeActive,
+          emergency_exit_allowed: emergencyExitAllowed,
+          emergency_exit_allowed_reason: emergencyExitAllowedReason,
+          invariant_violated: invariantViolated,
+          invariant_reason: invariantReason,
+          data_gaps: dataGaps,
           stateSnapshot: {
             halted: state.halted,
             availableBalance: state.availableBalance,
@@ -379,6 +395,7 @@ export class Orchestrator {
         if (!this.connector.isExecutionEnabled()) {
           return;
         }
+
         this.logger.logExecution(event.event_time_ms, {
           event_time_ms: event.event_time_ms,
           symbol: event.symbol,
@@ -392,12 +409,13 @@ export class Orchestrator {
             openOrders: Array.from(state.openOrders.values()),
             position: state.position,
             execQuality: state.execQuality,
+            marginRatio: state.marginRatio,
           },
         });
       },
       getExpectedOrderMeta: (orderId) => this.expectedByOrderId.get(orderId) || null,
       markAddUsed: () => {
-        // kept for future hook extensions
+        // no-op
       },
       cooldownConfig: {
         minMs: this.config.cooldownMinMs,
@@ -411,9 +429,11 @@ export class Orchestrator {
 
   private async executeActions(symbol: string, actions: DecisionAction[]) {
     const actor = this.getActor(symbol);
+
     for (const action of actions) {
       const decisionId = `${symbol}_${action.event_time_ms}`;
       const orderAttemptId = `${decisionId}_${action.type}`;
+
       if (action.type === 'NOOP') {
         continue;
       }
@@ -458,15 +478,20 @@ export class Orchestrator {
         if (!position || !action.side) {
           continue;
         }
+
         const clientOrderId = this.clientOrderId('exit', symbol, action.event_time_ms);
-        const response = await this.connector.placeOrder({
-          symbol,
-          side: action.side,
-          type: 'MARKET',
-          quantity: position.qty,
-          reduceOnly: true,
-          clientOrderId,
-        }, { decisionId, orderAttemptId });
+        const response = await this.connector.placeOrder(
+          {
+            symbol,
+            side: action.side,
+            type: 'MARKET',
+            quantity: position.qty,
+            reduceOnly: true,
+            clientOrderId,
+          },
+          { decisionId, orderAttemptId }
+        );
+
         this.expectedByOrderId.set(response.orderId, {
           expectedPrice: action.expectedPrice || null,
           sentAtMs: action.event_time_ms,
@@ -478,24 +503,24 @@ export class Orchestrator {
       if ((action.type === 'ENTRY_PROBE' || action.type === 'ADD_POSITION') && action.side && action.quantity && action.quantity > 0) {
         const tag = action.type === 'ENTRY_PROBE' ? 'entry' : 'add';
         const clientOrderId = this.clientOrderId(tag, symbol, action.event_time_ms);
-        try {
-          const response = await this.connector.placeOrder({
+
+        const response = await this.connector.placeOrder(
+          {
             symbol,
             side: action.side,
             type: 'MARKET',
             quantity: action.quantity,
             reduceOnly: false,
             clientOrderId,
-          }, { decisionId, orderAttemptId });
+          },
+          { decisionId, orderAttemptId }
+        );
 
-          this.expectedByOrderId.set(response.orderId, {
-            expectedPrice: action.expectedPrice || null,
-            sentAtMs: action.event_time_ms,
-            tag,
-          });
-        } catch (e: any) {
-          console.error(`[EXEC] Order FAILED:`, e.message || e);
-        }
+        this.expectedByOrderId.set(response.orderId, {
+          expectedPrice: action.expectedPrice || null,
+          sentAtMs: action.event_time_ms,
+          tag,
+        });
       }
     }
   }
@@ -535,6 +560,8 @@ export function createOrchestratorFromEnv(): Orchestrator {
     },
     riskPerTradePercent: Number(process.env.RISK_PER_TRADE_PERCENT || 0.5),
     maxLeverage: Number(process.env.MAX_LEVERAGE || 100),
+    hardStopLossPct: Number(process.env.HARD_STOP_LOSS_PCT || 1.0),
+    liquidationEmergencyMarginRatio: Number(process.env.LIQUIDATION_EMERGENCY_MARGIN_RATIO || 0.30),
     cooldownMinMs: Number(process.env.COOLDOWN_MIN_MS || 2000),
     cooldownMaxMs: Number(process.env.COOLDOWN_MAX_MS || 30000),
     loggerQueueLimit: Number(process.env.LOGGER_QUEUE_LIMIT || 5000),

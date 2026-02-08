@@ -1,8 +1,11 @@
 import { ExecutionEvent } from '../connectors/executionTypes';
 import { DecisionEngine } from './Decision';
+import { assessFreezeFromExecQuality } from './FreezeController';
+import { ExecQualityLevel } from './types';
 import {
   ActorEnvelope,
   DecisionAction,
+  GateMode,
   MetricsEventEnvelope,
   OpenOrderState,
   SymbolState,
@@ -18,6 +21,15 @@ export interface SymbolActorDeps {
     exchange_event_time_ms: number | null;
     gate: MetricsEventEnvelope['gate'];
     actions: DecisionAction[];
+    executionMode: 'NORMAL' | 'DEGRADED' | 'FREEZE';
+    execQuality: ExecQualityLevel;
+    execMetricsPresent: boolean;
+    freezeActive: boolean;
+    emergencyExitAllowed: boolean;
+    emergencyExitAllowedReason: string | null;
+    invariantViolated: boolean;
+    invariantReason: string | null;
+    dataGaps: string[];
     state: SymbolState;
   }) => void;
   onExecutionLogged: (event: ExecutionEvent | (ExecutionEvent & { slippage_bps?: number; execution_latency_ms?: number }), state: SymbolState) => void;
@@ -45,8 +57,14 @@ export class SymbolActor {
       hasOpenEntryOrder: false,
       cooldown_until_ms: 0,
       last_exit_event_time_ms: 0,
+      marginRatio: null,
       execQuality: {
-        poor: false,
+        quality: 'UNKNOWN',
+        metricsPresent: false,
+        freezeActive: true,
+        lastLatencyMs: null,
+        lastSlippageBps: null,
+        lastSpreadPct: null,
         recentLatencyMs: [],
         recentSlippageBps: [],
       },
@@ -85,6 +103,7 @@ export class SymbolActor {
   private async onMetrics(envelope: MetricsEventEnvelope) {
     this.lastDeltaZ = envelope.metrics.legacyMetrics?.deltaZ || 0;
     this.lastPrintsPerSecond = envelope.metrics.prints_per_second || 0;
+    this.updateExecQualityFromMetrics(envelope.metrics.spread_pct);
 
     const actions = this.deps.decisionEngine.evaluate({
       symbol: envelope.symbol,
@@ -94,12 +113,51 @@ export class SymbolActor {
       state: this.state,
     });
 
+    const emergencyAction = actions.find((a) => a.type === 'EXIT_MARKET' && (a.reason === 'emergency_exit_liquidation_risk' || a.reason === 'emergency_exit_hard_stop'));
+    const emergencyExitAllowed = Boolean(emergencyAction);
+    const emergencyExitAllowedReason = emergencyAction?.reason || null;
+    const dataGaps: string[] = [];
+    if (!this.state.execQuality.metricsPresent) {
+      dataGaps.push('exec_metrics_missing');
+    }
+    if (this.state.execQuality.lastSpreadPct === null) {
+      dataGaps.push('spread_missing');
+    }
+    if (this.state.execQuality.lastLatencyMs === null) {
+      dataGaps.push('latency_missing');
+    }
+    if (this.state.execQuality.lastSlippageBps === null) {
+      dataGaps.push('slippage_missing');
+    }
+    const forbiddenEmergency = actions.some((a) => a.type === 'EXIT_MARKET' && a.reason.startsWith('emergency_exit_') && a.reason !== 'emergency_exit_liquidation_risk' && a.reason !== 'emergency_exit_hard_stop');
+    const invariantViolated = forbiddenEmergency || (this.state.execQuality.quality === 'UNKNOWN' && actions.some((a) => a.reason === 'emergency_exit_exec_quality'));
+    const invariantReason = forbiddenEmergency
+      ? 'forbidden_emergency_exit_reason'
+      : this.state.execQuality.quality === 'UNKNOWN' && actions.some((a) => a.reason === 'emergency_exit_exec_quality')
+      ? 'panic_exit_with_missing_exec_metrics'
+      : null;
+    const executionMode: 'NORMAL' | 'DEGRADED' | 'FREEZE' =
+      this.state.execQuality.freezeActive
+        ? 'FREEZE'
+        : envelope.gate.mode === GateMode.V1_NO_LATENCY
+        ? 'DEGRADED'
+        : 'NORMAL';
+
     this.deps.onDecisionLogged({
       symbol: envelope.symbol,
       canonical_time_ms: envelope.canonical_time_ms,
       exchange_event_time_ms: envelope.exchange_event_time_ms,
       gate: envelope.gate,
       actions,
+      executionMode,
+      execQuality: this.state.execQuality.quality,
+      execMetricsPresent: this.state.execQuality.metricsPresent,
+      freezeActive: this.state.execQuality.freezeActive,
+      emergencyExitAllowed,
+      emergencyExitAllowedReason,
+      invariantViolated,
+      invariantReason,
+      dataGaps,
       state: this.snapshotState(),
     });
 
@@ -188,6 +246,9 @@ export class SymbolActor {
       const hadPosition = this.state.position !== null;
       this.state.availableBalance = event.availableBalance;
       this.state.walletBalance = event.walletBalance;
+      this.state.marginRatio = event.walletBalance > 0
+        ? Math.max(0, Math.min(1, event.availableBalance / event.walletBalance))
+        : null;
 
       const qty = Math.abs(event.positionAmt);
       if (qty === 0) {
@@ -221,6 +282,8 @@ export class SymbolActor {
   }
 
   private pushExecQuality(latencyMs: number, slippageBps: number) {
+    this.state.execQuality.lastLatencyMs = latencyMs;
+    this.state.execQuality.lastSlippageBps = slippageBps;
     this.state.execQuality.recentLatencyMs.push(latencyMs);
     this.state.execQuality.recentSlippageBps.push(slippageBps);
 
@@ -231,9 +294,33 @@ export class SymbolActor {
       this.state.execQuality.recentSlippageBps.shift();
     }
 
-    const latAvg = this.average(this.state.execQuality.recentLatencyMs);
-    const slipAvg = this.average(this.state.execQuality.recentSlippageBps);
-    this.state.execQuality.poor = latAvg > 2000 || slipAvg > 30;
+    this.refreshExecQuality();
+  }
+
+  private updateExecQualityFromMetrics(spreadPct?: number | null) {
+    this.state.execQuality.lastSpreadPct = typeof spreadPct === 'number' && Number.isFinite(spreadPct)
+      ? spreadPct
+      : null;
+    this.refreshExecQuality();
+  }
+
+  private refreshExecQuality() {
+    const hasLatency = typeof this.state.execQuality.lastLatencyMs === 'number' && Number.isFinite(this.state.execQuality.lastLatencyMs);
+    const hasSlippage = typeof this.state.execQuality.lastSlippageBps === 'number' && Number.isFinite(this.state.execQuality.lastSlippageBps);
+    const hasSpread = typeof this.state.execQuality.lastSpreadPct === 'number' && Number.isFinite(this.state.execQuality.lastSpreadPct);
+
+    this.state.execQuality.metricsPresent = hasLatency && hasSlippage && hasSpread;
+
+    let quality: ExecQualityLevel = 'UNKNOWN';
+    if (this.state.execQuality.metricsPresent) {
+      const latencyBad = (this.state.execQuality.lastLatencyMs as number) > 2000;
+      const slippageBad = (this.state.execQuality.lastSlippageBps as number) > 30;
+      const spreadBad = Math.abs(this.state.execQuality.lastSpreadPct as number) > 0.08;
+      quality = latencyBad || slippageBad || spreadBad ? 'BAD' : 'GOOD';
+    }
+
+    this.state.execQuality.quality = quality;
+    this.state.execQuality.freezeActive = assessFreezeFromExecQuality(quality).freezeActive;
   }
 
   private average(values: number[]): number {
@@ -249,7 +336,12 @@ export class SymbolActor {
       openOrders: new Map(this.state.openOrders),
       position: this.state.position ? { ...this.state.position } : null,
       execQuality: {
-        poor: this.state.execQuality.poor,
+        quality: this.state.execQuality.quality,
+        metricsPresent: this.state.execQuality.metricsPresent,
+        freezeActive: this.state.execQuality.freezeActive,
+        lastLatencyMs: this.state.execQuality.lastLatencyMs,
+        lastSlippageBps: this.state.execQuality.lastSlippageBps,
+        lastSpreadPct: this.state.execQuality.lastSpreadPct,
         recentLatencyMs: [...this.state.execQuality.recentLatencyMs],
         recentSlippageBps: [...this.state.execQuality.recentSlippageBps],
       },
