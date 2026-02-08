@@ -10,9 +10,8 @@ import {
   bestBid,
   bestAsk,
   getLevelSize,
+  DepthCache,
 } from '../metrics/OrderbookManager';
-
-import { DepthCache } from '../index';
 
 /**
  * Tests for OrderbookManager functions.  These tests cover snapshot
@@ -31,7 +30,6 @@ export function runTests() {
       ['101.0', '4'],
       ['102.0', '6'],
     ],
-    cachedAt: Date.now(),
   };
   const ob = createOrderbookState();
   applySnapshot(ob, snapshot);
@@ -46,8 +44,10 @@ export function runTests() {
     u: 11,
     b: [['100.0', '4']],
     a: [['101.0', '5']],
+    eventTimeMs: Date.now(),
+    receiptTimeMs: Date.now(),
   });
-  assert(ok, 'contiguous update should succeed');
+  assert(ok.ok, 'contiguous update should succeed');
   assert(ob.lastUpdateId === 11, 'lastUpdateId updates');
   assert(getLevelSize(ob, 100.0) === 4, 'bid updated');
   assert(getLevelSize(ob, 101.0) === 5, 'ask updated');
@@ -57,6 +57,8 @@ export function runTests() {
     u: 13,
     b: [['100.0', '5']],
     a: [],
+    eventTimeMs: Date.now(),
+    receiptTimeMs: Date.now(),
   });
-  assert(bad === false, 'gap update should return false');
+  assert(bad.ok === false, 'gap update should return false');
 }
