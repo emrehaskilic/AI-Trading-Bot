@@ -501,3 +501,33 @@
 {"channel":"execution","type":"request_debug","ts":1770649580904,"payload":{"method":"POST","baseUrl":"https://testnet.binancefuture.com","path":"/fapi/v1/marginType","params":{"marginType":"CROSSED","symbol":"XRPUSDT","recvWindow":"5000","timestamp":"1770649580896"},"query_string":"marginType=CROSSED&recvWindow=5000&symbol=XRPUSDT&timestamp=1770649580896","signature_len":64,"recvWindow":5000,"timestamp":1770649580896}}
 {"channel":"execution","type":"request_error","ts":1770649581172,"payload":{"method":"POST","path":"/fapi/v1/marginType","status":400,"error_class":"unknown_binance_error","code":-4046,"message":"Binance POST /fapi/v1/marginType failed (400)","response":{"code":-4046,"msg":"No need to change margin type."}}}
 {"channel":"execution","type":"readiness","symbol":"XRPUSDT","ts":1770649581172,"payload":{"ready":true}}
+{"channel":"execution","type":"readiness","symbol":"BTCUSDT","ts":1770649644718,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"BTCUSDT","ts":1770649645217,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"BTCUSDT","ts":1770649664144,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"ETHUSDT","ts":1770649664144,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"BTCUSDT","ts":1770649668803,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"ETHUSDT","ts":1770649668803,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"SOLUSDT","ts":1770649668803,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"BTCUSDT","ts":1770649703209,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"ETHUSDT","ts":1770649703210,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"SOLUSDT","ts":1770649703210,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"BTCUSDT","ts":1770649703578,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"ETHUSDT","ts":1770649703578,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"SOLUSDT","ts":1770649703578,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"BTCUSDT","ts":1770649729025,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"SOLUSDT","ts":1770649729025,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"BTCUSDT","ts":1770649729898,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"BTCUSDT","ts":1770649734637,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"ETHUSDT","ts":1770649734638,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"BTCUSDT","ts":1770649739816,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"ETHUSDT","ts":1770649739816,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"SOLUSDT","ts":1770649739816,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"BTCUSDT","ts":1770649742835,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"ETHUSDT","ts":1770649742835,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"SOLUSDT","ts":1770649742835,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"BTCUSDT","ts":1770649752932,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"ETHUSDT","ts":1770649752932,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"SOLUSDT","ts":1770649752932,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"BTCUSDT","ts":1770649842578,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"ETHUSDT","ts":1770649842578,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}
+{"channel":"execution","type":"readiness","symbol":"SOLUSDT","ts":1770649842578,"payload":{"ready":false,"reason":"Execution connector is missing API keys"}}

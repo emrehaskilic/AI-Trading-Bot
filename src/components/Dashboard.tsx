@@ -512,7 +512,7 @@ export const Dashboard: React.FC = () => {
         <div className="md:hidden space-y-3 mb-4">
           {activeSymbols.map((symbol) => {
             const msg: MetricsMessage | undefined = marketData[symbol];
-            if (!msg) return null;
+            if (!msg) return <div key={symbol} className="p-3 bg-zinc-900 border border-zinc-800 rounded-lg text-zinc-500 text-xs animate-pulse">Waiting for data: {symbol}...</div>;
             return <MobileSymbolCard key={symbol} symbol={symbol} metrics={msg} showLatency={false} />;
           })}
         </div>
@@ -533,7 +533,12 @@ export const Dashboard: React.FC = () => {
               <div className="bg-black/20 divide-y divide-zinc-800/50">
                 {activeSymbols.map((symbol) => {
                   const msg: MetricsMessage | undefined = marketData[symbol];
-                  if (!msg) return null;
+                  if (!msg) return (
+                    <div key={symbol} className="grid px-4 py-3 text-xs text-zinc-500 bg-zinc-900/40 border-b border-zinc-800 animate-pulse" style={{ gridTemplateColumns: '120px 1fr' }}>
+                      <div className="font-bold">{symbol}</div>
+                      <div>Initializing...</div>
+                    </div>
+                  );
                   return <SymbolRow key={symbol} symbol={symbol} data={msg} showLatency={false} />;
                 })}
                 {Object.keys(marketData).length === 0 && (
