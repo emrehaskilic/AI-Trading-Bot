@@ -1,0 +1,1 @@
+const WebSocket = require('ws'); const ws = new WebSocket('ws://localhost:8787/ws?symbols=BNBUSDT'); ws.on('open', () => console.log('OPEN')); ws.on('error', console.error); setInterval(() => {}, 10000);

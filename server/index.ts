@@ -382,9 +382,13 @@ async function fetchSnapshot(symbol: string, trigger: string, force = false) {
         });
 
         if (snapshotResult.ok) {
-            transitionOrderbookState(symbol, 'RESYNCING', 'snapshot_applied_wait_live_window');
+            // Directly transition to LIVE as per c4c8a70 logic
+            transitionOrderbookState(symbol, 'LIVE', 'snapshot_applied_success');
             log('SNAPSHOT_OK', { symbol, trigger, lastUpdateId: data.lastUpdateId });
+            // Ensure live sample is recorded immediately
+            recordLiveSample(symbol, true);
         } else {
+            // Only go to RESYNCING if buffer gap detected
             transitionOrderbookState(symbol, 'RESYNCING', 'snapshot_buffer_gap_detected');
             log('SNAPSHOT_BUFFER_GAP', { symbol, trigger, lastUpdateId: data.lastUpdateId });
         }
@@ -564,27 +568,26 @@ function evaluateLiveReadiness(symbol: string) {
     const ob = getOrderbook(symbol);
     const now = Date.now();
 
-    const desyncRate10s = countWindow(meta.desyncEvents, 10000, now);
     const snapshotFresh = meta.lastSnapshotOk > 0 && (now - meta.lastSnapshotOk) <= LIVE_SNAPSHOT_FRESH_MS;
-    const queueOk = meta.depthQueue.length <= LIVE_QUEUE_MAX;
-    const goodSequence = meta.goodSequenceStreak >= LIVE_GOOD_SEQUENCE_MIN;
     const hasBook = ob.bids.size > 0 && ob.asks.size > 0;
 
-    const live = snapshotFresh && desyncRate10s <= LIVE_DESYNC_RATE_10S_MAX && queueOk && goodSequence && hasBook;
+    // Relaxed criteria: If we have a fresh snapshot and a populated book, we are LIVE.
+    // We ignore goodSequenceStreak and desyncRate for state transition blocking, 
+    // effectively mimicking c4c8a70 behavior where snapshot -> LIVE immediately.
+    const live = snapshotFresh && hasBook;
+
     recordLiveSample(symbol, live);
 
     if (live) {
-        transitionOrderbookState(symbol, 'LIVE', 'live_criteria_met', {
-            desyncRate10s,
-            queueLen: meta.depthQueue.length,
-            goodSequenceStreak: meta.goodSequenceStreak,
+        transitionOrderbookState(symbol, 'LIVE', 'live_criteria_met_relaxed', {
             lastSnapshotOkMsAgo: now - meta.lastSnapshotOk,
+            queueLen: meta.depthQueue.length,
+            goodSequenceStreak: meta.goodSequenceStreak
         });
     } else {
         transitionOrderbookState(symbol, 'RESYNCING', 'live_criteria_not_met', {
-            desyncRate10s,
-            queueLen: meta.depthQueue.length,
-            goodSequenceStreak: meta.goodSequenceStreak,
+            hasBook,
+            snapshotFresh,
             lastSnapshotOkMsAgo: meta.lastSnapshotOk > 0 ? (now - meta.lastSnapshotOk) : null,
         });
     }

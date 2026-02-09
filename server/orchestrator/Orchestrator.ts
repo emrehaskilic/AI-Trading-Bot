@@ -372,6 +372,24 @@ export class Orchestrator {
     }
     await this.connector.syncState();
     await this.flush();
+
+    // Sync currentMarginBudgetUsdt with actual wallet balance if connected
+    const status = this.getExecutionStatus();
+    if (status.wallet.totalWalletUsdt > 0 && this.connector.isConnected()) {
+      // Update starting margin to match wallet (user can adjust via UI)
+      this.capitalSettings.startingMarginUsdt = status.wallet.totalWalletUsdt;
+      this.capitalSettings.currentMarginBudgetUsdt = status.wallet.totalWalletUsdt;
+      this.capitalSettings.rampMult = 1;
+      // Update sizing ramp config
+      this.sizingRamp.updateConfig({
+        startingMarginUsdt: this.capitalSettings.startingMarginUsdt,
+        rampStepPct: this.capitalSettings.rampStepPct,
+        rampDecayPct: this.capitalSettings.rampDecayPct,
+        rampMaxMult: this.capitalSettings.rampMaxMult,
+        minMarginUsdt: this.config.minMarginUsdt,
+      });
+    }
+
     return this.getExecutionStatus();
   }
 
