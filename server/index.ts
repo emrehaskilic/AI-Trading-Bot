@@ -495,7 +495,7 @@ function updateStreams() {
                 setTimeout(() => {
                     fetchSnapshot(symbol, 'ws_open_seed', true).catch(() => { });
                 }, delay);
-                delay += 1000;
+                delay += 2000;
             }
         });
     });
@@ -1176,7 +1176,7 @@ setInterval(() => {
         evaluateLiveReadiness(symbol);
         emitBlockedReasonTelemetry(symbol);
     });
-    runAutoScaler();
+    // runAutoScaler();
 }, 1000);
 
 server.listen(PORT, HOST, () => log('SERVER_UP', { port: PORT, host: HOST }));
