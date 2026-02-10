@@ -10,17 +10,19 @@ export interface ExecutionDecision {
 
 export class BinanceExecutor {
     private connector: ExecutionConnector;
-    private enabled: boolean;
     private mode: 'live' | 'dry-run';
 
-    constructor(connector: ExecutionConnector, enabled: boolean = false, mode: 'live' | 'dry-run' = 'dry-run') {
+    constructor(connector: ExecutionConnector, mode: 'live' | 'dry-run' = 'dry-run') {
         this.connector = connector;
-        this.enabled = enabled;
+        this.mode = mode;
+    }
+
+    public setMode(mode: 'live' | 'dry-run') {
         this.mode = mode;
     }
 
     public async execute(decision: ExecutionDecision): Promise<{ ok: boolean; orderId?: string; error?: string }> {
-        if (!this.enabled) {
+        if (!this.connector.isExecutionEnabled()) {
             return { ok: false, error: 'EXECUTION_DISABLED' };
         }
 

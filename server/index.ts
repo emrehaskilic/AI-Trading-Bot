@@ -90,8 +90,8 @@ const GRACE_PERIOD_MS = 5000;
 
 // [PHASE 3] Execution Flags
 let KILL_SWITCH = false;
-const EXECUTION_ENABLED = process.env.EXECUTION_ENABLED === 'true';
-const EXECUTION_MODE = (process.env.EXECUTION_MODE || 'dry-run') as 'live' | 'dry-run';
+let EXECUTION_ENABLED = process.env.EXECUTION_ENABLED === 'true';
+let EXECUTION_MODE = (process.env.EXECUTION_MODE || 'dry-run') as 'live' | 'dry-run';
 
 // =============================================================================
 // Logging
@@ -314,7 +314,9 @@ const getStrategy = (s: string) => { if (!strategyMap.has(s)) strategyMap.set(s,
 const getRisk = (s: string) => { if (!riskMap.has(s)) riskMap.set(s, new RiskManager()); return riskMap.get(s)!; };
 const getExecutor = (s: string) => {
     if (!executorMap.has(s)) {
-        executorMap.set(s, new BinanceExecutor(orchestrator.getConnector() as any, EXECUTION_ENABLED, EXECUTION_MODE));
+        executorMap.set(s, new BinanceExecutor(orchestrator.getConnector() as any, EXECUTION_MODE));
+    } else {
+        executorMap.get(s)!.setMode(EXECUTION_MODE);
     }
     return executorMap.get(s)!;
 };
@@ -1185,8 +1187,15 @@ app.post('/api/execution/disconnect', async (req, res) => {
 
 app.post('/api/execution/enabled', async (req, res) => {
     const enabled = Boolean(req.body?.enabled);
+    EXECUTION_ENABLED = enabled;
     await orchestrator.setExecutionEnabled(enabled);
-    res.json({ ok: true, status: orchestrator.getExecutionStatus() });
+    res.json({ ok: true, status: orchestrator.getExecutionStatus(), executionEnabled: EXECUTION_ENABLED, executionMode: EXECUTION_MODE });
+});
+
+app.post('/api/execution/mode', (req, res) => {
+    const modeRaw = String(req.body?.mode || '').toLowerCase();
+    EXECUTION_MODE = modeRaw === 'live' ? 'live' : 'dry-run';
+    res.json({ ok: true, executionMode: EXECUTION_MODE });
 });
 
 app.post('/api/execution/symbol', async (req, res) => {

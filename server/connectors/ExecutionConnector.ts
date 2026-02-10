@@ -1032,8 +1032,9 @@ export class ExecutionConnector {
         params: { symbol, marginType },
       });
     } catch (error: any) {
-      const code = Number(error?.binanceCode);
-      if (code !== -4046) {
+      const code = Number(error?.binanceCode ?? error?.binanceBody?.code);
+      const msg = String(error?.binanceBody?.msg || error?.message || '');
+      if (code !== -4046 && !msg.includes('No need to change margin type')) {
         throw error;
       }
     }
@@ -1315,7 +1316,10 @@ export class ExecutionConnector {
     }
 
     if (!response.ok) {
-      const binanceCode = typeof body?.code === 'number' ? body.code : null;
+      const codeRaw = body?.code;
+      const binanceCode = typeof codeRaw === 'number'
+        ? codeRaw
+        : (typeof codeRaw === 'string' && /^-?\d+$/.test(codeRaw) ? Number(codeRaw) : null);
       const err: any = new Error(`Binance ${options.method} ${options.path} failed (${response.status})`);
       err.binanceCode = binanceCode;
       err.binanceBody = body;
