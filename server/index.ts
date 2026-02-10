@@ -906,6 +906,7 @@ function broadcastMetrics(
         : null;
 
     const oiM = getOICalc(s).getMetrics();
+    const oiLegacy = leg.getOpenInterestMetrics();
     const bf = getBackfill(s).getState();
 
     const payload: any = {
@@ -922,7 +923,15 @@ function broadcastMetrics(
             tradeCounts: cvd.getTradeCounts()
         },
         absorption: absVal,
-        openInterest: {
+        openInterest: oiLegacy ? {
+            openInterest: oiLegacy.openInterest,
+            oiChangeAbs: oiLegacy.oiChangeAbs,
+            oiChangePct: oiLegacy.oiChangePct,
+            oiDeltaWindow: oiLegacy.oiDeltaWindow,
+            lastUpdated: oiLegacy.lastUpdated,
+            source: oiLegacy.source,
+            stabilityMsg: oiM.stabilityMsg
+        } : {
             openInterest: oiM.currentOI,
             oiChangeAbs: oiM.oiChangeAbs,
             oiChangePct: oiM.oiChangePct,
