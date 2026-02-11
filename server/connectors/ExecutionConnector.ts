@@ -425,17 +425,32 @@ export class ExecutionConnector {
       orderAttemptId,
       decisionId: context?.decisionId,
     });
+    const orderType = request.type === 'LIMIT' ? 'LIMIT' : 'MARKET';
 
     const params: Record<string, string | number | boolean | undefined> = {
       symbol,
       side: request.side,
-      type: 'MARKET',
+      type: orderType,
       quantity: qty,
       newClientOrderId: request.clientOrderId,
       reduceOnly: request.reduceOnly ? true : undefined,
       positionSide,
       recvWindow: Math.trunc(this.config.recvWindowMs || 5000),
     };
+
+    if (orderType === 'LIMIT') {
+      let rawLimitPrice = Number(request.price);
+      if (!Number.isFinite(rawLimitPrice) || rawLimitPrice <= 0) {
+        rawLimitPrice = await this.referencePrice(symbol, request.side);
+      }
+      if (!Number.isFinite(rawLimitPrice) || rawLimitPrice <= 0) {
+        throw new Error(`invalid_limit_price:${request.price}`);
+      }
+
+      const normalizedLimitPrice = this.normalizeLimitPrice(symbol, request.side, rawLimitPrice);
+      params.price = normalizedLimitPrice;
+      params.timeInForce = 'GTC';
+    }
 
     this.emitDebug({
       channel: 'execution',
@@ -1184,6 +1199,29 @@ export class ExecutionConnector {
     }
 
     return qty.toFixed(stepDigits);
+  }
+
+  private normalizeLimitPrice(symbol: string, side: 'BUY' | 'SELL', rawPrice: number): string {
+    const rules = this.symbolRules.get(symbol);
+    if (!rules) {
+      throw new Error(`missing_symbol_rules:${symbol}`);
+    }
+
+    if (!Number.isFinite(rawPrice) || rawPrice <= 0) {
+      throw new Error(`invalid_price:${rawPrice}`);
+    }
+
+    const tick = rules.priceTickSize > 0 ? rules.priceTickSize : 0.01;
+    const tickDigits = this.stepDigits(tick);
+    const aligned = side === 'BUY'
+      ? Math.floor(rawPrice / tick) * tick
+      : Math.ceil(rawPrice / tick) * tick;
+
+    if (!Number.isFinite(aligned) || aligned <= 0) {
+      throw new Error(`normalized_price_non_positive:${aligned}`);
+    }
+
+    return aligned.toFixed(tickDigits);
   }
 
   private async referencePrice(symbol: string, side: 'BUY' | 'SELL'): Promise<number> {
