@@ -642,8 +642,14 @@ export class Orchestrator {
 }
 
 export function createOrchestratorFromEnv(): Orchestrator {
-  const executionEnabledEnv = String(process.env.EXECUTION_ENABLED || 'false').toLowerCase();
-  const enableGateV2 = String(process.env.ENABLE_GATE_V2 || 'false').toLowerCase() === 'true';
+  const parseEnvFlag = (value: string | undefined): boolean => {
+    if (!value) return false;
+    const normalized = value.trim().replace(/^['"]|['"]$/g, '').toLowerCase();
+    return normalized === 'true';
+  };
+
+  const executionEnabledEnv = parseEnvFlag(process.env.EXECUTION_ENABLED);
+  const enableGateV2 = parseEnvFlag(process.env.ENABLE_GATE_V2);
   const gateMode: GateMode = enableGateV2 ? 'V2_NETWORK_LATENCY' : 'V1_NO_LATENCY';
   const gate: GateConfig = {
     mode: gateMode,
@@ -655,7 +661,7 @@ export function createOrchestratorFromEnv(): Orchestrator {
   };
 
   const connector = new ExecutionConnector({
-    enabled: executionEnabledEnv === 'true',
+    enabled: executionEnabledEnv,
     apiKey: process.env.BINANCE_TESTNET_API_KEY,
     apiSecret: process.env.BINANCE_TESTNET_API_SECRET,
     restBaseUrl: process.env.BINANCE_TESTNET_REST_BASE || 'https://testnet.binancefuture.com',

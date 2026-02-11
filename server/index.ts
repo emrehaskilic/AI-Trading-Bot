@@ -88,7 +88,13 @@ const GRACE_PERIOD_MS = 5000;
 
 // [PHASE 3] Execution Flags
 let KILL_SWITCH = false;
-const EXECUTION_ENABLED_ENV = String(process.env.EXECUTION_ENABLED || '').toLowerCase() === 'true';
+function parseEnvFlag(value: string | undefined): boolean {
+    if (!value) return false;
+    const normalized = value.trim().replace(/^['"]|['"]$/g, '').toLowerCase();
+    return normalized === 'true';
+}
+
+const EXECUTION_ENABLED_ENV = parseEnvFlag(process.env.EXECUTION_ENABLED);
 let EXECUTION_ENABLED = EXECUTION_ENABLED_ENV;
 const EXECUTION_ENV = 'testnet';
 
@@ -1164,7 +1170,15 @@ app.post('/api/execution/disconnect', async (req, res) => {
 
 app.post('/api/execution/enabled', async (req, res) => {
     const enabled = Boolean(req.body?.enabled);
-    EXECUTION_ENABLED = EXECUTION_ENABLED_ENV && enabled;
+    if (enabled && !EXECUTION_ENABLED_ENV) {
+        res.status(409).json({
+            ok: false,
+            error: 'execution_env_disabled',
+            message: 'Set EXECUTION_ENABLED=true in the server environment and restart to enable execution.',
+        });
+        return;
+    }
+    EXECUTION_ENABLED = enabled && EXECUTION_ENABLED_ENV;
     await orchestrator.setExecutionEnabled(EXECUTION_ENABLED);
     res.json({ ok: true, status: orchestrator.getExecutionStatus(), executionEnabled: EXECUTION_ENABLED });
 });
