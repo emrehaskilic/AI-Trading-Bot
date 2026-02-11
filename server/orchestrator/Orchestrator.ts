@@ -146,6 +146,9 @@ export class Orchestrator {
     }
     this.connector.setSymbols(normalized);
     await this.connector.syncState();
+    if (this.connector.getStatus().hasCredentials) {
+      await this.connector.ensureSymbolsReady();
+    }
   }
 }
 
