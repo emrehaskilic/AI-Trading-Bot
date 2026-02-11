@@ -90,8 +90,8 @@ const GRACE_PERIOD_MS = 5000;
 
 // [PHASE 3] Execution Flags
 let KILL_SWITCH = false;
-let EXECUTION_ENABLED = process.env.EXECUTION_ENABLED === 'true';
 let EXECUTION_MODE = (process.env.EXECUTION_MODE || 'dry-run') as 'live' | 'dry-run';
+const executionSkipLogBySymbol = new Map<string, number>();
 
 // =============================================================================
 // Logging
@@ -183,6 +183,10 @@ const backfillInFlight = new Set<string>();
 const backfillLastAttemptMs = new Map<string, number>();
 const BACKFILL_RETRY_INTERVAL_MS = 30_000;
 const orchestrator = createOrchestratorFromEnv();
+
+function isExecutionEnabled(): boolean {
+    return orchestrator.getConnector().isExecutionEnabled();
+}
 
 // Cached Exchange Info
 let exchangeInfoCache: { data: any; timestamp: number } | null = null;
@@ -790,7 +794,18 @@ async function processSymbolEvent(s: string, d: any) {
         });
 
         // [PHASE 3] Execution Check
-        if (signal.signal && !KILL_SWITCH && EXECUTION_ENABLED) {
+        if (signal.signal && !KILL_SWITCH) {
+            if (!isExecutionEnabled()) {
+                const nowMs = Date.now();
+                const lastLogAt = executionSkipLogBySymbol.get(s) || 0;
+                if (nowMs - lastLogAt > 30000) {
+                    executionSkipLogBySymbol.set(s, nowMs);
+                    log('EXECUTION_SKIPPED', { symbol: s, signal: signal.signal, reason: 'EXECUTION_DISABLED' });
+                }
+                broadcastMetrics(s, ob, tas, cvd, absVal, leg, t, signal);
+                return;
+            }
+
             const risk = getRisk(s);
             const executor = getExecutor(s);
             const side: 'BUY' | 'SELL' = (signal.signal === 'BREAKOUT_LONG' || signal.signal === 'SWEEP_FADE_LONG') ? 'BUY' : 'SELL';
@@ -1058,7 +1073,7 @@ app.use(cors(corsOptions));
 app.get('/api/health', (req, res) => {
     res.json({
         ok: true,
-        executionEnabled: EXECUTION_ENABLED,
+        executionEnabled: isExecutionEnabled(),
         executionMode: EXECUTION_MODE,
         killSwitch: KILL_SWITCH,
         activeSymbols: Array.from(activeSymbols),
@@ -1196,9 +1211,8 @@ app.post('/api/execution/disconnect', async (req, res) => {
 
 app.post('/api/execution/enabled', async (req, res) => {
     const enabled = Boolean(req.body?.enabled);
-    EXECUTION_ENABLED = enabled;
     await orchestrator.setExecutionEnabled(enabled);
-    res.json({ ok: true, status: orchestrator.getExecutionStatus(), executionEnabled: EXECUTION_ENABLED, executionMode: EXECUTION_MODE });
+    res.json({ ok: true, status: orchestrator.getExecutionStatus(), executionEnabled: isExecutionEnabled(), executionMode: EXECUTION_MODE });
 });
 
 app.post('/api/execution/mode', (req, res) => {

@@ -212,6 +212,24 @@ export const Dashboard: React.FC = () => {
     }
   };
 
+  const setExecutionEnabled = async (enabled: boolean) => {
+    setConnectionError(null);
+    try {
+      const res = await fetch(`${proxyUrl}/api/execution/enabled`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error || 'execution_toggle_failed');
+      }
+      setExecutionStatus(data.status as ExecutionStatus);
+    } catch (e: any) {
+      setConnectionError(e.message || 'execution_toggle_failed');
+    }
+  };
+
   const refreshWalletPnl = async () => {
     const res = await fetch(`${proxyUrl}/api/execution/refresh`, {
       method: 'POST',
@@ -340,6 +358,25 @@ export const Dashboard: React.FC = () => {
             <div className="grid grid-cols-2 gap-2">
               <button onClick={connectTestnet} className="px-3 py-2 bg-blue-700 hover:bg-blue-600 rounded text-xs font-bold text-white shadow-lg transition-all active:scale-95">CONNECT EXCHANGE</button>
               <button onClick={disconnectTestnet} className="px-3 py-2 bg-zinc-700 hover:bg-zinc-600 rounded text-xs font-bold text-white transition-all active:scale-95">DISCONNECT</button>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={() => setExecutionEnabled(true)}
+                className={`px-3 py-2 rounded text-xs font-bold transition-all active:scale-95 border ${executionStatus.connection.executionEnabled ? 'bg-emerald-700 border-emerald-600 text-white' : 'bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700'}`}
+              >
+                ENABLE EXECUTION
+              </button>
+              <button
+                onClick={() => setExecutionEnabled(false)}
+                className={`px-3 py-2 rounded text-xs font-bold transition-all active:scale-95 border ${!executionStatus.connection.executionEnabled ? 'bg-amber-700 border-amber-600 text-white' : 'bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700'}`}
+              >
+                DISABLE EXECUTION
+              </button>
+            </div>
+            <div className="text-[11px] text-zinc-500">
+              Execution: <span className={executionStatus.connection.executionEnabled ? 'text-emerald-400 font-semibold' : 'text-amber-400 font-semibold'}>
+                {executionStatus.connection.executionEnabled ? 'ENABLED' : 'DISABLED'}
+              </span>
             </div>
             {connectionError && <div className="text-xs text-red-500 font-medium italic">{connectionError}</div>}
 
