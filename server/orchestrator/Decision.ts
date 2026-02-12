@@ -111,11 +111,11 @@ export class DecisionEngine {
       actions.push(this.exitAction(symbol, event_time_ms, position.side === 'LONG' ? 'SELL' : 'BUY', 'profit_lock_drawdown'));
     }
 
-    if (position.side === 'LONG' && deltaZ < -3 && cvdSlope < -0.5) {
+    if (position.side === 'LONG' && deltaZ < -2 && cvdSlope < -0.3) {
       actions.push(this.exitAction(symbol, event_time_ms, 'SELL', 'reversal_exit_long'));
     }
 
-    if (position.side === 'SHORT' && deltaZ > 3 && cvdSlope > 0.5) {
+    if (position.side === 'SHORT' && deltaZ > 2 && cvdSlope > 0.3) {
       actions.push(this.exitAction(symbol, event_time_ms, 'BUY', 'reversal_exit_short'));
     }
 

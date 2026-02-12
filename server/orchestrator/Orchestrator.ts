@@ -653,8 +653,8 @@ export function createOrchestratorFromEnv(): Orchestrator {
   const gateMode: GateMode = enableGateV2 ? 'V2_NETWORK_LATENCY' : 'V1_NO_LATENCY';
   const gate: GateConfig = {
     mode: gateMode,
-    maxSpreadPct: Number(process.env.MAX_SPREAD_PCT || 0.08),
-    minObiDeep: Number(process.env.MIN_OBI_DEEP || 0.05),
+    maxSpreadPct: Number(process.env.MAX_SPREAD_PCT || 0.12),
+    minObiDeep: Number(process.env.MIN_OBI_DEEP || 0.03),
     v2: {
       maxNetworkLatencyMs: Number(process.env.MAX_NETWORK_LATENCY_MS || 1500),
     },
@@ -679,8 +679,8 @@ export function createOrchestratorFromEnv(): Orchestrator {
     loggerDropHaltThreshold: Number(process.env.LOGGER_DROP_HALT_THRESHOLD || 500),
     gate,
     cooldown: {
-      minMs: Number(process.env.COOLDOWN_MIN_MS || 2000),
-      maxMs: Number(process.env.COOLDOWN_MAX_MS || 30000),
+      minMs: Number(process.env.COOLDOWN_MIN_MS || 1000),
+      maxMs: Number(process.env.COOLDOWN_MAX_MS || 15000),
     },
     startingMarginUsdt: Number(process.env.STARTING_MARGIN_USDT || 0),
     minMarginUsdt: Number(process.env.MIN_MARGIN_USDT || 0),
