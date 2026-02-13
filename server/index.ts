@@ -675,8 +675,7 @@ async function processDepthQueue(symbol: string) {
             const absVal = absorptionResult.get(symbol) ?? 0;
             broadcastMetrics(symbol, ob, tas, cvd, absVal, leg, update.eventTimeMs || 0, null, 'depth');
 
-            const dryStatus = dryRunSession.getActiveSymbol();
-            if (dryStatus && dryStatus === symbol) {
+            if (dryRunSession.isTrackingSymbol(symbol)) {
                 const top = getTopLevels(ob, Number(process.env.DRY_RUN_ORDERBOOK_DEPTH || 20));
                 const bestBidPx = bestBid(ob);
                 const bestAskPx = bestAsk(ob);
@@ -1284,42 +1283,60 @@ app.get('/api/dry-run/status', (req, res) => {
 
 app.post('/api/dry-run/start', async (req, res) => {
     try {
-        const symbol = String(req.body?.symbol || '').toUpperCase();
-        if (!symbol) {
-            res.status(400).json({ ok: false, error: 'symbol_required' });
+        const rawSymbols = Array.isArray(req.body?.symbols)
+            ? req.body.symbols.map((s: any) => String(s || '').toUpperCase())
+            : [];
+        const fallbackSymbol = String(req.body?.symbol || '').toUpperCase();
+        const symbolsRequested = rawSymbols.length > 0
+            ? rawSymbols.filter((s: string, idx: number, arr: string[]) => Boolean(s) && arr.indexOf(s) === idx)
+            : (fallbackSymbol ? [fallbackSymbol] : []);
+
+        if (symbolsRequested.length === 0) {
+            res.status(400).json({ ok: false, error: 'symbols_required' });
             return;
         }
 
         const info = await fetchExchangeInfo();
         const symbols = Array.isArray(info?.symbols) ? info.symbols : [];
-        if (!symbols.includes(symbol)) {
-            res.status(400).json({ ok: false, error: 'symbol_not_supported' });
+        const unsupported = symbolsRequested.filter((s: string) => !symbols.includes(s));
+        if (unsupported.length > 0) {
+            res.status(400).json({ ok: false, error: 'symbol_not_supported', unsupported });
             return;
         }
 
-        const fundingRate = lastFunding.get(symbol)?.rate ?? Number(req.body?.fundingRate ?? 0);
+        const fundingRates: Record<string, number> = {};
+        for (const symbol of symbolsRequested) {
+            fundingRates[symbol] = lastFunding.get(symbol)?.rate ?? Number(req.body?.fundingRate ?? 0);
+        }
+
         const status = dryRunSession.start({
-            symbol,
+            symbols: symbolsRequested,
             runId: req.body?.runId ? String(req.body.runId) : undefined,
             walletBalanceStartUsdt: Number(req.body?.walletBalanceStartUsdt ?? 5000),
             initialMarginUsdt: Number(req.body?.initialMarginUsdt ?? 200),
             leverage: Number(req.body?.leverage ?? 10),
             takerFeeRate: Number(req.body?.takerFeeRate ?? 0.0004),
             maintenanceMarginRate: Number(req.body?.maintenanceMarginRate ?? 0.005),
-            fundingRate,
+            fundingRates,
             fundingIntervalMs: Number(req.body?.fundingIntervalMs ?? (8 * 60 * 60 * 1000)),
+            heartbeatIntervalMs: Number(req.body?.heartbeatIntervalMs ?? 10_000),
+            debugAggressiveEntry: Boolean(req.body?.debugAggressiveEntry),
         });
 
         dryRunForcedSymbols.clear();
-        dryRunForcedSymbols.add(symbol);
+        for (const symbol of symbolsRequested) {
+            dryRunForcedSymbols.add(symbol);
+        }
         updateStreams();
 
-        const ob = getOrderbook(symbol);
-        if (ob.lastUpdateId === 0 || ob.uiState === 'INIT') {
-            transitionOrderbookState(symbol, 'SNAPSHOT_PENDING', 'dry_run_start');
-            fetchSnapshot(symbol, 'dry_run_start', true).catch((e) => {
-                log('DRY_RUN_SNAPSHOT_ERROR', { symbol, error: e?.message || 'dry_run_snapshot_failed' });
-            });
+        for (const symbol of symbolsRequested) {
+            const ob = getOrderbook(symbol);
+            if (ob.lastUpdateId === 0 || ob.uiState === 'INIT') {
+                transitionOrderbookState(symbol, 'SNAPSHOT_PENDING', 'dry_run_start');
+                fetchSnapshot(symbol, 'dry_run_start', true).catch((e) => {
+                    log('DRY_RUN_SNAPSHOT_ERROR', { symbol, error: e?.message || 'dry_run_snapshot_failed' });
+                });
+            }
         }
 
         res.json({ ok: true, status });
@@ -1347,6 +1364,22 @@ app.post('/api/dry-run/reset', (req, res) => {
         res.json({ ok: true, status });
     } catch (e: any) {
         res.status(500).json({ ok: false, error: e?.message || 'dry_run_reset_failed' });
+    }
+});
+
+app.post('/api/dry-run/test-order', (req, res) => {
+    try {
+        const symbol = String(req.body?.symbol || '').toUpperCase();
+        const sideRaw = String(req.body?.side || 'BUY').toUpperCase();
+        const side = sideRaw === 'SELL' ? 'SELL' : 'BUY';
+        if (!symbol) {
+            res.status(400).json({ ok: false, error: 'symbol_required' });
+            return;
+        }
+        const status = dryRunSession.submitManualTestOrder(symbol, side);
+        res.json({ ok: true, status });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'dry_run_test_order_failed' });
     }
 });
 

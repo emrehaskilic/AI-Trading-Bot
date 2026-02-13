@@ -20,6 +20,7 @@ import * as SizingRampTests from './SizingRamp.test';
 import * as SizingCalculationTests from './SizingCalculation.test';
 import * as OrderPlanTests from './OrderPlan.test';
 import * as DryRunEngineTests from './DryRunEngine.test';
+import * as DryRunSessionServiceTests from './DryRunSessionService.test';
 
 // Minimal test harness: runs each runTests() and prints summary
 const testSuites: { name: string; fn: () => void }[] = [
@@ -40,6 +41,7 @@ const testSuites: { name: string; fn: () => void }[] = [
   { name: 'SizingCalculation', fn: SizingCalculationTests.runTests },
   { name: 'OrderPlan', fn: OrderPlanTests.runTests },
   { name: 'DryRunEngine', fn: DryRunEngineTests.runTests },
+  { name: 'DryRunSessionService', fn: DryRunSessionServiceTests.runTests },
 ];
 
 let total = 0;
