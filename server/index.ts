@@ -42,6 +42,7 @@ import { OICalculator } from './metrics/OICalculator';
 import { SymbolEventQueue } from './utils/SymbolEventQueue';
 import { SnapshotTracker } from './telemetry/Snapshot';
 import { StrategyEngine } from './strategy/StrategyEngine';
+import { DryRunConfig, DryRunEngine, DryRunEventInput } from './dryrun';
 
 // =============================================================================
 // Configuration
@@ -1237,6 +1238,47 @@ app.post('/api/execution/refresh', async (req, res) => {
         res.json({ ok: true, status });
     } catch (e: any) {
         res.status(500).json({ ok: false, error: e.message || 'execution_refresh_failed' });
+    }
+});
+
+app.post('/api/dry-run/run', (req, res) => {
+    try {
+        const body = req.body || {};
+        const runId = String(body.runId || '');
+        if (!runId) {
+            res.status(400).json({ ok: false, error: 'runId is required' });
+            return;
+        }
+
+        if (!Array.isArray(body.events)) {
+            res.status(400).json({ ok: false, error: 'events array is required' });
+            return;
+        }
+
+        const events: DryRunEventInput[] = body.events;
+        const config: DryRunConfig = {
+            runId,
+            walletBalanceStartUsdt: Number(body.walletBalanceStartUsdt ?? 5000),
+            initialMarginUsdt: Number(body.initialMarginUsdt ?? 200),
+            takerFeeRate: Number(body.takerFeeRate ?? 0.0004),
+            maintenanceMarginRate: Number(body.maintenanceMarginRate ?? 0.005),
+            fundingRate: Number(body.fundingRate ?? 0),
+            fundingIntervalMs: Number(body.fundingIntervalMs ?? (8 * 60 * 60 * 1000)),
+            fundingBoundaryStartTsUTC: body.fundingBoundaryStartTsUTC != null
+                ? Number(body.fundingBoundaryStartTsUTC)
+                : undefined,
+            proxy: {
+                mode: 'backend-proxy',
+                restBaseUrl: String(body.restBaseUrl || 'https://fapi.binance.com'),
+                marketWsBaseUrl: String(body.marketWsBaseUrl || 'wss://fstream.binance.com/stream'),
+            },
+        };
+
+        const engine = new DryRunEngine(config);
+        const result = engine.run(events);
+        res.json({ ok: true, logs: result.logs, finalState: result.finalState });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e.message || 'dry_run_failed' });
     }
 });
 
