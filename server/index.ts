@@ -846,7 +846,22 @@ async function processSymbolEvent(s: string, d: any) {
 
         // [DRY RUN INTEGRATION]
         // If a valid signal is generated, feed it into the Dry Run engine
-        if (signal.signal && dryRunSession.isTrackingSymbol(s)) {
+        const isDryRunTracked = dryRunSession.isTrackingSymbol(s);
+        if (isDryRunTracked) {
+            // Debug log to trace why signals might be missing
+            if (Math.random() < 0.05) { // Sample 5% of ticks to avoid spam
+                log('DRY_RUN_STRATEGY_CHECK', {
+                    symbol: s,
+                    signal: signal?.signal,
+                    score: signal?.score,
+                    ready: backfill.getState().ready,
+                    veto: signal?.vetoReason
+                });
+            }
+        }
+
+        if (signal.signal && isDryRunTracked) {
+            log('DRY_RUN_SIGNAL_SUBMIT', { symbol: s, signal: signal.signal });
             dryRunSession.submitStrategySignal(s, signal);
         }
 
