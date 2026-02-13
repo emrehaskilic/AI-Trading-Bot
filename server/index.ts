@@ -844,6 +844,12 @@ async function processSymbolEvent(s: string, d: any) {
         // [PHASE 3] Execution Check
         // Execution now flows through the orchestrator (gate + decision + executor).
 
+        // [DRY RUN INTEGRATION]
+        // If a valid signal is generated, feed it into the Dry Run engine
+        if (signal.signal && dryRunSession.isTrackingSymbol(s)) {
+            dryRunSession.submitStrategySignal(s, signal);
+        }
+
         // Broadcast
         broadcastMetrics(s, ob, tas, cvd, absVal, leg, t, signal);
     }

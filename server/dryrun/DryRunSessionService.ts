@@ -1,5 +1,6 @@
 import { DryRunEngine } from './DryRunEngine';
 import { DryRunConfig, DryRunEventInput, DryRunEventLog, DryRunOrderBook, DryRunOrderRequest, DryRunStateSnapshot } from './types';
+import { StrategySignal } from '../strategy/StrategyEngine';
 
 export interface DryRunSessionStartInput {
   symbols?: string[];
@@ -296,6 +297,51 @@ export class DryRunSessionService {
     return this.getStatus();
   }
 
+  submitStrategySignal(symbol: string, signal: StrategySignal): void {
+    const normalized = normalizeSymbol(symbol);
+    const session = this.sessions.get(normalized);
+    if (!this.running || !session || !this.config) return;
+
+    // Only process valid signals with a score
+    if (!signal.signal || !signal.candidate || signal.score < 50) return;
+
+    // Determine side based on signal type
+    let side: 'BUY' | 'SELL' | null = null;
+    if (signal.signal.includes('LONG')) side = 'BUY';
+    if (signal.signal.includes('SHORT')) side = 'SELL';
+
+    if (!side) return;
+
+    // Avoid duplicate entries if already in a position
+    if (session.lastState.position && session.lastState.position.side !== (side === 'BUY' ? 'LONG' : 'SHORT')) {
+      // Optional: Close opposite position? For now, we stick to simple entry.
+    }
+    if (session.lastState.position) {
+      // Already positioned. Ignore new entry signal for now unless it's a flip (not implemented yet).
+      return;
+    }
+
+    // Calculate Quantity
+    const referencePrice = signal.candidate.entryPrice;
+    if (referencePrice <= 0) return;
+
+    const qtyRaw = (this.config.initialMarginUsdt * this.config.leverage) / referencePrice;
+    const qty = roundTo(qtyRaw, 6);
+
+    if (qty <= 0) return;
+
+    // Queue the Entry Order
+    session.manualOrders.push({
+      side: side,
+      type: 'MARKET', // Strategy suggests price, but for reliability we use MARKET in dry run for now
+      qty: qty,
+      timeInForce: 'IOC',
+      reduceOnly: false
+    });
+
+    this.addConsoleLog('INFO', normalized, `Strategy Signal Executed: ${signal.signal} (${side} ${qty} @ ~${referencePrice})`, session.lastEventTimestampMs);
+  }
+
   ingestDepthEvent(input: {
     symbol: string;
     eventTimestampMs: number;
@@ -442,12 +488,12 @@ export class DryRunSessionService {
         },
         position: session.lastState.position
           ? {
-              side: session.lastState.position.side,
-              qty: session.lastState.position.qty,
-              entryPrice: session.lastState.position.entryPrice,
-              markPrice: session.latestMarkPrice,
-              liqPrice: null,
-            }
+            side: session.lastState.position.side,
+            qty: session.lastState.position.qty,
+            entryPrice: session.lastState.position.entryPrice,
+            markPrice: session.latestMarkPrice,
+            liqPrice: null,
+          }
           : null,
         openLimitOrders: session.lastState.openLimitOrders,
         lastEventTimestampMs: session.lastEventTimestampMs,
@@ -501,6 +547,10 @@ export class DryRunSessionService {
 
     const state = session.lastState;
     const orders: DryRunOrderRequest[] = [];
+
+    // Disable internal random entry if we are waiting for strategy signals?
+    // Actually, we can keep debugAggressiveEntry as a "noise" generator if explicitly enabled,
+    // but default should be OFF for strategy replication.
     const entryCooldownMs = this.config.debugAggressiveEntry
       ? Math.max(500, Math.trunc(DEFAULT_ENTRY_COOLDOWN_MS / 2))
       : Math.max(0, Math.trunc(DEFAULT_ENTRY_COOLDOWN_MS));
@@ -508,13 +558,16 @@ export class DryRunSessionService {
 
     if (!state.position && !hasOpenLimits) {
       if (session.lastEntryEventTs === 0 || (eventTimestampMs - session.lastEntryEventTs) >= entryCooldownMs) {
-        const side: 'BUY' | 'SELL' = this.resolveEntrySide(session, markPrice);
-        const targetNotional = this.config.initialMarginUsdt * this.config.leverage;
-        const qtyRaw = targetNotional / markPrice;
-        const qty = roundTo(Math.max(0, qtyRaw), 6);
-        if (qty > 0) {
-          orders.push({ side, type: 'MARKET', qty, timeInForce: 'IOC', reduceOnly: false });
-          session.lastEntryEventTs = eventTimestampMs;
+        // Only trigger internal random entry if debugAggressiveEntry is TRUE
+        if (this.config.debugAggressiveEntry) {
+          const side: 'BUY' | 'SELL' = this.resolveEntrySide(session, markPrice);
+          const targetNotional = this.config.initialMarginUsdt * this.config.leverage;
+          const qtyRaw = targetNotional / markPrice;
+          const qty = roundTo(Math.max(0, qtyRaw), 6);
+          if (qty > 0) {
+            orders.push({ side, type: 'MARKET', qty, timeInForce: 'IOC', reduceOnly: false });
+            session.lastEntryEventTs = eventTimestampMs;
+          }
         }
       }
       return orders;
