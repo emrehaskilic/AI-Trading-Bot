@@ -6,6 +6,7 @@ import { IExecutor } from '../execution/types';
 import { TradeLogger } from '../logger/TradeLogger';
 import { FundingRateMonitor } from '../metrics/FundingRateMonitor';
 import { RiskManager } from '../risk/RiskManager';
+import { AlertService } from '../notifications/AlertService';
 import { logger } from '../utils/logger';
 import { SymbolActor } from './Actor';
 import { DecisionEngine } from './Decision';
@@ -70,7 +71,8 @@ export class Orchestrator {
 
   constructor(
     private readonly connector: ExecutionConnector,
-    private readonly config: OrchestratorConfig
+    private readonly config: OrchestratorConfig,
+    private readonly alertService?: AlertService
   ) {
     this.capitalSettings.leverage = Math.min(this.connector.getPreferredLeverage(), config.maxLeverage);
     this.connector.setPreferredLeverage(this.capitalSettings.leverage);
@@ -399,6 +401,18 @@ export class Orchestrator {
       getMaxLeverage: () => this.getEffectiveLeverage(),
       hardStopLossPct: this.config.hardStopLossPct,
       liquidationEmergencyMarginRatio: this.config.liquidationEmergencyMarginRatio,
+      liquidationRiskConfig: {
+        yellowThreshold: Number(process.env.LIQ_RISK_YELLOW_RATIO || 0.30),
+        orangeThreshold: Number(process.env.LIQ_RISK_ORANGE_RATIO || 0.20),
+        redThreshold: Number(process.env.LIQ_RISK_RED_RATIO || 0.10),
+        criticalThreshold: Number(process.env.LIQ_RISK_CRITICAL_RATIO || 0.05),
+        timeToLiquidationWarningMs: Number(process.env.LIQ_RISK_WARN_MS || (5 * 60 * 1000)),
+        fundingRateImpactFactor: Number(process.env.LIQ_RISK_FUNDING_FACTOR || 2.5),
+        volatilityImpactFactor: Number(process.env.LIQ_RISK_VOL_FACTOR || 1.2),
+      },
+      onLiquidationAlert: (message) => {
+        this.alertService?.send('LIQUIDATION_RISK', message, 'CRITICAL');
+      },
       takerFeeBps: this.config.takerFeeBps,
       profitLockBufferBps: this.config.profitLockBufferBps,
     });
@@ -499,7 +513,10 @@ export class Orchestrator {
         maxDailyDrawdownPct: Number(process.env.CB_MAX_DAILY_DRAWDOWN_PCT || 0.15),
         pauseDurationMs: Number(process.env.CB_PAUSE_MS || 30 * 60 * 1000),
       },
-      onAlert: (message) => this.log('CIRCUIT_BREAKER_ALERT', { symbol: normalized, message }),
+      onAlert: (message) => {
+        this.log('CIRCUIT_BREAKER_ALERT', { symbol: normalized, message });
+        this.alertService?.send('LARGE_LOSS', `${normalized}: ${message}`, 'HIGH');
+      },
     });
     this.riskManagers.set(normalized, manager);
     return manager;
@@ -1087,7 +1104,7 @@ export class Orchestrator {
   }
 }
 
-export function createOrchestratorFromEnv(): Orchestrator {
+export function createOrchestratorFromEnv(alertService?: AlertService): Orchestrator {
   const parseEnvFlag = (value: string | undefined): boolean => {
     if (!value) return false;
     const normalized = value.trim().replace(/^['"]|['"]$/g, '').toLowerCase();
@@ -1221,5 +1238,5 @@ export function createOrchestratorFromEnv(): Orchestrator {
     takerFeeBps: Number(process.env.TAKER_FEE_BPS || 4),
     profitLockBufferBps: Number(process.env.PROFIT_LOCK_BUFFER_BPS || 2),
     plan: planConfig,
-  });
+  }, alertService);
 }

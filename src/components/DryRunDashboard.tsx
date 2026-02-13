@@ -35,6 +35,16 @@ interface DryRunStatus {
     feePaid: number;
     fundingPnl: number;
     marginHealth: number;
+    performance?: {
+      totalPnL: number;
+      winCount: number;
+      lossCount: number;
+      totalTrades: number;
+      winRate: number;
+      maxDrawdown: number;
+      sharpeRatio: number;
+      pnlCurve: Array<{ timestamp: number; pnl: number }>;
+    };
   };
   perSymbol: Record<string, {
     symbol: string;
@@ -47,6 +57,27 @@ interface DryRunStatus {
       feePaid: number;
       fundingPnl: number;
       marginHealth: number;
+    };
+    performance?: {
+      totalPnL: number;
+      winCount: number;
+      lossCount: number;
+      totalTrades: number;
+      winRate: number;
+      maxDrawdown: number;
+      sharpeRatio: number;
+      pnlCurve: Array<{ timestamp: number; pnl: number }>;
+    };
+    risk?: {
+      winStreak: number;
+      lossStreak: number;
+      dynamicLeverage: number;
+      stopLossPrice: number | null;
+      liquidationRisk?: {
+        score: 'GREEN' | 'YELLOW' | 'ORANGE' | 'RED' | 'CRITICAL';
+        timeToLiquidationMs: number | null;
+        fundingRateImpact: number;
+      };
     };
     position: {
       side: 'LONG' | 'SHORT';
@@ -67,6 +98,14 @@ interface DryRunStatus {
     eventCount: number;
   }>;
   logTail: DryRunConsoleLog[];
+  alphaDecay: Array<{
+    signalType: string;
+    avgValidityMs: number;
+    alphaDecayHalfLife: number;
+    optimalEntryWindow: [number, number];
+    optimalExitWindow: [number, number];
+    sampleCount: number;
+  }>;
 }
 
 const DEFAULT_STATUS: DryRunStatus = {
@@ -82,9 +121,20 @@ const DEFAULT_STATUS: DryRunStatus = {
     feePaid: 0,
     fundingPnl: 0,
     marginHealth: 0,
+    performance: {
+      totalPnL: 0,
+      winCount: 0,
+      lossCount: 0,
+      totalTrades: 0,
+      winRate: 0,
+      maxDrawdown: 0,
+      sharpeRatio: 0,
+      pnlCurve: [],
+    },
   },
   perSymbol: {},
   logTail: [],
+  alphaDecay: [],
 };
 
 const formatNum = (n: number, d = 2): string => n.toLocaleString(undefined, {
@@ -281,6 +331,7 @@ const DryRunDashboard: React.FC = () => {
   };
 
   const summary = status.summary;
+  const perf = summary.performance || DEFAULT_STATUS.summary.performance!;
   const marginHealthPct = summary.marginHealth * 100;
   const symbolRows = useMemo(() => Object.values(status.perSymbol), [status.perSymbol]);
 
@@ -493,10 +544,37 @@ const DryRunDashboard: React.FC = () => {
           </div>
         </div>
 
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+          <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-4">
+            <div className="text-xs text-zinc-500">Total PnL</div>
+            <div className={`text-lg font-mono mt-1 ${perf.totalPnL >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+              {perf.totalPnL >= 0 ? '+' : ''}{formatNum(perf.totalPnL, 4)}
+            </div>
+          </div>
+          <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-4">
+            <div className="text-xs text-zinc-500">Win Rate</div>
+            <div className={`text-lg font-mono mt-1 ${perf.winRate >= 55 ? 'text-emerald-400' : 'text-amber-300'}`}>
+              {formatNum(perf.winRate, 2)}%
+            </div>
+          </div>
+          <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-4">
+            <div className="text-xs text-zinc-500">Max Drawdown</div>
+            <div className="text-lg font-mono mt-1 text-red-400">
+              {formatNum(perf.maxDrawdown, 4)}
+            </div>
+          </div>
+          <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-4">
+            <div className="text-xs text-zinc-500">Sharpe</div>
+            <div className={`text-lg font-mono mt-1 ${perf.sharpeRatio >= 1.8 ? 'text-emerald-400' : 'text-amber-300'}`}>
+              {formatNum(perf.sharpeRatio, 2)}
+            </div>
+          </div>
+        </div>
+
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4 overflow-x-auto">
             <h2 className="text-sm font-semibold text-zinc-300 mb-3">Per-Symbol Positions</h2>
-            <table className="w-full text-xs min-w-[760px]">
+            <table className="w-full text-xs min-w-[980px]">
               <thead>
                 <tr className="text-zinc-500 border-b border-zinc-800">
                   <th className="text-left py-2">Symbol</th>
@@ -506,13 +584,17 @@ const DryRunDashboard: React.FC = () => {
                   <th className="text-right py-2">Mark</th>
                   <th className="text-right py-2">Eq</th>
                   <th className="text-right py-2">Margin Health</th>
+                  <th className="text-right py-2">Streak</th>
+                  <th className="text-right py-2">Lev</th>
+                  <th className="text-right py-2">Stop</th>
+                  <th className="text-right py-2">Liq</th>
                   <th className="text-right py-2">Events</th>
                 </tr>
               </thead>
               <tbody>
                 {symbolRows.length === 0 && (
                   <tr>
-                    <td colSpan={8} className="py-4 text-center text-zinc-600 italic">No active symbol session</td>
+                    <td colSpan={12} className="py-4 text-center text-zinc-600 italic">No active symbol session</td>
                   </tr>
                 )}
                 {symbolRows.map((row) => (
@@ -526,6 +608,18 @@ const DryRunDashboard: React.FC = () => {
                     <td className="py-2 text-right font-mono">{formatNum(row.metrics.markPrice, 4)}</td>
                     <td className="py-2 text-right font-mono">{formatNum(row.metrics.totalEquity, 4)}</td>
                     <td className="py-2 text-right font-mono">{formatNum(row.metrics.marginHealth * 100, 2)}%</td>
+                    <td className="py-2 text-right font-mono">
+                      {row.risk ? `${row.risk.winStreak}/${row.risk.lossStreak}` : '-'}
+                    </td>
+                    <td className="py-2 text-right font-mono">
+                      {row.risk ? formatNum(row.risk.dynamicLeverage, 2) : '-'}
+                    </td>
+                    <td className="py-2 text-right font-mono">
+                      {row.risk?.stopLossPrice ? formatNum(row.risk.stopLossPrice, 4) : '-'}
+                    </td>
+                    <td className="py-2 text-right font-mono">
+                      {row.risk?.liquidationRisk?.score || '-'}
+                    </td>
                     <td className="py-2 text-right font-mono text-zinc-500">{row.eventCount}</td>
                   </tr>
                 ))}
@@ -546,6 +640,38 @@ const DryRunDashboard: React.FC = () => {
               {logLines.length === 0 ? 'Dry Run not started.' : logLines.join('\n')}
             </div>
           </div>
+        </div>
+
+        <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+          <h2 className="text-sm font-semibold text-zinc-300 mb-3">Alpha Decay Summary</h2>
+          {status.alphaDecay.length === 0 ? (
+            <div className="text-xs text-zinc-500">No alpha decay samples yet.</div>
+          ) : (
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-zinc-500 border-b border-zinc-800">
+                  <th className="text-left py-2">Signal</th>
+                  <th className="text-right py-2">Avg Validity (ms)</th>
+                  <th className="text-right py-2">Half-Life (ms)</th>
+                  <th className="text-right py-2">Entry Window</th>
+                  <th className="text-right py-2">Exit Window</th>
+                  <th className="text-right py-2">Samples</th>
+                </tr>
+              </thead>
+              <tbody>
+                {status.alphaDecay.map((item) => (
+                  <tr key={item.signalType} className="border-b border-zinc-800/40">
+                    <td className="py-2 font-mono text-zinc-200">{item.signalType}</td>
+                    <td className="py-2 text-right font-mono">{formatNum(item.avgValidityMs, 0)}</td>
+                    <td className="py-2 text-right font-mono">{formatNum(item.alphaDecayHalfLife, 0)}</td>
+                    <td className="py-2 text-right font-mono">{item.optimalEntryWindow[0]}-{item.optimalEntryWindow[1]}</td>
+                    <td className="py-2 text-right font-mono">{item.optimalExitWindow[0]}-{item.optimalExitWindow[1]}</td>
+                    <td className="py-2 text-right font-mono text-zinc-500">{item.sampleCount}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
 
         <div className="bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden shadow-2xl">

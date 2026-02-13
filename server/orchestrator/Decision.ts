@@ -9,6 +9,16 @@ export interface DecisionDependencies {
   getMaxLeverage: () => number;
   hardStopLossPct: number;
   liquidationEmergencyMarginRatio: number;
+  liquidationRiskConfig?: {
+    yellowThreshold?: number;
+    orangeThreshold?: number;
+    redThreshold?: number;
+    criticalThreshold?: number;
+    timeToLiquidationWarningMs?: number;
+    fundingRateImpactFactor?: number;
+    volatilityImpactFactor?: number;
+  };
+  onLiquidationAlert?: (message: string) => void;
   takerFeeBps: number;
   profitLockBufferBps: number;
 }
@@ -42,7 +52,9 @@ export class DecisionEngine {
 
     const liquidationTriggered = liquidationRiskTriggered(state, {
       emergencyMarginRatio: this.deps.liquidationEmergencyMarginRatio,
-    });
+      riskConfig: this.deps.liquidationRiskConfig,
+      onAlert: this.deps.onLiquidationAlert,
+    }, metrics);
     const hardStopEvaluation = evaluateHardStop(state, { maxLossPct: this.deps.hardStopLossPct }, marketPrice);
 
     const emergencyReason = liquidationTriggered

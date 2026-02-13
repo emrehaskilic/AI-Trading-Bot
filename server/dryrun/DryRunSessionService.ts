@@ -1,6 +1,13 @@
 import { DryRunEngine } from './DryRunEngine';
 import { DryRunConfig, DryRunEventInput, DryRunEventLog, DryRunOrderBook, DryRunOrderRequest, DryRunStateSnapshot } from './types';
 import { StrategySignal } from '../strategy/StrategyEngine';
+import { AlphaDecayAnalyzer } from '../strategy/AlphaDecayAnalyzer';
+import { AlertService } from '../notifications/AlertService';
+import { PositionSizingService, DynamicSizingConfig } from './PositionSizingService';
+import { DynamicStopLossService, DynamicStopLossConfig } from '../risk/DynamicStopLossService';
+import { PerformanceCalculator, PerformanceMetrics } from '../metrics/PerformanceCalculator';
+import { SessionStore } from './SessionStore';
+import { LimitOrderStrategy, LimitStrategyMode } from './LimitOrderStrategy';
 
 export interface DryRunSessionStartInput {
   symbols?: string[];
@@ -38,6 +45,18 @@ export interface DryRunSymbolStatus {
     fundingPnl: number;
     marginHealth: number;
   };
+  performance?: PerformanceMetrics;
+  risk?: {
+    winStreak: number;
+    lossStreak: number;
+    dynamicLeverage: number;
+    stopLossPrice: number | null;
+    liquidationRisk?: {
+      score: 'GREEN' | 'YELLOW' | 'ORANGE' | 'RED' | 'CRITICAL';
+      timeToLiquidationMs: number | null;
+      fundingRateImpact: number;
+    };
+  };
   position: {
     side: 'LONG' | 'SHORT';
     qty: number;
@@ -72,9 +91,18 @@ export interface DryRunSessionStatus {
     feePaid: number;
     fundingPnl: number;
     marginHealth: number;
+    performance?: PerformanceMetrics;
   };
   perSymbol: Record<string, DryRunSymbolStatus>;
   logTail: DryRunConsoleLog[];
+  alphaDecay: Array<{
+    signalType: string;
+    avgValidityMs: number;
+    alphaDecayHalfLife: number;
+    optimalEntryWindow: [number, number];
+    optimalExitWindow: [number, number];
+    sampleCount: number;
+  }>;
 }
 
 type SymbolSession = {
@@ -83,8 +111,20 @@ type SymbolSession = {
   fundingRate: number;
   lastEventTimestampMs: number;
   lastState: DryRunStateSnapshot;
+  lastOrderBook: DryRunOrderBook;
   latestMarkPrice: number;
   lastMarkPrice: number;
+  atr: number;
+  avgAtr: number;
+  priceHistory: number[];
+  obi: number;
+  volatilityRegime: 'LOW' | 'MEDIUM' | 'HIGH';
+  winStreak: number;
+  lossStreak: number;
+  dynamicLeverage: number;
+  stopLossPrice: number | null;
+  performance: PerformanceCalculator;
+  activeSignal: { type: string; timestampMs: number } | null;
   lastEntryEventTs: number;
   lastHeartbeatTs: number;
   lastDataLogTs: number;
@@ -109,6 +149,32 @@ const DEFAULT_ENTRY_COOLDOWN_MS = Number(process.env.DRY_RUN_ENTRY_COOLDOWN_MS |
 const DEFAULT_HEARTBEAT_INTERVAL_MS = Number(process.env.DRY_RUN_HEARTBEAT_INTERVAL_MS || 10_000);
 const CONSOLE_LOG_TAIL_LIMIT = Number(process.env.DRY_RUN_CONSOLE_TAIL_LIMIT || 500);
 const ENGINE_LOG_TAIL_LIMIT = Number(process.env.DRY_RUN_ENGINE_TAIL_LIMIT || 120);
+const DEFAULT_WIN_STREAK_MULT = Number(process.env.DRY_RUN_WIN_STREAK_MULT || 0.06);
+const DEFAULT_LOSS_STREAK_DIV = Number(process.env.DRY_RUN_LOSS_STREAK_DIV || 0.25);
+const DEFAULT_MARTINGALE_FACTOR = Number(process.env.DRY_RUN_MARTINGALE_FACTOR || 1.2);
+const DEFAULT_MARTINGALE_MAX = Number(process.env.DRY_RUN_MARTINGALE_MAX || 3);
+const DEFAULT_MAX_NOTIONAL = Number(process.env.DRY_RUN_MAX_NOTIONAL_USDT || 5000);
+const DEFAULT_STOP_ATR_MULT = Number(process.env.DRY_RUN_STOP_ATR_MULT || 1.4);
+const DEFAULT_STOP_VOL_FACTOR = Number(process.env.DRY_RUN_STOP_VOL_FACTOR || 0.2);
+const DEFAULT_STOP_OBI_FACTOR = Number(process.env.DRY_RUN_STOP_OBI_FACTOR || 0.4);
+const DEFAULT_STOP_MIN_DIST = Number(process.env.DRY_RUN_STOP_MIN_DIST || 0.5);
+const DEFAULT_STOP_MAX_DIST = Number(process.env.DRY_RUN_STOP_MAX_DIST || 50);
+const DEFAULT_ATR_WINDOW = Number(process.env.DRY_RUN_ATR_WINDOW || 14);
+const DEFAULT_LARGE_LOSS_ALERT = Number(process.env.DRY_RUN_LARGE_LOSS_USDT || 500);
+const DEFAULT_LIMIT_STRATEGY = String(process.env.DRY_RUN_LIMIT_STRATEGY || 'MARKET').toUpperCase();
+
+function parseLimitStrategy(input: string): LimitStrategyMode {
+  switch (input) {
+    case 'PASSIVE':
+      return 'PASSIVE';
+    case 'SPLIT':
+      return 'SPLIT';
+    case 'AGGRESSIVE':
+      return 'AGGRESSIVE';
+    default:
+      return 'MARKET';
+  }
+}
 
 function finiteOr(value: unknown, fallback: number): number {
   const n = Number(value);
@@ -149,6 +215,44 @@ export class DryRunSessionService {
   private symbols: string[] = [];
   private sessions = new Map<string, SymbolSession>();
   private logTail: DryRunConsoleLog[] = [];
+  private sizingService: PositionSizingService;
+  private stopLossService: DynamicStopLossService;
+  private limitStrategy: LimitOrderStrategy;
+  private alphaDecay = new AlphaDecayAnalyzer();
+  private readonly alertService?: AlertService;
+  private readonly sessionStore: SessionStore;
+
+  constructor(alertService?: AlertService) {
+    const sizingConfig: DynamicSizingConfig = {
+      baseLeverage: 10,
+      winStreakMultiplier: DEFAULT_WIN_STREAK_MULT,
+      lossStreakDivisor: DEFAULT_LOSS_STREAK_DIV,
+      martingaleFactor: DEFAULT_MARTINGALE_FACTOR,
+      martingaleMaxSteps: DEFAULT_MARTINGALE_MAX,
+      marginHealthLeverageFactor: 2,
+      minLeverage: 1,
+      maxLeverage: 50,
+      maxPositionNotionalUsdt: DEFAULT_MAX_NOTIONAL,
+    };
+    const stopConfig: DynamicStopLossConfig = {
+      baseAtrMultiplier: DEFAULT_STOP_ATR_MULT,
+      volatilityAdjustmentFactor: DEFAULT_STOP_VOL_FACTOR,
+      obiAdjustmentFactor: DEFAULT_STOP_OBI_FACTOR,
+      minStopDistance: DEFAULT_STOP_MIN_DIST,
+      maxStopDistance: DEFAULT_STOP_MAX_DIST,
+    };
+
+    this.sizingService = new PositionSizingService(sizingConfig);
+    this.stopLossService = new DynamicStopLossService(stopConfig);
+    this.limitStrategy = new LimitOrderStrategy({
+      mode: parseLimitStrategy(DEFAULT_LIMIT_STRATEGY),
+      splitLevels: 3,
+      passiveOffsetBps: 2,
+      maxSlices: 4,
+    });
+    this.alertService = alertService;
+    this.sessionStore = new SessionStore();
+  }
 
   start(input: DryRunSessionStartInput): DryRunSessionStatus {
     const symbols = normalizeSymbols(input);
@@ -178,6 +282,7 @@ export class DryRunSessionService {
     this.sessions.clear();
     this.logTail = [];
     this.consoleSeq = 0;
+    this.alphaDecay = new AlphaDecayAnalyzer();
 
     this.config = {
       walletBalanceStartUsdt,
@@ -189,6 +294,18 @@ export class DryRunSessionService {
       heartbeatIntervalMs,
       debugAggressiveEntry,
     };
+
+    this.sizingService = new PositionSizingService({
+      baseLeverage: leverage,
+      winStreakMultiplier: DEFAULT_WIN_STREAK_MULT,
+      lossStreakDivisor: DEFAULT_LOSS_STREAK_DIV,
+      martingaleFactor: DEFAULT_MARTINGALE_FACTOR,
+      martingaleMaxSteps: DEFAULT_MARTINGALE_MAX,
+      marginHealthLeverageFactor: 2,
+      minLeverage: 1,
+      maxLeverage: Math.max(leverage, 50),
+      maxPositionNotionalUsdt: DEFAULT_MAX_NOTIONAL,
+    });
 
     for (const symbol of this.symbols) {
       const fundingRate = Number.isFinite(input.fundingRates?.[symbol] as number)
@@ -219,8 +336,20 @@ export class DryRunSessionService {
         fundingRate,
         lastEventTimestampMs: 0,
         lastState,
+        lastOrderBook: { bids: [], asks: [] },
         latestMarkPrice: 0,
         lastMarkPrice: 0,
+        atr: 0,
+        avgAtr: 0,
+        priceHistory: [],
+        obi: 0,
+        volatilityRegime: 'MEDIUM',
+        winStreak: 0,
+        lossStreak: 0,
+        dynamicLeverage: leverage,
+        stopLossPrice: null,
+        performance: new PerformanceCalculator(walletBalanceStartUsdt),
+        activeSignal: null,
         lastEntryEventTs: 0,
         lastHeartbeatTs: 0,
         lastDataLogTs: 0,
@@ -258,7 +387,126 @@ export class DryRunSessionService {
     this.sessions.clear();
     this.logTail = [];
     this.consoleSeq = 0;
+    this.alphaDecay = new AlphaDecayAnalyzer();
     return this.getStatus();
+  }
+
+  async saveSession(sessionId?: string): Promise<void> {
+    if (!this.runId) {
+      throw new Error('dry_run_not_initialized');
+    }
+    const id = sessionId || this.runId;
+    const payload = {
+      runId: this.runId,
+      config: this.config,
+      symbols: this.symbols,
+      status: this.getStatus(),
+      sessions: Array.from(this.sessions.values()).map((session) => ({
+        symbol: session.symbol,
+        lastState: session.lastState,
+        latestMarkPrice: session.latestMarkPrice,
+        lastMarkPrice: session.lastMarkPrice,
+        atr: session.atr,
+        avgAtr: session.avgAtr,
+        priceHistory: session.priceHistory,
+        obi: session.obi,
+        volatilityRegime: session.volatilityRegime,
+        winStreak: session.winStreak,
+        lossStreak: session.lossStreak,
+        dynamicLeverage: session.dynamicLeverage,
+        stopLossPrice: session.stopLossPrice,
+        activeSignal: session.activeSignal,
+        performance: session.performance.getMetrics(),
+        realizedPnl: session.realizedPnl,
+        feePaid: session.feePaid,
+        fundingPnl: session.fundingPnl,
+        eventCount: session.eventCount,
+        lastEventTimestampMs: session.lastEventTimestampMs,
+      })),
+    };
+    await this.sessionStore.save(id, payload);
+  }
+
+  async loadSession(sessionId: string): Promise<DryRunSessionStatus> {
+    const stored = await this.sessionStore.load(sessionId);
+    if (!stored) {
+      throw new Error('dry_run_session_not_found');
+    }
+    const payload: any = stored.payload;
+    if (!payload?.config || !Array.isArray(payload?.symbols)) {
+      throw new Error('dry_run_session_invalid');
+    }
+
+    this.running = false;
+    const config = payload.config as NonNullable<DryRunSessionStatus['config']>;
+    this.runId = payload.runId || sessionId;
+    this.symbols = [...payload.symbols];
+    this.config = config;
+    this.sessions.clear();
+
+    for (const symbol of this.symbols) {
+      const sessionSnapshot = payload.sessions?.find((s: any) => s.symbol === symbol);
+      const cfg: DryRunConfig = {
+        runId: `${this.runId}-${symbol}`,
+        walletBalanceStartUsdt: config.walletBalanceStartUsdt,
+        initialMarginUsdt: config.initialMarginUsdt,
+        leverage: config.leverage,
+        takerFeeRate: config.takerFeeRate,
+        maintenanceMarginRate: config.maintenanceMarginRate,
+        fundingRate: 0,
+        fundingIntervalMs: config.fundingIntervalMs,
+        proxy: {
+          mode: 'backend-proxy',
+          restBaseUrl: 'https://fapi.binance.com',
+          marketWsBaseUrl: 'wss://fstream.binance.com/stream',
+        },
+      };
+      const engine = new DryRunEngine(cfg);
+      if (sessionSnapshot?.lastState) {
+        engine.restoreState(sessionSnapshot.lastState);
+      }
+      const perf = new PerformanceCalculator(config.walletBalanceStartUsdt);
+      if (sessionSnapshot?.performance) {
+        perf.restore(sessionSnapshot.performance);
+      }
+      this.sessions.set(symbol, {
+        symbol,
+        engine,
+        fundingRate: 0,
+        lastEventTimestampMs: sessionSnapshot?.lastEventTimestampMs || 0,
+        lastState: sessionSnapshot?.lastState || engine.getStateSnapshot(),
+        lastOrderBook: { bids: [], asks: [] },
+        latestMarkPrice: sessionSnapshot?.latestMarkPrice || 0,
+        lastMarkPrice: sessionSnapshot?.lastMarkPrice || 0,
+        atr: sessionSnapshot?.atr || 0,
+        avgAtr: sessionSnapshot?.avgAtr || 0,
+        priceHistory: sessionSnapshot?.priceHistory || [],
+        obi: sessionSnapshot?.obi || 0,
+        volatilityRegime: sessionSnapshot?.volatilityRegime || 'MEDIUM',
+        winStreak: sessionSnapshot?.winStreak || 0,
+        lossStreak: sessionSnapshot?.lossStreak || 0,
+        dynamicLeverage: sessionSnapshot?.dynamicLeverage || config.leverage,
+        stopLossPrice: sessionSnapshot?.stopLossPrice ?? null,
+        performance: perf,
+        activeSignal: sessionSnapshot?.activeSignal ?? null,
+        lastEntryEventTs: 0,
+        lastHeartbeatTs: 0,
+        lastDataLogTs: 0,
+        lastEmptyBookLogTs: 0,
+        realizedPnl: sessionSnapshot?.realizedPnl || 0,
+        feePaid: sessionSnapshot?.feePaid || 0,
+        fundingPnl: sessionSnapshot?.fundingPnl || 0,
+        eventCount: sessionSnapshot?.eventCount || 0,
+        manualOrders: [],
+        logTail: [],
+      });
+    }
+
+    return this.getStatus();
+  }
+
+  async listSessions(): Promise<string[]> {
+    return this.sessionStore.list();
   }
 
   getActiveSymbols(): string[] {
@@ -297,7 +545,7 @@ export class DryRunSessionService {
     return this.getStatus();
   }
 
-  submitStrategySignal(symbol: string, signal: StrategySignal): void {
+  submitStrategySignal(symbol: string, signal: StrategySignal, timestampMs?: number): void {
     const normalized = normalizeSymbol(symbol);
     const session = this.sessions.get(normalized);
     if (!this.running || !session || !this.config) return;
@@ -321,23 +569,39 @@ export class DryRunSessionService {
       return;
     }
 
-    // Calculate Quantity
+    // Calculate Quantity with dynamic sizing
     const referencePrice = signal.candidate.entryPrice;
     if (referencePrice <= 0) return;
 
-    const qtyRaw = (this.config.initialMarginUsdt * this.config.leverage) / referencePrice;
-    const qty = roundTo(qtyRaw, 6);
-
-    if (qty <= 0) return;
-
-    // Queue the Entry Order
-    session.manualOrders.push({
-      side: side,
-      type: 'MARKET', // Strategy suggests price, but for reliability we use MARKET in dry run for now
-      qty: qty,
-      timeInForce: 'IOC',
-      reduceOnly: false
+    const sizing = this.sizingService.compute({
+      walletBalanceUsdt: session.lastState.walletBalance,
+      baseMarginUsdt: this.config.initialMarginUsdt,
+      markPrice: referencePrice,
+      winStreak: session.winStreak,
+      lossStreak: session.lossStreak,
+      marginHealth: session.lastState.marginHealth,
     });
+
+    if (!(sizing.quantity > 0)) return;
+    const qty = roundTo(sizing.quantity, 6);
+    session.dynamicLeverage = sizing.leverage;
+    session.engine.setLeverageOverride(sizing.leverage);
+
+    const entryOrders = this.limitStrategy.buildEntryOrders({
+      side,
+      qty,
+      markPrice: referencePrice,
+      orderBook: session.lastOrderBook,
+      urgency: Math.min(1, signal.score / 100),
+    });
+
+    for (const order of entryOrders) {
+      session.manualOrders.push(order);
+    }
+
+    const signalTs = Number.isFinite(timestampMs as number) ? Number(timestampMs) : Date.now();
+    session.activeSignal = { type: signal.signal, timestampMs: signalTs };
+    this.alphaDecay.recordSignal(normalized, signal.signal, signalTs);
 
     this.addConsoleLog('INFO', normalized, `Strategy Signal Executed: ${signal.signal} (${side} ${qty} @ ~${referencePrice})`, session.lastEventTimestampMs);
   }
@@ -362,6 +626,7 @@ export class DryRunSessionService {
     }
 
     const book = this.normalizeBook(input.orderBook);
+    session.lastOrderBook = book;
     if (book.bids.length === 0 || book.asks.length === 0) {
       if (session.lastEmptyBookLogTs === 0 || (eventTimestampMs - session.lastEmptyBookLogTs) >= this.config.heartbeatIntervalMs) {
         this.addConsoleLog('WARN', symbol, 'Orderbook empty on one side. Waiting for full depth.', eventTimestampMs);
@@ -378,6 +643,9 @@ export class DryRunSessionService {
     const markPrice = roundTo(resolvedMarkPriceRaw, 8);
     if (!(markPrice > 0)) return null;
 
+    this.updateDerivedMetrics(session, book, markPrice);
+
+    const prevPosition = session.lastState.position;
     const orders = this.buildDeterministicOrders(session, markPrice, eventTimestampMs);
     const event: DryRunEventInput = {
       timestampMs: eventTimestampMs,
@@ -400,6 +668,30 @@ export class DryRunSessionService {
     session.logTail.push(out.log);
     if (session.logTail.length > ENGINE_LOG_TAIL_LIMIT) {
       session.logTail = session.logTail.slice(session.logTail.length - ENGINE_LOG_TAIL_LIMIT);
+    }
+
+    if (out.log.realizedPnl !== 0) {
+      if (out.log.realizedPnl > 0) {
+        session.winStreak += 1;
+        session.lossStreak = 0;
+      } else {
+        session.lossStreak += 1;
+        session.winStreak = 0;
+      }
+      const equity = session.lastState.walletBalance + this.computeUnrealizedPnl(session);
+      session.performance.recordTrade({
+        realizedPnl: out.log.realizedPnl,
+        equity,
+      });
+
+      if (this.alertService && out.log.realizedPnl <= -DEFAULT_LARGE_LOSS_ALERT) {
+        this.alertService.send('LARGE_LOSS', `${symbol}: realized PnL ${roundTo(out.log.realizedPnl, 2)} USDT`, 'HIGH');
+      }
+    }
+
+    if (prevPosition && !out.state.position && session.activeSignal) {
+      this.alphaDecay.recordExit(symbol, eventTimestampMs);
+      session.activeSignal = null;
     }
 
     if (session.lastDataLogTs === 0 || (eventTimestampMs - session.lastDataLogTs) >= 2_000) {
@@ -451,6 +743,12 @@ export class DryRunSessionService {
     let fundingPnl = 0;
     let marginHealth = 0;
     let marginHealthInit = false;
+    let totalWins = 0;
+    let totalLosses = 0;
+    let totalPnL = 0;
+    let maxDrawdown = 0;
+    let sharpeSum = 0;
+    let sharpeCount = 0;
 
     for (const symbol of this.symbols) {
       const session = this.sessions.get(symbol);
@@ -474,6 +772,16 @@ export class DryRunSessionService {
         marginHealth = Math.min(marginHealth, symbolMarginHealth);
       }
 
+      const perf = session.performance.getMetrics();
+      totalWins += perf.winCount;
+      totalLosses += perf.lossCount;
+      totalPnL += perf.totalPnL;
+      maxDrawdown = Math.max(maxDrawdown, perf.maxDrawdown);
+      if (perf.sharpeRatio !== 0) {
+        sharpeSum += perf.sharpeRatio;
+        sharpeCount += 1;
+      }
+
       perSymbol[symbol] = {
         symbol,
         metrics: {
@@ -485,6 +793,14 @@ export class DryRunSessionService {
           feePaid: roundTo(session.feePaid, 8),
           fundingPnl: roundTo(session.fundingPnl, 8),
           marginHealth: roundTo(symbolMarginHealth, 8),
+        },
+        performance: perf,
+        risk: {
+          winStreak: session.winStreak,
+          lossStreak: session.lossStreak,
+          dynamicLeverage: roundTo(session.dynamicLeverage, 2),
+          stopLossPrice: session.stopLossPrice ? roundTo(session.stopLossPrice, 6) : null,
+          liquidationRisk: this.computeLiquidationRisk(session, symbolMarginHealth),
         },
         position: session.lastState.position
           ? {
@@ -514,9 +830,20 @@ export class DryRunSessionService {
         feePaid: roundTo(feePaid, 8),
         fundingPnl: roundTo(fundingPnl, 8),
         marginHealth: roundTo(marginHealthInit ? marginHealth : 0, 8),
+        performance: {
+          totalPnL: roundTo(totalPnL, 8),
+          winCount: totalWins,
+          lossCount: totalLosses,
+          totalTrades: totalWins + totalLosses,
+          winRate: totalWins + totalLosses > 0 ? (totalWins / (totalWins + totalLosses)) * 100 : 0,
+          maxDrawdown,
+          sharpeRatio: sharpeCount > 0 ? sharpeSum / sharpeCount : 0,
+          pnlCurve: [],
+        },
       },
       perSymbol,
       logTail: [...this.logTail],
+      alphaDecay: this.alphaDecay.getSummary(),
     };
   }
 
@@ -561,11 +888,26 @@ export class DryRunSessionService {
         // Only trigger internal random entry if debugAggressiveEntry is TRUE
         if (this.config.debugAggressiveEntry) {
           const side: 'BUY' | 'SELL' = this.resolveEntrySide(session, markPrice);
-          const targetNotional = this.config.initialMarginUsdt * this.config.leverage;
-          const qtyRaw = targetNotional / markPrice;
-          const qty = roundTo(Math.max(0, qtyRaw), 6);
+          const sizing = this.sizingService.compute({
+            walletBalanceUsdt: session.lastState.walletBalance,
+            baseMarginUsdt: this.config.initialMarginUsdt,
+            markPrice,
+            winStreak: session.winStreak,
+            lossStreak: session.lossStreak,
+            marginHealth: session.lastState.marginHealth,
+          });
+          const qty = roundTo(Math.max(0, sizing.quantity), 6);
+          session.dynamicLeverage = sizing.leverage;
+          session.engine.setLeverageOverride(sizing.leverage);
           if (qty > 0) {
-            orders.push({ side, type: 'MARKET', qty, timeInForce: 'IOC', reduceOnly: false });
+            const entryOrders = this.limitStrategy.buildEntryOrders({
+              side,
+              qty,
+              markPrice,
+              orderBook: session.lastOrderBook,
+              urgency: 0.3,
+            });
+            orders.push(...entryOrders);
             session.lastEntryEventTs = eventTimestampMs;
           }
         }
@@ -595,8 +937,33 @@ export class DryRunSessionService {
       return orders;
     }
 
-    const stopBps = Math.max(1, DEFAULT_STOP_BPS);
     const isLong = position.side === 'LONG';
+    const dynamicStop = this.stopLossService.calculateStopPrice({
+      side: position.side,
+      markPrice,
+      atr: session.atr || Math.max(0.5, (Math.abs(markPrice - position.entryPrice) * 0.02)),
+      volatilityRegime: session.volatilityRegime,
+      obiDivergence: session.obi,
+      sweepStrength: 0,
+    });
+    session.stopLossPrice = dynamicStop || null;
+
+    if (dynamicStop > 0) {
+      const stopTriggered = isLong ? markPrice <= dynamicStop : markPrice >= dynamicStop;
+      if (stopTriggered) {
+        const closeSide: 'BUY' | 'SELL' = isLong ? 'SELL' : 'BUY';
+        orders.push({
+          side: closeSide,
+          type: 'MARKET',
+          qty: roundTo(position.qty, 6),
+          timeInForce: 'IOC',
+          reduceOnly: true,
+        });
+      }
+      return orders;
+    }
+
+    const stopBps = Math.max(1, DEFAULT_STOP_BPS);
     const pnlBps = isLong
       ? ((markPrice - position.entryPrice) / position.entryPrice) * 10000
       : ((position.entryPrice - markPrice) / position.entryPrice) * 10000;
@@ -612,6 +979,37 @@ export class DryRunSessionService {
     }
 
     return orders;
+  }
+
+  private updateDerivedMetrics(session: SymbolSession, book: DryRunOrderBook, markPrice: number): void {
+    session.priceHistory.push(markPrice);
+    if (session.priceHistory.length > Math.max(DEFAULT_ATR_WINDOW * 4, 40)) {
+      session.priceHistory = session.priceHistory.slice(session.priceHistory.length - Math.max(DEFAULT_ATR_WINDOW * 4, 40));
+    }
+
+    if (session.priceHistory.length >= 2) {
+      const diffs: number[] = [];
+      for (let i = 1; i < session.priceHistory.length; i += 1) {
+        diffs.push(Math.abs(session.priceHistory[i] - session.priceHistory[i - 1]));
+      }
+      const window = diffs.slice(-DEFAULT_ATR_WINDOW);
+      const longWindow = diffs.slice(-Math.max(DEFAULT_ATR_WINDOW * 2, 20));
+      session.atr = window.length > 0 ? window.reduce((a, b) => a + b, 0) / window.length : session.atr;
+      session.avgAtr = longWindow.length > 0 ? longWindow.reduce((a, b) => a + b, 0) / longWindow.length : session.avgAtr;
+    }
+
+    const topLevels = Math.min(10, book.bids.length, book.asks.length);
+    let bidVol = 0;
+    let askVol = 0;
+    for (let i = 0; i < topLevels; i += 1) {
+      bidVol += book.bids[i]?.qty ?? 0;
+      askVol += book.asks[i]?.qty ?? 0;
+    }
+    const denom = bidVol + askVol;
+    session.obi = denom > 0 ? (bidVol - askVol) / denom : 0;
+
+    const ratio = session.avgAtr > 0 ? session.atr / session.avgAtr : 1;
+    session.volatilityRegime = ratio > 1.5 ? 'HIGH' : ratio < 0.7 ? 'LOW' : 'MEDIUM';
   }
 
   private resolveEntrySide(session: SymbolSession, markPrice: number): 'BUY' | 'SELL' {
@@ -630,6 +1028,31 @@ export class DryRunSessionService {
       return (session.latestMarkPrice - pos.entryPrice) * pos.qty;
     }
     return (pos.entryPrice - session.latestMarkPrice) * pos.qty;
+  }
+
+  private computeLiquidationRisk(session: SymbolSession, marginHealth: number): NonNullable<DryRunSymbolStatus['risk']>['liquidationRisk'] {
+    const thresholds = { yellow: 0.3, orange: 0.2, red: 0.1, critical: 0.05 };
+    let score: 'GREEN' | 'YELLOW' | 'ORANGE' | 'RED' | 'CRITICAL' = 'GREEN';
+    if (marginHealth <= thresholds.critical) score = 'CRITICAL';
+    else if (marginHealth <= thresholds.red) score = 'RED';
+    else if (marginHealth <= thresholds.orange) score = 'ORANGE';
+    else if (marginHealth <= thresholds.yellow) score = 'YELLOW';
+
+    const positionNotional = session.lastState.position
+      ? session.lastState.position.qty * (session.latestMarkPrice || 0)
+      : 0;
+    const fundingImpact = session.fundingRate * positionNotional;
+    const volFactor = session.volatilityRegime === 'HIGH' ? 1.4 : session.volatilityRegime === 'LOW' ? 0.8 : 1;
+    const baseMs = 5 * 60 * 1000;
+    const timeToLiquidationMs = marginHealth > 0
+      ? Math.max(0, Math.round(baseMs * (marginHealth / thresholds.yellow) / volFactor))
+      : 0;
+
+    return {
+      score,
+      timeToLiquidationMs,
+      fundingRateImpact: roundTo(fundingImpact, 4),
+    };
   }
 
   private addConsoleLog(

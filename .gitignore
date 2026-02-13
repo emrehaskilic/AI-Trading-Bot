@@ -11,3 +11,5 @@ server/dist/
 repo
 health_check_result.json
 server/health-report.json
+server/sessions/
+data/backfill/

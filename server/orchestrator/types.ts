@@ -122,6 +122,17 @@ export interface ExecQualityState {
   recentSlippageBps: number[];
 }
 
+export type RiskScore = 'GREEN' | 'YELLOW' | 'ORANGE' | 'RED' | 'CRITICAL';
+
+export interface LiquidationRiskStatus {
+  score: RiskScore;
+  timeToLiquidationMs: number | null;
+  fundingRateImpact: number;
+  volatilityImpact: number;
+  reason: string | null;
+  lastCalculatedAt: number;
+}
+
 export interface SymbolState {
   symbol: string;
   halted: boolean;
@@ -135,6 +146,7 @@ export interface SymbolState {
   last_exit_event_time_ms: number;
   marginRatio: number | null;
   execQuality: ExecQualityState;
+  liquidationRiskStatus?: LiquidationRiskStatus;
 }
 
 export interface OrderPlanConfig {

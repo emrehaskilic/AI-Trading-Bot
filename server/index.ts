@@ -47,6 +47,16 @@ import { StrategyEngine } from './strategy/StrategyEngine';
 import { DryRunConfig, DryRunEngine, DryRunEventInput, DryRunSessionService, isUpstreamGuardError } from './dryrun';
 import { logger, requestLogger, serializeError } from './utils/logger';
 import { WebSocketManager } from './ws/WebSocketManager';
+import { AlertService } from './notifications/AlertService';
+import { buildAlertConfigFromEnv } from './config/alertConfig';
+import { HealthController } from './health/HealthController';
+import { MarketDataArchive } from './backfill/MarketDataArchive';
+import { SignalReplay } from './backfill/SignalReplay';
+import { ABTestManager } from './abtesting';
+import { PortfolioMonitor } from './risk/PortfolioMonitor';
+import { LatencyTracker } from './metrics/LatencyTracker';
+import { MonteCarloSimulator } from './backtesting/MonteCarloSimulator';
+import { WalkForwardAnalyzer } from './backtesting/WalkForwardAnalyzer';
 
 // =============================================================================
 // Configuration
@@ -92,6 +102,8 @@ const MIN_RESYNC_INTERVAL_MS = 15000;
 const GRACE_PERIOD_MS = 5000;
 const CLIENT_HEARTBEAT_INTERVAL_MS = Number(process.env.CLIENT_HEARTBEAT_INTERVAL_MS || 15000);
 const CLIENT_STALE_CONNECTION_MS = Number(process.env.CLIENT_STALE_CONNECTION_MS || 60000);
+const BACKFILL_RECORDING_ENABLED = parseEnvFlag(process.env.BACKFILL_RECORDING_ENABLED);
+const BACKFILL_SNAPSHOT_INTERVAL_MS = Number(process.env.BACKFILL_SNAPSHOT_INTERVAL_MS || 2000);
 
 // [PHASE 3] Execution Flags
 let KILL_SWITCH = false;
@@ -177,6 +189,7 @@ interface SymbolMeta {
     lastStateTransitionTs: number;
     lastLiveTs: number;
     lastBlockedTelemetryTs: number;
+    lastArchiveSnapshotTs: number;
     // Rolling windows
     desyncEvents: number[];
     snapshotOkEvents: number[];
@@ -212,8 +225,14 @@ const strategyMap = new Map<string, StrategyEngine>();
 const backfillInFlight = new Set<string>();
 const backfillLastAttemptMs = new Map<string, number>();
 const BACKFILL_RETRY_INTERVAL_MS = 30_000;
-const orchestrator = createOrchestratorFromEnv();
-const dryRunSession = new DryRunSessionService();
+const alertService = new AlertService(buildAlertConfigFromEnv());
+const orchestrator = createOrchestratorFromEnv(alertService);
+const dryRunSession = new DryRunSessionService(alertService);
+const abTestManager = new ABTestManager(alertService);
+const marketArchive = new MarketDataArchive();
+const signalReplay = new SignalReplay(marketArchive);
+const portfolioMonitor = new PortfolioMonitor();
+const latencyTracker = new LatencyTracker();
 orchestrator.setKillSwitch(KILL_SWITCH);
 if (typeof process.env.EXECUTION_MODE !== 'undefined') {
     log('CONFIG_WARNING', { message: 'EXECUTION_MODE is deprecated and ignored' });
@@ -274,6 +293,7 @@ function getMeta(symbol: string): SymbolMeta {
             lastStateTransitionTs: Date.now(),
             lastLiveTs: 0,
             lastBlockedTelemetryTs: 0,
+            lastArchiveSnapshotTs: 0,
             desyncEvents: [],
             snapshotOkEvents: [],
             snapshotSkipEvents: [],
@@ -393,7 +413,12 @@ function ensureMonitors(symbol: string) {
 
     if (!fundingMonitors.has(symbol)) {
         const m = new FundingMonitor(symbol);
-        m.onUpdate(d => lastFunding.set(symbol, d));
+        m.onUpdate(d => {
+            lastFunding.set(symbol, d);
+            if (BACKFILL_RECORDING_ENABLED) {
+                void marketArchive.recordFunding(symbol, d, Date.now());
+            }
+        });
         m.start();
         fundingMonitors.set(symbol, m);
     }
@@ -533,6 +558,15 @@ const wsManager = new WebSocketManager({
     staleConnectionMs: CLIENT_STALE_CONNECTION_MS,
 });
 let autoScaleForcedSingle = false;
+const healthController = new HealthController(wsManager, {
+    getLatencySnapshot: () => latencyTracker.snapshot(),
+});
+
+function updateDryRunHealthFlag(): void {
+    const dryRunActive = dryRunSession.getStatus().running;
+    const abTestActive = abTestManager.getSnapshot().status === 'RUNNING';
+    healthController.setDryRunActive(dryRunActive || abTestActive);
+}
 
 function buildDepthStream(symbolLower: string): string {
     if (DEPTH_STREAM_MODE === 'partial') {
@@ -655,6 +689,7 @@ async function processDepthQueue(symbol: string) {
             const update = meta.depthQueue.shift()!;
             const now = Date.now();
             const lagMs = now - update.receiptTimeMs;
+            latencyTracker.record('depth_ingest_ms', Math.max(0, now - Number(update.eventTimeMs || now)));
             if (lagMs > DEPTH_LAG_MAX_MS) {
                 meta.desyncCount++;
                 meta.desyncEvents.push(now);
@@ -695,6 +730,12 @@ async function processDepthQueue(symbol: string) {
                 nowMs: now,
             });
 
+            if (integrity.level === 'CRITICAL') {
+                alertService.send('ORDERBOOK_INTEGRITY', `${symbol}: ${integrity.message}`, 'CRITICAL');
+            } else if (integrity.level === 'DEGRADED') {
+                alertService.send('ORDERBOOK_INTEGRITY', `${symbol}: ${integrity.message}`, 'MEDIUM');
+            }
+
             if (integrity.reconnectRecommended && !meta.isResyncing) {
                 const timeSinceResync = now - meta.lastResyncTs;
                 if (timeSinceResync > MIN_RESYNC_INTERVAL_MS) {
@@ -718,6 +759,19 @@ async function processDepthQueue(symbol: string) {
             const absVal = absorptionResult.get(symbol) ?? 0;
             broadcastMetrics(symbol, ob, tas, cvd, absVal, leg, update.eventTimeMs || 0, null, 'depth');
 
+            if (BACKFILL_RECORDING_ENABLED) {
+                const lastArchive = meta.lastArchiveSnapshotTs || 0;
+                if (now - lastArchive >= BACKFILL_SNAPSHOT_INTERVAL_MS) {
+                    const top = getTopLevels(ob, Number(process.env.DRY_RUN_ORDERBOOK_DEPTH || 20));
+                    void marketArchive.recordOrderbookSnapshot(symbol, {
+                        bids: top.bids,
+                        asks: top.asks,
+                        lastUpdateId: ob.lastUpdateId || 0,
+                    }, Number(update.eventTimeMs || now));
+                    meta.lastArchiveSnapshotTs = now;
+                }
+            }
+
             if (dryRunSession.isTrackingSymbol(symbol)) {
                 const top = getTopLevels(ob, Number(process.env.DRY_RUN_ORDERBOOK_DEPTH || 20));
                 const bestBidPx = bestBid(ob);
@@ -726,7 +780,18 @@ async function processDepthQueue(symbol: string) {
                     ? (bestBidPx + bestAskPx) / 2
                     : (bestBidPx || bestAskPx || 0);
                 try {
+                    const ingestStart = Date.now();
                     dryRunSession.ingestDepthEvent({
+                        symbol,
+                        eventTimestampMs: Number(update.eventTimeMs || 0),
+                        markPrice,
+                        orderBook: {
+                            bids: top.bids.map(([price, qty]) => ({ price, qty })),
+                            asks: top.asks.map(([price, qty]) => ({ price, qty })),
+                        },
+                    });
+                    latencyTracker.record('dry_run_ingest_ms', Date.now() - ingestStart);
+                    abTestManager.ingestDepthEvent({
                         symbol,
                         eventTimestampMs: Number(update.eventTimeMs || 0),
                         markPrice,
@@ -836,6 +901,7 @@ async function processSymbolEvent(s: string, d: any) {
         meta.depthMsgCount++;
         meta.depthMsgCount10s++;
         meta.lastDepthMsgTs = now;
+        healthController.setLastDataReceivedAt(now);
 
         ensureMonitors(s);
         enqueueDepthUpdate(s, {
@@ -849,10 +915,18 @@ async function processSymbolEvent(s: string, d: any) {
     } else if (e === 'trade') {
         ensureMonitors(s);
         meta.tradeMsgCount++;
+        healthController.setLastDataReceivedAt(now);
         const p = parseFloat(d.p);
         const q = parseFloat(d.q);
         const t = d.T;
         const side = d.m ? 'sell' : 'buy';
+        latencyTracker.record('trade_ingest_ms', Math.max(0, now - Number(t || now)));
+        if (p > 0) {
+            portfolioMonitor.ingestPrice(s, p);
+        }
+        if (BACKFILL_RECORDING_ENABLED && Number.isFinite(p) && Number.isFinite(q)) {
+            void marketArchive.recordTrade(s, { price: p, quantity: q, side }, Number(t || now));
+        }
 
         const tas = getTaS(s);
         const cvd = getCvd(s);
@@ -870,6 +944,7 @@ async function processSymbolEvent(s: string, d: any) {
         // [PHASE 2] Strategy Check
         const strategy = getStrategy(s);
         const backfill = getBackfill(s);
+        const calcStart = Date.now();
         const legMetrics = leg.computeMetrics(ob);
         const signal = strategy.compute({
             price: p,
@@ -883,6 +958,7 @@ async function processSymbolEvent(s: string, d: any) {
             ready: backfill.getState().ready,
             vetoReason: backfill.getState().vetoReason
         });
+        latencyTracker.record('strategy_calc_ms', Date.now() - calcStart);
 
         // [PHASE 3] Execution Check
         // Execution now flows through the orchestrator (gate + decision + executor).
@@ -905,7 +981,10 @@ async function processSymbolEvent(s: string, d: any) {
 
         if (signal.signal && isDryRunTracked) {
             log('DRY_RUN_SIGNAL_SUBMIT', { symbol: s, signal: signal.signal });
-            dryRunSession.submitStrategySignal(s, signal);
+            dryRunSession.submitStrategySignal(s, signal, Number(t || now));
+        }
+        if (signal.signal) {
+            abTestManager.submitStrategySignal(s, signal, Number(t || now));
         }
 
         // Broadcast
@@ -1136,6 +1215,10 @@ app.get(
     }
 );
 
+app.get('/health/liveness', healthController.liveness);
+app.get('/health/readiness', healthController.readiness);
+app.get('/health/metrics', healthController.metrics);
+
 app.get('/api/health', (req, res) => {
     res.json({
         ok: true,
@@ -1356,6 +1439,40 @@ app.get('/api/dry-run/status', (req, res) => {
     res.json({ ok: true, status: dryRunSession.getStatus() });
 });
 
+app.get('/api/dry-run/sessions', async (_req, res) => {
+    try {
+        const sessions = await dryRunSession.listSessions();
+        res.json({ ok: true, sessions });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'dry_run_sessions_failed' });
+    }
+});
+
+app.post('/api/dry-run/save', async (req, res) => {
+    try {
+        const sessionId = req.body?.sessionId ? String(req.body.sessionId) : undefined;
+        await dryRunSession.saveSession(sessionId);
+        res.json({ ok: true });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'dry_run_save_failed' });
+    }
+});
+
+app.post('/api/dry-run/load', async (req, res) => {
+    try {
+        const sessionId = String(req.body?.sessionId || '');
+        if (!sessionId) {
+            res.status(400).json({ ok: false, error: 'sessionId_required' });
+            return;
+        }
+        const status = await dryRunSession.loadSession(sessionId);
+        updateDryRunHealthFlag();
+        res.json({ ok: true, status });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'dry_run_load_failed' });
+    }
+});
+
 app.post('/api/dry-run/start', async (req, res) => {
     try {
         const rawSymbols = Array.isArray(req.body?.symbols)
@@ -1398,6 +1515,7 @@ app.post('/api/dry-run/start', async (req, res) => {
             debugAggressiveEntry: Boolean(req.body?.debugAggressiveEntry),
         });
 
+        updateDryRunHealthFlag();
         dryRunForcedSymbols.clear();
         for (const symbol of symbolsRequested) {
             dryRunForcedSymbols.add(symbol);
@@ -1423,6 +1541,7 @@ app.post('/api/dry-run/start', async (req, res) => {
 app.post('/api/dry-run/stop', (req, res) => {
     try {
         const status = dryRunSession.stop();
+        updateDryRunHealthFlag();
         dryRunForcedSymbols.clear();
         updateStreams();
         res.json({ ok: true, status });
@@ -1434,6 +1553,7 @@ app.post('/api/dry-run/stop', (req, res) => {
 app.post('/api/dry-run/reset', (req, res) => {
     try {
         const status = dryRunSession.reset();
+        updateDryRunHealthFlag();
         dryRunForcedSymbols.clear();
         updateStreams();
         res.json({ ok: true, status });
@@ -1503,6 +1623,158 @@ app.post('/api/dry-run/run', (req, res) => {
         }
         log('DRY_RUN_RUN_ERROR', { error: serializeError(e) });
         res.status(500).json({ ok: false, error: e.message || 'dry_run_failed' });
+    }
+});
+
+app.get('/api/alpha-decay', (_req, res) => {
+    res.json({ ok: true, alphaDecay: dryRunSession.getStatus().alphaDecay });
+});
+
+app.get('/api/portfolio/status', (_req, res) => {
+    const status = dryRunSession.getStatus();
+    const exposures: Record<string, number> = {};
+    for (const [symbol, symStatus] of Object.entries(status.perSymbol)) {
+        if (symStatus.position) {
+            const sign = symStatus.position.side === 'LONG' ? 1 : -1;
+            exposures[symbol] = sign * symStatus.position.qty * symStatus.metrics.markPrice;
+        }
+    }
+    res.json({ ok: true, snapshot: portfolioMonitor.snapshot(exposures) });
+});
+
+app.get('/api/latency', (_req, res) => {
+    res.json({ ok: true, latency: latencyTracker.snapshot() });
+});
+
+app.post('/api/abtest/start', (req, res) => {
+    try {
+        const symbols = Array.isArray(req.body?.symbols) ? req.body.symbols.map((s: any) => String(s || '').toUpperCase()) : [];
+        if (symbols.length === 0) {
+            res.status(400).json({ ok: false, error: 'symbols_required' });
+            return;
+        }
+        const sessionA = { name: 'A', ...(req.body?.sessionA || {}) };
+        const sessionB = { name: 'B', ...(req.body?.sessionB || {}) };
+        const snapshot = abTestManager.start({
+            symbols,
+            walletBalanceStartUsdt: Number(req.body?.walletBalanceStartUsdt ?? 5000),
+            initialMarginUsdt: Number(req.body?.initialMarginUsdt ?? 200),
+            leverage: Number(req.body?.leverage ?? 10),
+            heartbeatIntervalMs: Number(req.body?.heartbeatIntervalMs ?? 10_000),
+            runId: req.body?.runId ? String(req.body.runId) : undefined,
+            sessionA,
+            sessionB,
+        });
+        updateDryRunHealthFlag();
+        res.json({ ok: true, status: snapshot });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'abtest_start_failed' });
+    }
+});
+
+app.post('/api/abtest/stop', (_req, res) => {
+    const snapshot = abTestManager.stop();
+    updateDryRunHealthFlag();
+    res.json({ ok: true, status: snapshot });
+});
+
+app.get('/api/abtest/status', (_req, res) => {
+    res.json({ ok: true, status: abTestManager.getSnapshot() });
+});
+
+app.get('/api/abtest/results', (_req, res) => {
+    res.json({ ok: true, results: abTestManager.getComparison() });
+});
+
+app.get('/api/backfill/status', async (_req, res) => {
+    const symbols = await marketArchive.listSymbols();
+    res.json({ ok: true, recordingEnabled: BACKFILL_RECORDING_ENABLED, symbols });
+});
+
+app.post('/api/backfill/replay', async (req, res) => {
+    try {
+        const symbol = String(req.body?.symbol || '').toUpperCase();
+        if (!symbol) {
+            res.status(400).json({ ok: false, error: 'symbol_required' });
+            return;
+        }
+        const result = await signalReplay.replay(symbol, {
+            fromMs: req.body?.fromMs ? Number(req.body.fromMs) : undefined,
+            toMs: req.body?.toMs ? Number(req.body.toMs) : undefined,
+            limit: req.body?.limit ? Number(req.body.limit) : undefined,
+        });
+        res.json({ ok: true, result });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'backfill_replay_failed' });
+    }
+});
+
+app.post('/api/backtest/monte-carlo', async (req, res) => {
+    try {
+        const symbol = String(req.body?.symbol || '').toUpperCase();
+        if (!symbol) {
+            res.status(400).json({ ok: false, error: 'symbol_required' });
+            return;
+        }
+        const events = await marketArchive.loadEvents(symbol, {
+            fromMs: req.body?.fromMs ? Number(req.body.fromMs) : undefined,
+            toMs: req.body?.toMs ? Number(req.body.toMs) : undefined,
+            types: ['trade'],
+        });
+        const prices = events.map((e) => Number(e.payload?.price ?? e.payload?.p ?? 0)).filter((p) => p > 0);
+        if (prices.length < 2) {
+            res.status(400).json({ ok: false, error: 'insufficient_price_history' });
+            return;
+        }
+        const returns: number[] = [];
+        for (let i = 1; i < prices.length; i += 1) {
+            returns.push(Math.log(prices[i] / prices[i - 1]));
+        }
+        const simulator = new MonteCarloSimulator({
+            runs: Number(req.body?.runs ?? 100),
+            seed: req.body?.seed ? Number(req.body.seed) : undefined,
+        });
+        const results = simulator.run(returns);
+        res.json({ ok: true, results });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'monte_carlo_failed' });
+    }
+});
+
+app.post('/api/backtest/walk-forward', async (req, res) => {
+    try {
+        const symbol = String(req.body?.symbol || '').toUpperCase();
+        if (!symbol) {
+            res.status(400).json({ ok: false, error: 'symbol_required' });
+            return;
+        }
+        const events = await marketArchive.loadEvents(symbol, {
+            fromMs: req.body?.fromMs ? Number(req.body.fromMs) : undefined,
+            toMs: req.body?.toMs ? Number(req.body.toMs) : undefined,
+            types: ['trade'],
+        });
+        const prices = events.map((e) => Number(e.payload?.price ?? e.payload?.p ?? 0)).filter((p) => p > 0);
+        if (prices.length < 2) {
+            res.status(400).json({ ok: false, error: 'insufficient_price_history' });
+            return;
+        }
+        const returns: number[] = [];
+        for (let i = 1; i < prices.length; i += 1) {
+            returns.push(Math.log(prices[i] / prices[i - 1]));
+        }
+        const analyzer = new WalkForwardAnalyzer({
+            windowSize: Number(req.body?.windowSize ?? 100),
+            stepSize: Number(req.body?.stepSize ?? 50),
+            thresholdRange: {
+                min: Number(req.body?.thresholdMin ?? 0.0005),
+                max: Number(req.body?.thresholdMax ?? 0.01),
+                step: Number(req.body?.thresholdStep ?? 0.0005),
+            },
+        });
+        const reports = analyzer.run(returns);
+        res.json({ ok: true, reports });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'walk_forward_failed' });
     }
 });
 

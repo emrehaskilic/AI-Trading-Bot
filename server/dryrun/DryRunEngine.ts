@@ -75,6 +75,7 @@ export class DryRunEngine {
 
   private readonly idGen: DeterministicIdGenerator;
   private readonly marketImpactSimulator: MarketImpactSimulator;
+  private leverageOverride: Fp | null = null;
 
   private walletBalance: Fp;
   private position: PositionInternal = null;
@@ -110,6 +111,17 @@ export class DryRunEngine {
     this.lastFundingBoundaryTsUTC = this.fundingBoundaryInitialized
       ? Number(config.fundingBoundaryStartTsUTC)
       : 0;
+  }
+
+  setLeverageOverride(nextLeverage: number | null): void {
+    if (nextLeverage === null) {
+      this.leverageOverride = null;
+      return;
+    }
+    if (!Number.isFinite(nextLeverage) || nextLeverage <= 0) {
+      return;
+    }
+    this.leverageOverride = toFp(nextLeverage);
   }
 
   processEvent(event: DryRunEventInput): { log: DryRunEventLog; state: DryRunStateSnapshot } {
@@ -224,6 +236,37 @@ export class DryRunEngine {
       lastFundingBoundaryTsUTC: this.lastFundingBoundaryTsUTC,
       marginHealth: this.computeMarginHealth(markPrice),
     };
+  }
+
+  restoreState(snapshot: DryRunStateSnapshot): void {
+    this.walletBalance = toFp(snapshot.walletBalance);
+    if (snapshot.position) {
+      const signedQty = snapshot.position.side === 'LONG'
+        ? toFp(snapshot.position.qty)
+        : -toFp(snapshot.position.qty);
+      this.position = {
+        signedQty,
+        entryPrice: toFp(snapshot.position.entryPrice),
+        entryTimestampMs: Date.now(),
+      };
+    } else {
+      this.position = null;
+    }
+    this.pendingLimits.clear();
+    for (const order of snapshot.openLimitOrders || []) {
+      this.pendingLimits.set(order.orderId, {
+        orderId: order.orderId,
+        side: order.side,
+        price: toFp(order.price),
+        remainingQty: toFp(order.remainingQty),
+        reduceOnly: order.reduceOnly,
+        createdTsMs: order.createdTsMs,
+      });
+    }
+    if (Number.isFinite(snapshot.lastFundingBoundaryTsUTC)) {
+      this.lastFundingBoundaryTsUTC = snapshot.lastFundingBoundaryTsUTC;
+      this.fundingBoundaryInitialized = true;
+    }
   }
 
   private normalizeBook(orderBook: DryRunOrderBook): DryRunOrderBook {
@@ -488,7 +531,8 @@ export class DryRunEngine {
     if (referencePrice <= 0n) {
       return fpZero;
     }
-    const maxNotional = fpMul(this.cfg.initialMarginUsdt, this.cfg.leverage);
+    const leverage = this.leverageOverride ?? this.cfg.leverage;
+    const maxNotional = fpMul(this.cfg.initialMarginUsdt, leverage);
     const maxAbsQty = fpDiv(maxNotional, referencePrice);
     const currentAfterCloseAbs = fpSub(fpAbs(currentQty), closePart);
     const availableOpenAbs = fpMax(fpZero, fpSub(maxAbsQty, currentAfterCloseAbs));
