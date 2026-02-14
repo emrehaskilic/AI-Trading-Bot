@@ -1,6 +1,17 @@
 export type DryRunSide = 'BUY' | 'SELL';
 export type DryRunOrderType = 'MARKET' | 'LIMIT';
 export type DryRunTimeInForce = 'IOC' | 'GTC';
+export type DryRunReasonCode =
+  | 'ENTRY_MARKET'
+  | 'ADDON_MAKER'
+  | 'REDUCE_PARTIAL'
+  | 'PROFITLOCK'
+  | 'TRAIL_STOP'
+  | 'FLIP_BLOCKED'
+  | 'FLIP_CONFIRMED'
+  | 'RISK_EMERGENCY'
+  | 'LIMIT_POSTONLY_REJECT'
+  | 'LIMIT_TTL_CANCEL';
 
 export interface DryRunBookLevel {
   price: number;
@@ -19,6 +30,12 @@ export interface DryRunOrderRequest {
   price?: number;
   timeInForce?: DryRunTimeInForce;
   reduceOnly?: boolean;
+  postOnly?: boolean;
+  ttlMs?: number;
+  clientOrderId?: string;
+  reasonCode?: DryRunReasonCode;
+  addonIndex?: number;
+  repriceAttempt?: number;
 }
 
 export interface DryRunEventInput {
@@ -46,6 +63,7 @@ export interface DryRunConfig {
   walletBalanceStartUsdt: number;
   initialMarginUsdt: number;
   leverage?: number;
+  makerFeeRate: number;
   takerFeeRate: number;
   maintenanceMarginRate: number;
   fundingRate: number;
@@ -59,6 +77,7 @@ export interface DryRunPosition {
   side: 'LONG' | 'SHORT';
   qty: number;
   entryPrice: number;
+  entryTimestampMs?: number;
 }
 
 export interface DryRunOrderResult {
@@ -75,6 +94,12 @@ export interface DryRunOrderResult {
   slippageBps?: number;
   marketImpactBps?: number;
   reason: string | null;
+  reasonCode?: DryRunReasonCode | null;
+  clientOrderId?: string | null;
+  postOnly?: boolean;
+  maker?: boolean;
+  addonIndex?: number | null;
+  repriceAttempt?: number | null;
   tradeIds: string[];
 }
 
@@ -104,6 +129,12 @@ export interface DryRunStateSnapshot {
     remainingQty: number;
     reduceOnly: boolean;
     createdTsMs: number;
+    clientOrderId?: string | null;
+    postOnly?: boolean;
+    ttlMs?: number | null;
+    reasonCode?: DryRunReasonCode | null;
+    addonIndex?: number | null;
+    repriceAttempt?: number | null;
   }>;
   lastFundingBoundaryTsUTC: number;
   marginHealth: number;

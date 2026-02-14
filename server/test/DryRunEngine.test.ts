@@ -9,6 +9,7 @@ function baseConfig(overrides: Partial<DryRunConfig> = {}): DryRunConfig {
     runId: 'run-deterministic-001',
     walletBalanceStartUsdt: 5000,
     initialMarginUsdt: 200,
+    makerFeeRate: 0.0002,
     takerFeeRate: 0.0004,
     maintenanceMarginRate: 0.005,
     fundingRate: 0,

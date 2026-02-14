@@ -1,14 +1,17 @@
 import { DryRunEngine } from './DryRunEngine';
-import { DryRunConfig, DryRunEventInput, DryRunEventLog, DryRunOrderBook, DryRunOrderRequest, DryRunStateSnapshot } from './types';
+import { DryRunConfig, DryRunEventInput, DryRunEventLog, DryRunOrderBook, DryRunOrderRequest, DryRunReasonCode, DryRunStateSnapshot } from './types';
 import { StrategySignal } from '../strategy/StrategyEngine';
 import { AlphaDecayAnalyzer } from '../strategy/AlphaDecayAnalyzer';
 import { AlertService } from '../notifications/AlertService';
 import { PositionSizingService, DynamicSizingConfig } from './PositionSizingService';
-import { DynamicStopLossService, DynamicStopLossConfig } from '../risk/DynamicStopLossService';
 import { PerformanceCalculator, PerformanceMetrics } from '../metrics/PerformanceCalculator';
 import { SessionStore } from './SessionStore';
 import { LimitOrderStrategy, LimitStrategyMode } from './LimitOrderStrategy';
 import { DryRunLogEvent, DryRunOrderflowMetrics, DryRunTradeLogger } from './DryRunTradeLogger';
+import { FlipGovernor } from './FlipGovernor';
+import { WinnerManager, WinnerState } from './WinnerManager';
+import { AddOnManager } from './AddOnManager';
+import { DryRunClock } from './DryRunClock';
 import path from 'path';
 
 export interface DryRunSessionStartInput {
@@ -19,6 +22,7 @@ export interface DryRunSessionStartInput {
   initialMarginUsdt: number;
   leverage: number;
   takerFeeRate?: number;
+  makerFeeRate?: number;
   maintenanceMarginRate?: number;
   fundingRate?: number;
   fundingRates?: Record<string, number>;
@@ -79,6 +83,7 @@ export interface DryRunSessionStatus {
     walletBalanceStartUsdt: number;
     initialMarginUsdt: number;
     leverage: number;
+    makerFeeRate: number;
     takerFeeRate: number;
     maintenanceMarginRate: number;
     fundingIntervalMs: number;
@@ -137,6 +142,38 @@ type ActiveTrade = {
   orderflow: DryRunOrderflowMetrics;
 };
 
+type SignalSnapshot = {
+  side: 'LONG' | 'SHORT';
+  signalType: string;
+  score: number;
+  candidate: StrategySignal['candidate'] | null;
+  orderflow: DryRunOrderflowMetrics;
+  boost?: StrategySignal['boost'];
+  market?: StrategySignal['market'];
+  timestampMs: number;
+};
+
+type PendingFlipEntry = {
+  side: 'BUY' | 'SELL';
+  signalType: string;
+  signalScore: number;
+  candidate: StrategySignal['candidate'] | null;
+  orderflow: DryRunOrderflowMetrics;
+  boost?: StrategySignal['boost'];
+  market?: StrategySignal['market'];
+  timestampMs: number;
+  leverage: number | null;
+};
+
+type AddOnState = {
+  count: number;
+  lastAddOnTs: number;
+  pendingClientOrderId: string | null;
+  pendingAddonIndex: number | null;
+  pendingAttempt: number;
+  filledClientOrderIds: Set<string>;
+};
+
 type SymbolSession = {
   symbol: string;
   engine: DryRunEngine;
@@ -155,6 +192,14 @@ type SymbolSession = {
   lossStreak: number;
   dynamicLeverage: number;
   stopLossPrice: number | null;
+  winnerState: WinnerState | null;
+  flipGovernor: FlipGovernor;
+  flipState: { partialReduced: boolean; lastPartialReduceTs: number };
+  addOnState: AddOnState;
+  lastEntryOrAddOnTs: number;
+  lastSignal: SignalSnapshot | null;
+  pendingFlipEntry: PendingFlipEntry | null;
+  spreadBreachCount: number;
   performance: PerformanceCalculator;
   activeSignal: { type: string; timestampMs: number } | null;
   lastEntryEventTs: number;
@@ -175,14 +220,11 @@ type SymbolSession = {
   lastSnapshotLogTs: number;
 };
 
-const DEFAULT_TAKER_FEE_RATE = 0.0004;
 const DEFAULT_MAINTENANCE_MARGIN_RATE = 0.005;
 const DEFAULT_FUNDING_RATE = 0;
 const DEFAULT_FUNDING_INTERVAL_MS = 8 * 60 * 60 * 1000;
 const DEFAULT_EVENT_INTERVAL_MS = Number(process.env.DRY_RUN_EVENT_INTERVAL_MS || 250);
 const DEFAULT_ORDERBOOK_DEPTH = Number(process.env.DRY_RUN_ORDERBOOK_DEPTH || 20);
-const DEFAULT_TP_BPS = Number(process.env.DRY_RUN_TP_BPS || 15);
-const DEFAULT_STOP_BPS = Number(process.env.DRY_RUN_STOP_BPS || 35);
 const DEFAULT_ENTRY_COOLDOWN_MS = Number(process.env.DRY_RUN_ENTRY_COOLDOWN_MS || 5000);
 const DEFAULT_HEARTBEAT_INTERVAL_MS = Number(process.env.DRY_RUN_HEARTBEAT_INTERVAL_MS || 10_000);
 const CONSOLE_LOG_TAIL_LIMIT = Number(process.env.DRY_RUN_CONSOLE_TAIL_LIMIT || 500);
@@ -193,10 +235,7 @@ const DEFAULT_MARTINGALE_FACTOR = Number(process.env.DRY_RUN_MARTINGALE_FACTOR |
 const DEFAULT_MARTINGALE_MAX = Number(process.env.DRY_RUN_MARTINGALE_MAX || 3);
 const DEFAULT_MAX_NOTIONAL = Number(process.env.DRY_RUN_MAX_NOTIONAL_USDT || 5000);
 const DEFAULT_STOP_ATR_MULT = Number(process.env.DRY_RUN_STOP_ATR_MULT || 1.4);
-const DEFAULT_STOP_VOL_FACTOR = Number(process.env.DRY_RUN_STOP_VOL_FACTOR || 0.2);
-const DEFAULT_STOP_OBI_FACTOR = Number(process.env.DRY_RUN_STOP_OBI_FACTOR || 0.4);
 const DEFAULT_STOP_MIN_DIST = Number(process.env.DRY_RUN_STOP_MIN_DIST || 0.5);
-const DEFAULT_STOP_MAX_DIST = Number(process.env.DRY_RUN_STOP_MAX_DIST || 50);
 const DEFAULT_ATR_WINDOW = Number(process.env.DRY_RUN_ATR_WINDOW || 14);
 const DEFAULT_LARGE_LOSS_ALERT = Number(process.env.DRY_RUN_LARGE_LOSS_USDT || 500);
 const DEFAULT_LIMIT_STRATEGY = String(process.env.DRY_RUN_LIMIT_STRATEGY || 'MARKET').toUpperCase();
@@ -206,6 +245,23 @@ const DEFAULT_TRADE_LOG_DIR = String(process.env.DRY_RUN_LOG_DIR || path.join(pr
 const DEFAULT_TRADE_LOG_QUEUE = Number(process.env.DRY_RUN_LOG_QUEUE_LIMIT || 10000);
 const DEFAULT_TRADE_LOG_DROP = Number(process.env.DRY_RUN_LOG_DROP_THRESHOLD || 2000);
 const DEFAULT_SNAPSHOT_LOG_MS = Number(process.env.DRY_RUN_SNAPSHOT_LOG_MS || 30_000);
+const DEFAULT_MAKER_FEE_BPS = clampNumber(process.env.MAKER_FEE_BPS, 2, 0, 50);
+const DEFAULT_TAKER_FEE_BPS = clampNumber(process.env.TAKER_FEE_BPS, 4, 0, 50);
+const DEFAULT_MAKER_FEE_RATE = DEFAULT_MAKER_FEE_BPS / 10000;
+const DEFAULT_TAKER_FEE_RATE = DEFAULT_TAKER_FEE_BPS / 10000;
+const DEFAULT_ENTRY_SIGNAL_MIN = clampNumber(process.env.ENTRY_SIGNAL_MIN, 50, 0, 100);
+const DEFAULT_MIN_HOLD_MS = clampNumber(process.env.MIN_HOLD_MS, 90_000, 0, 600_000);
+const DEFAULT_FLIP_DEADBAND_PCT = clampNumber(process.env.FLIP_DEADBAND_PCT, 0.003, 0, 0.05);
+const DEFAULT_FLIP_HYSTERESIS = clampNumber(process.env.FLIP_HYSTERESIS, 0.15, 0, 1);
+const DEFAULT_FLIP_CONFIRM_TICKS = Math.max(1, Math.trunc(clampNumber(process.env.FLIP_CONFIRM_TICKS, 3, 1, 20)));
+const DEFAULT_ADDON_MIN_UPNL_PCT = clampNumber(process.env.ADDON_MIN_UPNL_PCT, 0.0025, 0, 0.05);
+const DEFAULT_ADDON_SIGNAL_MIN = clampNumber(process.env.ADDON_SIGNAL_MIN, 60, 0, 100);
+const DEFAULT_ADDON_COOLDOWN_MS = clampNumber(process.env.ADDON_COOLDOWN_MS, 60_000, 0, 600_000);
+const DEFAULT_ADDON_MAX_COUNT = Math.max(0, Math.trunc(clampNumber(process.env.ADDON_MAX_COUNT, 3, 0, 10)));
+const DEFAULT_ADDON_TTL_MS = Math.max(1000, Math.trunc(clampNumber(process.env.ADDON_TTL_MS, 15_000, 1000, 120_000)));
+const DEFAULT_ADDON_REPRICE_MAX = Math.max(0, Math.trunc(clampNumber(process.env.ADDON_REPRICE_MAX, 2, 0, 5)));
+const DEFAULT_TRAIL_ATR_MULT = clampNumber(process.env.TRAIL_ATR_MULT, 2.2, 0.5, 10);
+const DEFAULT_MAX_SPREAD_PCT = clampNumber(process.env.MAX_SPREAD_PCT, 0.0008, 0, 0.01);
 
 function parseLimitStrategy(input: string): LimitStrategyMode {
   switch (input) {
@@ -223,6 +279,12 @@ function parseLimitStrategy(input: string): LimitStrategyMode {
 function finiteOr(value: unknown, fallback: number): number {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
 }
 
 function normalizeSymbol(symbol: string): string {
@@ -260,13 +322,15 @@ export class DryRunSessionService {
   private sessions = new Map<string, SymbolSession>();
   private logTail: DryRunConsoleLog[] = [];
   private sizingService: PositionSizingService;
-  private stopLossService: DynamicStopLossService;
   private limitStrategy: LimitOrderStrategy;
   private alphaDecay = new AlphaDecayAnalyzer();
   private readonly alertService?: AlertService;
   private readonly sessionStore: SessionStore;
   private readonly tradeLogger?: DryRunTradeLogger;
   private readonly tradeLogEnabled: boolean;
+  private readonly clock = new DryRunClock();
+  private readonly winnerManager: WinnerManager;
+  private readonly addOnManager: AddOnManager;
 
   constructor(alertService?: AlertService) {
     const sizingConfig: DynamicSizingConfig = {
@@ -280,21 +344,27 @@ export class DryRunSessionService {
       maxLeverage: 50,
       maxPositionNotionalUsdt: DEFAULT_MAX_NOTIONAL,
     };
-    const stopConfig: DynamicStopLossConfig = {
-      baseAtrMultiplier: DEFAULT_STOP_ATR_MULT,
-      volatilityAdjustmentFactor: DEFAULT_STOP_VOL_FACTOR,
-      obiAdjustmentFactor: DEFAULT_STOP_OBI_FACTOR,
-      minStopDistance: DEFAULT_STOP_MIN_DIST,
-      maxStopDistance: DEFAULT_STOP_MAX_DIST,
-    };
 
     this.sizingService = new PositionSizingService(sizingConfig);
-    this.stopLossService = new DynamicStopLossService(stopConfig);
     this.limitStrategy = new LimitOrderStrategy({
       mode: parseLimitStrategy(DEFAULT_LIMIT_STRATEGY),
       splitLevels: 3,
       passiveOffsetBps: 2,
       maxSlices: 4,
+    });
+    this.winnerManager = new WinnerManager({
+      trailAtrMult: DEFAULT_TRAIL_ATR_MULT,
+      rAtrMult: DEFAULT_STOP_ATR_MULT,
+      minRDistance: DEFAULT_STOP_MIN_DIST,
+    });
+    this.addOnManager = new AddOnManager({
+      minUnrealizedPnlPct: DEFAULT_ADDON_MIN_UPNL_PCT,
+      signalMin: DEFAULT_ADDON_SIGNAL_MIN,
+      cooldownMs: DEFAULT_ADDON_COOLDOWN_MS,
+      maxCount: DEFAULT_ADDON_MAX_COUNT,
+      ttlMs: DEFAULT_ADDON_TTL_MS,
+      maxSpreadPct: DEFAULT_MAX_SPREAD_PCT,
+      maxNotional: DEFAULT_MAX_NOTIONAL,
     });
     this.alertService = alertService;
     this.sessionStore = new SessionStore();
@@ -305,7 +375,7 @@ export class DryRunSessionService {
         queueLimit: finiteOr(DEFAULT_TRADE_LOG_QUEUE, 10000),
         dropHaltThreshold: finiteOr(DEFAULT_TRADE_LOG_DROP, 2000),
         onDropSpike: (count) => {
-          this.addConsoleLog('WARN', null, `Dry Run log backlog dropped ${count} events`, Date.now());
+          this.addConsoleLog('WARN', null, `Dry Run log backlog dropped ${count} events`, this.clock.now());
         },
       });
     }
@@ -327,6 +397,7 @@ export class DryRunSessionService {
 
     this.runCounter += 1;
     const runIdBase = String(input.runId || `dryrun-${this.runCounter}`);
+    const makerFeeRate = finiteOr(input.makerFeeRate, DEFAULT_MAKER_FEE_RATE);
     const takerFeeRate = finiteOr(input.takerFeeRate, DEFAULT_TAKER_FEE_RATE);
     const maintenanceMarginRate = finiteOr(input.maintenanceMarginRate, DEFAULT_MAINTENANCE_MARGIN_RATE);
     const fundingIntervalMs = Math.max(1, Math.trunc(finiteOr(input.fundingIntervalMs, DEFAULT_FUNDING_INTERVAL_MS)));
@@ -345,6 +416,7 @@ export class DryRunSessionService {
       walletBalanceStartUsdt,
       initialMarginUsdt,
       leverage,
+      makerFeeRate,
       takerFeeRate,
       maintenanceMarginRate,
       fundingIntervalMs,
@@ -374,6 +446,7 @@ export class DryRunSessionService {
         walletBalanceStartUsdt,
         initialMarginUsdt,
         leverage,
+        makerFeeRate,
         takerFeeRate,
         maintenanceMarginRate,
         fundingRate,
@@ -405,6 +478,21 @@ export class DryRunSessionService {
         lossStreak: 0,
         dynamicLeverage: leverage,
         stopLossPrice: null,
+        winnerState: null,
+        flipGovernor: new FlipGovernor(),
+        flipState: { partialReduced: false, lastPartialReduceTs: 0 },
+        addOnState: {
+          count: 0,
+          lastAddOnTs: 0,
+          pendingClientOrderId: null,
+          pendingAddonIndex: null,
+          pendingAttempt: 0,
+          filledClientOrderIds: new Set<string>(),
+        },
+        lastEntryOrAddOnTs: 0,
+        lastSignal: null,
+        pendingFlipEntry: null,
+        spreadBreachCount: 0,
         performance: new PerformanceCalculator(walletBalanceStartUsdt),
         activeSignal: null,
         lastEntryEventTs: 0,
@@ -514,6 +602,7 @@ export class DryRunSessionService {
         walletBalanceStartUsdt: config.walletBalanceStartUsdt,
         initialMarginUsdt: config.initialMarginUsdt,
         leverage: config.leverage,
+        makerFeeRate: Number.isFinite(config.makerFeeRate) ? config.makerFeeRate : DEFAULT_MAKER_FEE_RATE,
         takerFeeRate: config.takerFeeRate,
         maintenanceMarginRate: config.maintenanceMarginRate,
         fundingRate: 0,
@@ -550,6 +639,21 @@ export class DryRunSessionService {
         lossStreak: sessionSnapshot?.lossStreak || 0,
         dynamicLeverage: sessionSnapshot?.dynamicLeverage || config.leverage,
         stopLossPrice: sessionSnapshot?.stopLossPrice ?? null,
+        winnerState: null,
+        flipGovernor: new FlipGovernor(),
+        flipState: { partialReduced: false, lastPartialReduceTs: 0 },
+        addOnState: {
+          count: 0,
+          lastAddOnTs: 0,
+          pendingClientOrderId: null,
+          pendingAddonIndex: null,
+          pendingAttempt: 0,
+          filledClientOrderIds: new Set<string>(),
+        },
+        lastEntryOrAddOnTs: 0,
+        lastSignal: null,
+        pendingFlipEntry: null,
+        spreadBreachCount: 0,
         performance: perf,
         activeSignal: sessionSnapshot?.activeSignal ?? null,
         lastEntryEventTs: 0,
@@ -602,12 +706,15 @@ export class DryRunSessionService {
       throw new Error('manual_test_qty_invalid');
     }
 
+    const nowMs = this.clock.now();
     session.manualOrders.push({
       side,
       type: 'MARKET',
       qty,
       timeInForce: 'IOC',
       reduceOnly: false,
+      reasonCode: 'ENTRY_MARKET',
+      clientOrderId: `manual-${this.getRunId()}-${normalized}-${nowMs}`,
     });
 
     session.pendingEntry = {
@@ -617,7 +724,7 @@ export class DryRunSessionService {
       candidate: null,
       orderflow: this.buildOrderflowMetrics(undefined, session),
       market: this.buildMarketMetrics({ price: referencePrice }, session),
-      timestampMs: Date.now(),
+      timestampMs: nowMs,
       leverage: this.config.leverage,
     };
 
@@ -631,7 +738,7 @@ export class DryRunSessionService {
     if (!this.running || !session || !this.config) return;
 
     // Only process valid signals with a score
-    if (!signal.signal || !signal.candidate || signal.score < 50) return;
+    if (!signal.signal || !signal.candidate || signal.score < DEFAULT_ENTRY_SIGNAL_MIN) return;
 
     // Determine side based on signal type
     let side: 'BUY' | 'SELL' | null = null;
@@ -640,7 +747,8 @@ export class DryRunSessionService {
 
     if (!side) return;
 
-    const signalTs = Number.isFinite(timestampMs as number) ? Number(timestampMs) : Date.now();
+    const signalTs = Number.isFinite(timestampMs as number) ? Number(timestampMs) : this.clock.now();
+    this.clock.set(signalTs);
     const orderflow = this.buildOrderflowMetrics(signal.orderflow, session);
     const market = this.buildMarketMetrics(signal.market, session);
     this.logTradeEvent({
@@ -658,61 +766,81 @@ export class DryRunSessionService {
       market,
     });
 
-    // Avoid duplicate entries if already in a position
-    if (session.lastState.position && session.lastState.position.side !== (side === 'BUY' ? 'LONG' : 'SHORT')) {
-      // Optional: Close opposite position? For now, we stick to simple entry.
-    }
-    if (session.lastState.position) {
-      // Already positioned. Ignore new entry signal for now unless it's a flip (not implemented yet).
-      return;
-    }
-
-    // Calculate Quantity with dynamic sizing
-    const referencePrice = signal.candidate.entryPrice;
-    if (referencePrice <= 0) return;
-
-    const sizing = this.sizingService.compute({
-      walletBalanceUsdt: session.lastState.walletBalance,
-      baseMarginUsdt: this.config.initialMarginUsdt,
-      markPrice: referencePrice,
-      winStreak: session.winStreak,
-      lossStreak: session.lossStreak,
-      marginHealth: session.lastState.marginHealth,
-    });
-
-    if (!(sizing.quantity > 0)) return;
-    const qty = roundTo(sizing.quantity, 6);
-    session.dynamicLeverage = sizing.leverage;
-    session.engine.setLeverageOverride(sizing.leverage);
-
-    const entryOrders = this.limitStrategy.buildEntryOrders({
-      side,
-      qty,
-      markPrice: referencePrice,
-      orderBook: session.lastOrderBook,
-      urgency: Math.min(1, signal.score / 100),
-    });
-
-    for (const order of entryOrders) {
-      session.manualOrders.push(order);
-    }
-
-    session.activeSignal = { type: signal.signal, timestampMs: signalTs };
-    this.alphaDecay.recordSignal(normalized, signal.signal, signalTs);
-
-    session.pendingEntry = {
-      reason: 'STRATEGY_SIGNAL',
+    const signalSide: 'LONG' | 'SHORT' = side === 'BUY' ? 'LONG' : 'SHORT';
+    session.lastSignal = {
+      side: signalSide,
       signalType: signal.signal,
-      signalScore: signal.score,
+      score: signal.score,
       candidate: signal.candidate,
       orderflow,
       boost: signal.boost,
       market,
       timestampMs: signalTs,
-      leverage: sizing.leverage,
     };
 
-    this.addConsoleLog('INFO', normalized, `Strategy Signal Executed: ${signal.signal} (${side} ${qty} @ ~${referencePrice})`, session.lastEventTimestampMs);
+    const position = session.lastState.position;
+    const hasOpenLimits = session.lastState.openLimitOrders.length > 0;
+    if (!position) {
+      if (hasOpenLimits) return;
+      const referencePrice = signal.candidate.entryPrice;
+      if (referencePrice <= 0) return;
+
+      const sizing = this.sizingService.compute({
+        walletBalanceUsdt: session.lastState.walletBalance,
+        baseMarginUsdt: this.config.initialMarginUsdt,
+        markPrice: referencePrice,
+        winStreak: session.winStreak,
+        lossStreak: session.lossStreak,
+        marginHealth: session.lastState.marginHealth,
+      });
+
+      if (!(sizing.quantity > 0)) return;
+      const qty = roundTo(sizing.quantity, 6);
+      session.dynamicLeverage = sizing.leverage;
+      session.engine.setLeverageOverride(sizing.leverage);
+
+      const entryOrders = this.limitStrategy.buildEntryOrders({
+        side,
+        qty,
+        markPrice: referencePrice,
+        orderBook: session.lastOrderBook,
+        urgency: Math.min(1, signal.score / 100),
+      });
+
+      for (const order of entryOrders) {
+        session.manualOrders.push({
+          ...order,
+          reasonCode: 'ENTRY_MARKET',
+        });
+      }
+
+      session.activeSignal = { type: signal.signal, timestampMs: signalTs };
+      this.alphaDecay.recordSignal(normalized, signal.signal, signalTs);
+
+      session.pendingEntry = {
+        reason: 'STRATEGY_SIGNAL',
+        signalType: signal.signal as string,
+        signalScore: signal.score,
+        candidate: signal.candidate,
+        orderflow,
+        boost: signal.boost,
+        market,
+        timestampMs: signalTs,
+        leverage: sizing.leverage,
+      };
+
+      session.lastEntryEventTs = signalTs;
+      this.addConsoleLog('INFO', normalized, `Strategy Signal Executed: ${signal.signal} (${side} ${qty} @ ~${referencePrice})`, session.lastEventTimestampMs);
+      return;
+    }
+
+    if (position.side === signalSide) {
+      this.tryQueueAddOn(session, signal, signalTs, side, orderflow, market);
+      return;
+    }
+
+    this.tryFlipInvalidation(session, signal, signalTs, side, orderflow, market);
+    return;
   }
 
   ingestDepthEvent(input: {
@@ -733,6 +861,7 @@ export class DryRunSessionService {
     if (session.lastEventTimestampMs > 0 && (eventTimestampMs - session.lastEventTimestampMs) < DEFAULT_EVENT_INTERVAL_MS) {
       return null;
     }
+    this.clock.set(eventTimestampMs);
 
     const book = this.normalizeBook(input.orderBook);
     session.lastOrderBook = book;
@@ -753,6 +882,12 @@ export class DryRunSessionService {
     if (!(markPrice > 0)) return null;
 
     this.updateDerivedMetrics(session, book, markPrice);
+    const spreadPct = this.computeSpreadPct(book);
+    if (spreadPct != null && spreadPct > DEFAULT_MAX_SPREAD_PCT) {
+      session.spreadBreachCount += 1;
+    } else {
+      session.spreadBreachCount = 0;
+    }
 
     const prevPosition = session.lastState.position;
     const orders = this.buildDeterministicOrders(session, markPrice, eventTimestampMs);
@@ -847,7 +982,9 @@ export class DryRunSessionService {
       this.addConsoleLog('WARN', symbol, 'Liquidation triggered. Position force-closed.', eventTimestampMs);
     }
 
+    this.handleOrderActions(session, out.log.orderResults, markPrice, spreadPct, eventTimestampMs);
     this.handleTradeTransitions(session, prevPosition, out.log, out.state.position, eventTimestampMs);
+    this.syncPositionStateAfterEvent(session, prevPosition, out.state.position, eventTimestampMs, markPrice);
     this.maybeLogSnapshot(session, eventTimestampMs);
 
     return this.getStatus();
@@ -1006,6 +1143,50 @@ export class DryRunSessionService {
 
     if (!state.position && !hasOpenLimits) {
       if (session.lastEntryEventTs === 0 || (eventTimestampMs - session.lastEntryEventTs) >= entryCooldownMs) {
+        if (session.pendingFlipEntry) {
+          const pending = session.pendingFlipEntry;
+          const referencePrice = pending.candidate?.entryPrice ?? markPrice;
+          if (referencePrice > 0) {
+            const sizing = this.sizingService.compute({
+              walletBalanceUsdt: session.lastState.walletBalance,
+              baseMarginUsdt: this.config.initialMarginUsdt,
+              markPrice: referencePrice,
+              winStreak: session.winStreak,
+              lossStreak: session.lossStreak,
+              marginHealth: session.lastState.marginHealth,
+            });
+            const qty = roundTo(Math.max(0, sizing.quantity), 6);
+            session.dynamicLeverage = sizing.leverage;
+            session.engine.setLeverageOverride(sizing.leverage);
+            if (qty > 0) {
+              const entryOrders = this.limitStrategy.buildEntryOrders({
+                side: pending.side,
+                qty,
+                markPrice: referencePrice,
+                orderBook: session.lastOrderBook,
+                urgency: Math.min(1, (pending.signalScore || 0) / 100),
+              });
+              for (const order of entryOrders) {
+                orders.push({ ...order, reasonCode: 'ENTRY_MARKET' });
+              }
+              session.lastEntryEventTs = eventTimestampMs;
+              session.pendingEntry = {
+                reason: 'STRATEGY_SIGNAL',
+                signalType: pending.signalType,
+                signalScore: pending.signalScore,
+                candidate: pending.candidate,
+                orderflow: pending.orderflow,
+                boost: pending.boost,
+                market: pending.market,
+                timestampMs: pending.timestampMs,
+                leverage: sizing.leverage,
+              };
+            }
+          }
+          session.pendingFlipEntry = null;
+          return orders;
+        }
+
         // Only trigger internal random entry if debugAggressiveEntry is TRUE
         if (this.config.debugAggressiveEntry) {
           const side: 'BUY' | 'SELL' = this.resolveEntrySide(session, markPrice);
@@ -1028,7 +1209,7 @@ export class DryRunSessionService {
               orderBook: session.lastOrderBook,
               urgency: 0.3,
             });
-            orders.push(...entryOrders);
+            orders.push(...entryOrders.map((order) => ({ ...order, reasonCode: 'ENTRY_MARKET' as DryRunReasonCode })));
             session.lastEntryEventTs = eventTimestampMs;
             if (!session.pendingEntry) {
               session.pendingEntry = {
@@ -1053,65 +1234,40 @@ export class DryRunSessionService {
     }
 
     const position = state.position;
-    if (!hasOpenLimits) {
-      const tpBps = Math.max(1, DEFAULT_TP_BPS);
-      const isLong = position.side === 'LONG';
-      const multiplier = isLong ? (1 + (tpBps / 10000)) : (1 - (tpBps / 10000));
-      const tpPrice = roundTo(position.entryPrice * multiplier, 8);
-      const closeSide: 'BUY' | 'SELL' = isLong ? 'SELL' : 'BUY';
-      orders.push({
-        side: closeSide,
-        type: 'LIMIT',
-        qty: roundTo(position.qty, 6),
-        price: tpPrice,
-        timeInForce: 'GTC',
-        reduceOnly: true,
-      });
-      session.pendingExitReason = 'TAKE_PROFIT_LIMIT';
-      return orders;
-    }
-
-    const isLong = position.side === 'LONG';
-    const dynamicStop = this.stopLossService.calculateStopPrice({
-      side: position.side,
+    this.ensureWinnerState(session, position, markPrice);
+    const winnerDecision = this.winnerManager.update(session.winnerState as WinnerState, {
       markPrice,
-      atr: session.atr || Math.max(0.5, (Math.abs(markPrice - position.entryPrice) * 0.02)),
-      volatilityRegime: session.volatilityRegime,
-      obiDivergence: session.obi,
-      sweepStrength: 0,
+      atr: session.atr || Math.abs(markPrice - position.entryPrice) * 0.01,
     });
-    session.stopLossPrice = dynamicStop || null;
+    session.winnerState = winnerDecision.nextState;
+    session.stopLossPrice = this.resolveActiveStop(session.winnerState);
 
-    if (dynamicStop > 0) {
-      const stopTriggered = isLong ? markPrice <= dynamicStop : markPrice >= dynamicStop;
-      if (stopTriggered) {
-        const closeSide: 'BUY' | 'SELL' = isLong ? 'SELL' : 'BUY';
-        orders.push({
-          side: closeSide,
-          type: 'MARKET',
-          qty: roundTo(position.qty, 6),
-          timeInForce: 'IOC',
-          reduceOnly: true,
-        });
-        session.pendingExitReason = 'STOP_LOSS_DYNAMIC';
-      }
-      return orders;
-    }
-
-    const stopBps = Math.max(1, DEFAULT_STOP_BPS);
-    const pnlBps = isLong
-      ? ((markPrice - position.entryPrice) / position.entryPrice) * 10000
-      : ((position.entryPrice - markPrice) / position.entryPrice) * 10000;
-    if (pnlBps <= -stopBps) {
-      const closeSide: 'BUY' | 'SELL' = isLong ? 'SELL' : 'BUY';
+    if (winnerDecision.action && position.qty > 0) {
+      const closeSide: 'BUY' | 'SELL' = position.side === 'LONG' ? 'SELL' : 'BUY';
       orders.push({
         side: closeSide,
         type: 'MARKET',
         qty: roundTo(position.qty, 6),
         timeInForce: 'IOC',
         reduceOnly: true,
+        reasonCode: winnerDecision.action === 'TRAIL_STOP' ? 'TRAIL_STOP' : 'PROFITLOCK',
       });
-      session.pendingExitReason = 'STOP_LOSS_FIXED';
+      session.pendingExitReason = winnerDecision.action === 'TRAIL_STOP' ? 'TRAIL_STOP' : 'PROFITLOCK_STOP';
+      return orders;
+    }
+
+    if (this.shouldRiskEmergency(session, markPrice, this.computeSpreadPct(session.lastOrderBook))) {
+      const closeSide: 'BUY' | 'SELL' = position.side === 'LONG' ? 'SELL' : 'BUY';
+      orders.push({
+        side: closeSide,
+        type: 'MARKET',
+        qty: roundTo(position.qty, 6),
+        timeInForce: 'IOC',
+        reduceOnly: true,
+        reasonCode: 'RISK_EMERGENCY',
+      });
+      session.pendingExitReason = 'RISK_EMERGENCY';
+      return orders;
     }
 
     return orders;
@@ -1166,7 +1322,11 @@ export class DryRunSessionService {
     return (pos.entryPrice - session.latestMarkPrice) * pos.qty;
   }
 
-  private computeLiquidationRisk(session: SymbolSession, marginHealth: number): NonNullable<DryRunSymbolStatus['risk']>['liquidationRisk'] {
+  private computeLiquidationRisk(session: SymbolSession, marginHealth: number): {
+    score: 'GREEN' | 'YELLOW' | 'ORANGE' | 'RED' | 'CRITICAL';
+    timeToLiquidationMs: number | null;
+    fundingRateImpact: number;
+  } {
     const thresholds = { yellow: 0.3, orange: 0.2, red: 0.1, critical: 0.05 };
     let score: 'GREEN' | 'YELLOW' | 'ORANGE' | 'RED' | 'CRITICAL' = 'GREEN';
     if (marginHealth <= thresholds.critical) score = 'CRITICAL';
@@ -1259,7 +1419,7 @@ export class DryRunSessionService {
       if (flipped) {
         this.applyTradeAcc(session, closingRealized, closingFee, fundingImpact);
         const exitPrice = closingQty > 0 ? closingNotional / closingQty : session.latestMarkPrice;
-        const reason = this.resolveExitReason(session, liquidation, closingRealized, 'FLIP');
+        const reason = this.resolveExitReason(session, liquidation, closingRealized, 'HARD_INVALIDATION');
         this.closeTrade(session, eventTimestampMs, exitPrice, prevPosition?.qty || 0, reason);
         this.openTrade(session, nextPosition, eventTimestampMs, openingFee);
         return;
@@ -1400,12 +1560,12 @@ export class DryRunSessionService {
     realized: number,
     fallback: string | null
   ): string {
-    if (liquidation) return 'LIQUIDATION';
+    if (liquidation) return 'RISK_EMERGENCY';
     if (fallback) return fallback;
     if (session.pendingExitReason) return session.pendingExitReason;
-    if (realized > 0) return 'TAKE_PROFIT';
-    if (realized < 0) return 'STOP_LOSS';
-    return 'CLOSE';
+    if (realized > 0) return 'PROFITLOCK_STOP';
+    if (realized < 0) return 'RISK_EMERGENCY';
+    return 'HARD_INVALIDATION';
   }
 
   private computeRMultiple(trade: ActiveTrade, net: number): number | null {
@@ -1554,6 +1714,457 @@ export class DryRunSessionService {
     };
   }
 
+  private computeUnrealizedPnlPct(session: SymbolSession, markPrice: number): number {
+    const pos = session.lastState.position;
+    if (!pos || !(markPrice > 0) || !(pos.entryPrice > 0)) return 0;
+    if (pos.side === 'LONG') return (markPrice - pos.entryPrice) / pos.entryPrice;
+    return (pos.entryPrice - markPrice) / pos.entryPrice;
+  }
+
+  private computeSpreadPct(book: DryRunOrderBook): number | null {
+    const bestBid = book.bids?.[0]?.price ?? 0;
+    const bestAsk = book.asks?.[0]?.price ?? 0;
+    if (!(bestBid > 0) || !(bestAsk > 0)) return null;
+    const mid = (bestBid + bestAsk) / 2;
+    return mid > 0 ? (bestAsk - bestBid) / mid : null;
+  }
+
+  private getHoldRemainingMs(session: SymbolSession, nowMs: number): number {
+    if (!session.lastEntryOrAddOnTs || nowMs <= 0) return 0;
+    return Math.max(0, DEFAULT_MIN_HOLD_MS - (nowMs - session.lastEntryOrAddOnTs));
+  }
+
+  private buildFlipState(session: SymbolSession, confirmTicks?: number, lastOppositeSide?: 'LONG' | 'SHORT' | null) {
+    const state = session.flipGovernor.getState();
+    return {
+      confirmTicks: Number.isFinite(confirmTicks as number) ? Number(confirmTicks) : state.confirmTicks,
+      requiredTicks: DEFAULT_FLIP_CONFIRM_TICKS,
+      lastOppositeSide: lastOppositeSide ?? state.lastOppositeSide,
+      partialReduced: session.flipState.partialReduced,
+    };
+  }
+
+  private logAction(session: SymbolSession, payload: {
+    reasonCode: DryRunReasonCode;
+    timestampMs: number;
+    signalType: string | null;
+    signalScore: number | null;
+    signalSide: 'LONG' | 'SHORT' | null;
+    unrealizedPnlPct: number;
+    feePaidIncrement: number;
+    spreadPct: number | null;
+    impactEstimate: number | null;
+    addonIndex: number | null;
+    flipState: {
+      confirmTicks: number;
+      requiredTicks: number;
+      lastOppositeSide: 'LONG' | 'SHORT' | null;
+      partialReduced: boolean;
+    } | null;
+    holdRemainingMs: number;
+  }): void {
+    if (!this.tradeLogger || !this.tradeLogEnabled) return;
+    this.tradeLogger.log({
+      type: 'ACTION',
+      runId: this.getRunId(),
+      symbol: session.symbol,
+      timestampMs: payload.timestampMs,
+      reason_code: payload.reasonCode,
+      signalType: payload.signalType,
+      signalScore: payload.signalScore,
+      signalSide: payload.signalSide,
+      unrealizedPnlPct: Number(payload.unrealizedPnlPct.toFixed(6)),
+      feePaid_increment: Number(payload.feePaidIncrement.toFixed(8)),
+      spread_pct: payload.spreadPct == null ? null : Number(payload.spreadPct.toFixed(6)),
+      impact_estimate: payload.impactEstimate == null ? null : Number(payload.impactEstimate.toFixed(6)),
+      addonIndex: payload.addonIndex,
+      flipState: payload.flipState,
+      holdRemainingMs: payload.holdRemainingMs,
+    });
+  }
+
+  private hasPendingAddOn(session: SymbolSession): boolean {
+    if (session.addOnState.pendingClientOrderId) return true;
+    if (session.manualOrders.some((o) => o.reasonCode === 'ADDON_MAKER')) return true;
+    return session.lastState.openLimitOrders.some((o) => o.reasonCode === 'ADDON_MAKER');
+  }
+
+  private buildAddOnClientOrderId(session: SymbolSession, addonIndex: number, attempt: number): string {
+    return `addon-${this.getRunId()}-${session.symbol}-${addonIndex}-${attempt}`;
+  }
+
+  private tryQueueAddOn(
+    session: SymbolSession,
+    signal: StrategySignal,
+    signalTs: number,
+    side: 'BUY' | 'SELL',
+    orderflow: DryRunOrderflowMetrics,
+    market: ReturnType<DryRunSessionService['buildMarketMetrics']>
+  ): void {
+    const position = session.lastState.position;
+    if (!position) return;
+
+    const unrealizedPnlPct = this.computeUnrealizedPnlPct(session, session.latestMarkPrice || position.entryPrice);
+    const addonIndex = session.addOnState.count + 1;
+    const decision = this.addOnManager.buildAddOnOrder({
+      side: position.side,
+      positionQty: position.qty,
+      markPrice: session.latestMarkPrice || position.entryPrice,
+      unrealizedPnlPct,
+      signalScore: signal.score,
+      book: session.lastOrderBook,
+      nowMs: signalTs,
+      lastAddOnTs: session.addOnState.lastAddOnTs,
+      addonCount: session.addOnState.count,
+      addonIndex,
+      hasPendingAddOn: this.hasPendingAddOn(session),
+    });
+
+    if (!decision) return;
+    const clientOrderId = this.buildAddOnClientOrderId(session, decision.addonIndex, 0);
+    session.manualOrders.push({
+      ...decision.order,
+      clientOrderId,
+      repriceAttempt: 0,
+    });
+    session.addOnState.pendingClientOrderId = clientOrderId;
+    session.addOnState.pendingAddonIndex = decision.addonIndex;
+    session.addOnState.pendingAttempt = 0;
+
+    if (!session.pendingEntry) {
+      session.pendingEntry = {
+        reason: 'STRATEGY_SIGNAL',
+        signalType: signal.signal as string,
+        signalScore: signal.score,
+        candidate: signal.candidate,
+        orderflow,
+        boost: signal.boost,
+        market,
+        timestampMs: signalTs,
+        leverage: session.dynamicLeverage,
+      };
+    }
+  }
+
+  private tryFlipInvalidation(
+    session: SymbolSession,
+    signal: StrategySignal,
+    signalTs: number,
+    side: 'BUY' | 'SELL',
+    orderflow: DryRunOrderflowMetrics,
+    market: ReturnType<DryRunSessionService['buildMarketMetrics']>
+  ): void {
+    const position = session.lastState.position;
+    if (!position) return;
+
+    const spreadPct = this.computeSpreadPct(session.lastOrderBook);
+    const holdRemainingMs = this.getHoldRemainingMs(session, signalTs);
+    if (spreadPct != null && spreadPct > DEFAULT_MAX_SPREAD_PCT) {
+      this.logAction(session, {
+        reasonCode: 'FLIP_BLOCKED',
+        timestampMs: signalTs,
+        signalType: signal.signal,
+        signalScore: signal.score,
+        signalSide: side === 'BUY' ? 'LONG' : 'SHORT',
+        unrealizedPnlPct: this.computeUnrealizedPnlPct(session, session.latestMarkPrice || position.entryPrice),
+        feePaidIncrement: 0,
+        spreadPct,
+        impactEstimate: null,
+        addonIndex: null,
+        flipState: this.buildFlipState(session),
+        holdRemainingMs,
+      });
+      return;
+    }
+
+    const flipThreshold = DEFAULT_ENTRY_SIGNAL_MIN + (DEFAULT_FLIP_HYSTERESIS * 100);
+    const decision = session.flipGovernor.evaluate({
+      minHoldMs: DEFAULT_MIN_HOLD_MS,
+      deadbandPct: DEFAULT_FLIP_DEADBAND_PCT,
+      confirmTicks: DEFAULT_FLIP_CONFIRM_TICKS,
+      flipScoreThreshold: flipThreshold,
+    }, {
+      nowMs: signalTs,
+      lastEntryOrAddOnTs: session.lastEntryOrAddOnTs,
+      unrealizedPnlPct: this.computeUnrealizedPnlPct(session, session.latestMarkPrice || position.entryPrice),
+      signalScore: signal.score,
+      oppositeSide: side === 'BUY' ? 'LONG' : 'SHORT',
+    });
+
+    const flipState = this.buildFlipState(session, decision.confirmTicks, decision.lastOppositeSide);
+    if (!decision.confirmed) {
+      this.logAction(session, {
+        reasonCode: 'FLIP_BLOCKED',
+        timestampMs: signalTs,
+        signalType: signal.signal,
+        signalScore: signal.score,
+        signalSide: side === 'BUY' ? 'LONG' : 'SHORT',
+        unrealizedPnlPct: this.computeUnrealizedPnlPct(session, session.latestMarkPrice || position.entryPrice),
+        feePaidIncrement: 0,
+        spreadPct,
+        impactEstimate: null,
+        addonIndex: null,
+        flipState,
+        holdRemainingMs: decision.holdRemainingMs,
+      });
+      return;
+    }
+
+    this.logAction(session, {
+      reasonCode: 'FLIP_CONFIRMED',
+      timestampMs: signalTs,
+      signalType: signal.signal,
+      signalScore: signal.score,
+      signalSide: side === 'BUY' ? 'LONG' : 'SHORT',
+      unrealizedPnlPct: this.computeUnrealizedPnlPct(session, session.latestMarkPrice || position.entryPrice),
+      feePaidIncrement: 0,
+      spreadPct,
+      impactEstimate: null,
+      addonIndex: null,
+      flipState,
+      holdRemainingMs: 0,
+    });
+
+    if (!session.flipState.partialReduced) {
+      const reduceQty = roundTo(position.qty * 0.4, 6);
+      if (reduceQty > 0) {
+        session.manualOrders.push({
+          side: position.side === 'LONG' ? 'SELL' : 'BUY',
+          type: 'MARKET',
+          qty: reduceQty,
+          timeInForce: 'IOC',
+          reduceOnly: true,
+          reasonCode: 'REDUCE_PARTIAL',
+        });
+        session.flipState.partialReduced = true;
+        session.flipState.lastPartialReduceTs = signalTs;
+      }
+      return;
+    }
+
+    const closeQty = roundTo(position.qty, 6);
+    if (closeQty > 0) {
+      session.manualOrders.push({
+        side: position.side === 'LONG' ? 'SELL' : 'BUY',
+        type: 'MARKET',
+        qty: closeQty,
+        timeInForce: 'IOC',
+        reduceOnly: true,
+        reasonCode: 'FLIP_CONFIRMED',
+      });
+      session.pendingExitReason = 'HARD_INVALIDATION';
+      session.pendingFlipEntry = {
+        side,
+        signalType: signal.signal as string,
+        signalScore: signal.score,
+        candidate: signal.candidate,
+        orderflow,
+        boost: signal.boost,
+        market,
+        timestampMs: signalTs,
+        leverage: session.dynamicLeverage,
+      };
+    }
+  }
+
+  private handleOrderActions(
+    session: SymbolSession,
+    orderResults: DryRunEventLog['orderResults'],
+    markPrice: number,
+    spreadPct: number | null,
+    eventTimestampMs: number
+  ): void {
+    const holdRemainingMs = this.getHoldRemainingMs(session, eventTimestampMs);
+    const unrealizedPnlPct = this.computeUnrealizedPnlPct(session, markPrice);
+    const signalType = session.lastSignal?.signalType ?? null;
+    const signalScore = session.lastSignal?.score ?? null;
+    const signalSide = session.lastSignal?.side ?? null;
+    const flipState = this.buildFlipState(session);
+
+    for (const order of orderResults || []) {
+      if (order.status === 'NEW') continue;
+      const reasonCode = order.reasonCode ?? null;
+      if (!reasonCode) continue;
+      const feePaidIncrement = Number.isFinite(order.fee) ? Number(order.fee) : 0;
+      const impactEstimate = Number.isFinite(order.marketImpactBps as number) ? Number(order.marketImpactBps) : null;
+      const addonIndex = Number.isFinite(order.addonIndex as number) ? Number(order.addonIndex) : null;
+
+      this.logAction(session, {
+        reasonCode,
+        timestampMs: eventTimestampMs,
+        signalType,
+        signalScore,
+        signalSide,
+        unrealizedPnlPct,
+        feePaidIncrement,
+        spreadPct,
+        impactEstimate,
+        addonIndex,
+        flipState,
+        holdRemainingMs,
+      });
+
+      if (reasonCode === 'ENTRY_MARKET' && Number(order.filledQty) > 0) {
+        session.lastEntryOrAddOnTs = eventTimestampMs;
+      }
+
+      if (reasonCode === 'ADDON_MAKER' && Number(order.filledQty) > 0) {
+        session.lastEntryOrAddOnTs = eventTimestampMs;
+        session.addOnState.lastAddOnTs = eventTimestampMs;
+        if (order.clientOrderId && !session.addOnState.filledClientOrderIds.has(order.clientOrderId)) {
+          session.addOnState.filledClientOrderIds.add(order.clientOrderId);
+          session.addOnState.count += 1;
+        }
+      }
+
+      if (reasonCode === 'LIMIT_TTL_CANCEL') {
+        this.repriceAddOnIfEligible(session, order, eventTimestampMs);
+      }
+    }
+
+    this.syncPendingAddOn(session);
+  }
+
+  private repriceAddOnIfEligible(session: SymbolSession, order: DryRunEventLog['orderResults'][number], eventTimestampMs: number): void {
+    if (!session.lastState.position) return;
+    if (!order.clientOrderId || !(Number.isFinite(order.addonIndex as number))) return;
+    if (!(Number(order.remainingQty) > 0)) return;
+    const attempt = Number.isFinite(order.repriceAttempt as number) ? Number(order.repriceAttempt) : 0;
+    if (attempt >= DEFAULT_ADDON_REPRICE_MAX) return;
+
+    const lastSignal = session.lastSignal;
+    if (!lastSignal || lastSignal.score < DEFAULT_ADDON_SIGNAL_MIN) return;
+    if (lastSignal.side !== session.lastState.position.side) return;
+
+    const spreadPct = this.computeSpreadPct(session.lastOrderBook);
+    if (spreadPct != null && spreadPct > DEFAULT_MAX_SPREAD_PCT) return;
+
+    const bestBid = session.lastOrderBook.bids?.[0]?.price ?? 0;
+    const bestAsk = session.lastOrderBook.asks?.[0]?.price ?? 0;
+    const limitPrice = session.lastState.position.side === 'LONG' ? bestBid : bestAsk;
+    if (!(limitPrice > 0)) return;
+
+    const nextAttempt = attempt + 1;
+    const clientOrderId = this.buildAddOnClientOrderId(session, Number(order.addonIndex), nextAttempt);
+    session.manualOrders.push({
+      side: session.lastState.position.side === 'LONG' ? 'BUY' : 'SELL',
+      type: 'LIMIT',
+      qty: roundTo(Number(order.remainingQty), 6),
+      price: roundTo(limitPrice, 8),
+      timeInForce: 'GTC',
+      reduceOnly: false,
+      postOnly: true,
+      ttlMs: DEFAULT_ADDON_TTL_MS,
+      reasonCode: 'ADDON_MAKER',
+      addonIndex: Number(order.addonIndex),
+      repriceAttempt: nextAttempt,
+      clientOrderId,
+    });
+
+    session.addOnState.pendingClientOrderId = clientOrderId;
+    session.addOnState.pendingAddonIndex = Number(order.addonIndex);
+    session.addOnState.pendingAttempt = nextAttempt;
+    session.addOnState.lastAddOnTs = eventTimestampMs;
+  }
+
+  private syncPendingAddOn(session: SymbolSession): void {
+    if (!session.addOnState.pendingClientOrderId) return;
+    const stillOpen = session.lastState.openLimitOrders.some((o) => o.clientOrderId === session.addOnState.pendingClientOrderId);
+    if (!stillOpen) {
+      session.addOnState.pendingClientOrderId = null;
+      session.addOnState.pendingAddonIndex = null;
+      session.addOnState.pendingAttempt = 0;
+    }
+  }
+
+  private ensureWinnerState(session: SymbolSession, position: NonNullable<DryRunStateSnapshot['position']>, markPrice: number): void {
+    if (session.winnerState) return;
+    session.winnerState = this.winnerManager.initState({
+      entryPrice: position.entryPrice,
+      side: position.side,
+      atr: session.atr || Math.abs(markPrice - position.entryPrice) * 0.01,
+      markPrice,
+    });
+  }
+
+  private resolveActiveStop(state: WinnerState | null): number | null {
+    if (!state) return null;
+    const active = state.side === 'LONG'
+      ? Math.max(state.profitLockStop ?? -Infinity, state.trailingStop ?? -Infinity)
+      : Math.min(state.profitLockStop ?? Infinity, state.trailingStop ?? Infinity);
+    return Number.isFinite(active) ? active : null;
+  }
+
+  private shouldRiskEmergency(session: SymbolSession, markPrice: number, spreadPct: number | null): boolean {
+    const marginHealth = session.lastState.marginHealth;
+    if (marginHealth <= 0.05) return true;
+    const liquidation = this.computeLiquidationRisk(session, marginHealth);
+    if (liquidation.score === 'RED' || liquidation.score === 'CRITICAL') return true;
+
+    const drawdownPct = this.computeUnrealizedPnlPct(session, markPrice);
+    if (drawdownPct <= -Math.max(DEFAULT_FLIP_DEADBAND_PCT * 4, 0.012)) return true;
+
+    if (spreadPct != null && spreadPct > DEFAULT_MAX_SPREAD_PCT && session.spreadBreachCount >= 3) {
+      return true;
+    }
+    return false;
+  }
+
+  private syncPositionStateAfterEvent(
+    session: SymbolSession,
+    prevPosition: DryRunStateSnapshot['position'],
+    nextPosition: DryRunStateSnapshot['position'],
+    eventTimestampMs: number,
+    markPrice: number
+  ): void {
+    if (!prevPosition && nextPosition) {
+      session.winnerState = this.winnerManager.initState({
+        entryPrice: nextPosition.entryPrice,
+        side: nextPosition.side,
+        atr: session.atr || Math.abs(markPrice - nextPosition.entryPrice) * 0.01,
+        markPrice,
+      });
+      session.stopLossPrice = this.resolveActiveStop(session.winnerState);
+      session.addOnState.count = 0;
+      session.addOnState.lastAddOnTs = eventTimestampMs;
+      session.addOnState.pendingClientOrderId = null;
+      session.addOnState.pendingAddonIndex = null;
+      session.addOnState.pendingAttempt = 0;
+      session.addOnState.filledClientOrderIds.clear();
+      session.lastEntryOrAddOnTs = eventTimestampMs;
+      session.flipGovernor.reset();
+      session.flipState.partialReduced = false;
+      session.flipState.lastPartialReduceTs = 0;
+      return;
+    }
+
+    if (prevPosition && !nextPosition) {
+      session.winnerState = null;
+      session.stopLossPrice = null;
+      session.addOnState.pendingClientOrderId = null;
+      session.addOnState.pendingAddonIndex = null;
+      session.addOnState.pendingAttempt = 0;
+      session.flipGovernor.reset();
+      session.flipState.partialReduced = false;
+      session.flipState.lastPartialReduceTs = 0;
+      return;
+    }
+
+    if (prevPosition && nextPosition && prevPosition.side !== nextPosition.side) {
+      session.winnerState = this.winnerManager.initState({
+        entryPrice: nextPosition.entryPrice,
+        side: nextPosition.side,
+        atr: session.atr || Math.abs(markPrice - nextPosition.entryPrice) * 0.01,
+        markPrice,
+      });
+      session.stopLossPrice = this.resolveActiveStop(session.winnerState);
+      session.lastEntryOrAddOnTs = eventTimestampMs;
+      session.flipGovernor.reset();
+      session.flipState.partialReduced = false;
+      session.flipState.lastPartialReduceTs = 0;
+    }
+  }
+
   private isClosingOrder(prevSide: 'LONG' | 'SHORT', orderSide: 'BUY' | 'SELL'): boolean {
     return (prevSide === 'LONG' && orderSide === 'SELL') || (prevSide === 'SHORT' && orderSide === 'BUY');
   }
@@ -1576,7 +2187,7 @@ export class DryRunSessionService {
     this.consoleSeq += 1;
     const logItem: DryRunConsoleLog = {
       seq: this.consoleSeq,
-      timestampMs: timestampMs > 0 ? timestampMs : Date.now(),
+      timestampMs: timestampMs > 0 ? timestampMs : this.clock.now(),
       symbol,
       level,
       message,

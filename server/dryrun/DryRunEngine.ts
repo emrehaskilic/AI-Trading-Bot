@@ -28,6 +28,7 @@ import {
   DryRunOrderResult,
   DryRunSide,
   DryRunStateSnapshot,
+  DryRunReasonCode,
 } from './types';
 
 type PositionInternal = {
@@ -43,6 +44,12 @@ type PendingLimitOrder = {
   remainingQty: Fp;
   reduceOnly: boolean;
   createdTsMs: number;
+  clientOrderId?: string;
+  postOnly: boolean;
+  ttlMs: number | null;
+  reasonCode?: DryRunReasonCode;
+  addonIndex?: number;
+  repriceAttempt?: number;
 };
 
 type FillComputation = {
@@ -65,6 +72,7 @@ function isUuidLike(value: string): boolean {
 export class DryRunEngine {
   private readonly cfg: {
     runId: string;
+    makerFeeRate: Fp;
     takerFeeRate: Fp;
     maintenanceMarginRate: Fp;
     fundingRate: Fp;
@@ -97,6 +105,7 @@ export class DryRunEngine {
     }
     this.cfg = {
       runId: config.runId,
+      makerFeeRate: toFp(config.makerFeeRate),
       takerFeeRate: toFp(config.takerFeeRate),
       maintenanceMarginRate: toFp(config.maintenanceMarginRate),
       fundingRate: toFp(config.fundingRate),
@@ -222,6 +231,12 @@ export class DryRunEngine {
       remainingQty: fpRoundTo(o.remainingQty, 8),
       reduceOnly: o.reduceOnly,
       createdTsMs: o.createdTsMs,
+      clientOrderId: o.clientOrderId ?? null,
+      postOnly: o.postOnly,
+      ttlMs: o.ttlMs ?? null,
+      reasonCode: o.reasonCode ?? null,
+      addonIndex: o.addonIndex ?? null,
+      repriceAttempt: o.repriceAttempt ?? null,
     }));
     return {
       walletBalance: fpRoundTo(this.walletBalance, 8),
@@ -230,6 +245,7 @@ export class DryRunEngine {
             side: this.position.signedQty > 0n ? 'LONG' : 'SHORT',
             qty: fpRoundTo(fpAbs(this.position.signedQty), 8),
             entryPrice: fpRoundTo(this.position.entryPrice, 8),
+            entryTimestampMs: this.position.entryTimestampMs,
           }
         : null,
       openLimitOrders,
@@ -247,7 +263,9 @@ export class DryRunEngine {
       this.position = {
         signedQty,
         entryPrice: toFp(snapshot.position.entryPrice),
-        entryTimestampMs: Date.now(),
+        entryTimestampMs: Number.isFinite(snapshot.position.entryTimestampMs as number)
+          ? Number(snapshot.position.entryTimestampMs)
+          : 0,
       };
     } else {
       this.position = null;
@@ -261,6 +279,12 @@ export class DryRunEngine {
         remainingQty: toFp(order.remainingQty),
         reduceOnly: order.reduceOnly,
         createdTsMs: order.createdTsMs,
+        clientOrderId: order.clientOrderId ?? undefined,
+        postOnly: Boolean(order.postOnly),
+        ttlMs: Number.isFinite(order.ttlMs as number) ? Number(order.ttlMs) : null,
+        reasonCode: (order.reasonCode as DryRunReasonCode) ?? undefined,
+        addonIndex: Number.isFinite(order.addonIndex as number) ? Number(order.addonIndex) : undefined,
+        repriceAttempt: Number.isFinite(order.repriceAttempt as number) ? Number(order.repriceAttempt) : undefined,
       });
     }
     if (Number.isFinite(snapshot.lastFundingBoundaryTsUTC)) {
@@ -307,6 +331,30 @@ export class DryRunEngine {
   }> {
     const out: Array<{ result: DryRunOrderResult; realizedPnlFp: Fp; feeFp: Fp }> = [];
     for (const pending of Array.from(this.pendingLimits.values())) {
+      const ttlMs = pending.ttlMs ?? null;
+      if (ttlMs && ttlMs > 0 && (timestampMs - pending.createdTsMs) >= ttlMs) {
+        out.push({
+          result: this.makeCanceled(
+            pending.orderId,
+            pending.side,
+            'LIMIT',
+            fromFp(pending.remainingQty),
+            fromFp(pending.remainingQty),
+            'LIMIT_TTL_CANCEL',
+            pending.reasonCode ?? 'LIMIT_TTL_CANCEL',
+            {
+              clientOrderId: pending.clientOrderId,
+              postOnly: pending.postOnly,
+              addonIndex: pending.addonIndex,
+              repriceAttempt: pending.repriceAttempt,
+            }
+          ),
+          realizedPnlFp: fpZero,
+          feeFp: fpZero,
+        });
+        this.pendingLimits.delete(pending.orderId);
+        continue;
+      }
       const execution = this.executeWithOrderbook({
         orderId: pending.orderId,
         side: pending.side,
@@ -318,6 +366,12 @@ export class DryRunEngine {
         timestampMs,
         book,
         forced: false,
+        liquidity: 'MAKER',
+        clientOrderId: pending.clientOrderId,
+        postOnly: pending.postOnly,
+        reasonCode: pending.reasonCode,
+        addonIndex: pending.addonIndex,
+        repriceAttempt: pending.repriceAttempt,
       });
       out.push({
         result: execution.result,
@@ -351,6 +405,14 @@ export class DryRunEngine {
     const tif = input.type === 'MARKET' ? 'IOC' : (input.timeInForce || 'GTC');
     const reduceOnly = Boolean(input.reduceOnly);
     const price = type === 'LIMIT' ? toFp(Number(input.price || 0)) : fpZero;
+    const postOnly = Boolean(input.postOnly);
+    const ttlMs = Number.isFinite(input.ttlMs as number) && Number(input.ttlMs) > 0
+      ? Math.trunc(Number(input.ttlMs))
+      : null;
+    const clientOrderId = input.clientOrderId ? String(input.clientOrderId) : undefined;
+    const reasonCode = input.reasonCode ?? undefined;
+    const addonIndex = Number.isFinite(input.addonIndex as number) ? Number(input.addonIndex) : undefined;
+    const repriceAttempt = Number.isFinite(input.repriceAttempt as number) ? Number(input.repriceAttempt) : undefined;
     const orderId = this.idGen.nextOrderId({
       timestampMs,
       side,
@@ -364,20 +426,76 @@ export class DryRunEngine {
     }
 
     if (qty <= 0n) {
-      return { result: this.makeRejected(orderId, side, type, input.qty, 'INVALID_QTY'), realizedPnlFp: fpZero, feeFp: fpZero };
+      return {
+        result: this.makeRejected(orderId, side, type, input.qty, 'INVALID_QTY', undefined, {
+          clientOrderId,
+          postOnly,
+          reasonCode,
+          addonIndex,
+          repriceAttempt,
+        }),
+        realizedPnlFp: fpZero,
+        feeFp: fpZero,
+      };
     }
 
     if (type === 'LIMIT' && price <= 0n) {
-      return { result: this.makeRejected(orderId, side, type, input.qty, 'INVALID_LIMIT_PRICE'), realizedPnlFp: fpZero, feeFp: fpZero };
+      return {
+        result: this.makeRejected(orderId, side, type, input.qty, 'INVALID_LIMIT_PRICE', undefined, {
+          clientOrderId,
+          postOnly,
+          reasonCode,
+          addonIndex,
+          repriceAttempt,
+        }),
+        realizedPnlFp: fpZero,
+        feeFp: fpZero,
+      };
+    }
+
+    if (type === 'LIMIT' && postOnly) {
+      const bestOpposite = this.bestMarketPrice(side, book);
+      if (bestOpposite > 0n) {
+        const crosses = side === 'BUY'
+          ? price >= bestOpposite
+          : price <= bestOpposite;
+        if (crosses) {
+          return {
+            result: this.makeRejected(orderId, side, type, input.qty, 'LIMIT_POSTONLY_REJECT', 'LIMIT_POSTONLY_REJECT', {
+              clientOrderId,
+              postOnly,
+              reasonCode: 'LIMIT_POSTONLY_REJECT',
+              addonIndex,
+              repriceAttempt,
+            }),
+            realizedPnlFp: fpZero,
+            feeFp: fpZero,
+          };
+        }
+      }
     }
 
     if (reduceOnly) {
       const currentSign = this.position ? fpSign(this.position.signedQty) : 0;
       const sideSign = side === 'BUY' ? 1 : -1;
       if (currentSign === 0 || currentSign === sideSign) {
-        return { result: this.makeRejected(orderId, side, type, input.qty, 'REDUCE_ONLY_REJECTED'), realizedPnlFp: fpZero, feeFp: fpZero };
+        return {
+          result: this.makeRejected(orderId, side, type, input.qty, 'REDUCE_ONLY_REJECTED', undefined, {
+            clientOrderId,
+            postOnly,
+            reasonCode,
+            addonIndex,
+            repriceAttempt,
+          }),
+          realizedPnlFp: fpZero,
+          feeFp: fpZero,
+        };
       }
     }
+
+    const bestOpposite = this.bestMarketPrice(side, book);
+    const marketable = type === 'LIMIT' && bestOpposite > 0n && (side === 'BUY' ? price >= bestOpposite : price <= bestOpposite);
+    const liquidity = type === 'MARKET' || marketable ? 'TAKER' : 'MAKER';
 
     const execution = this.executeWithOrderbook({
       orderId,
@@ -390,6 +508,12 @@ export class DryRunEngine {
       timestampMs,
       book,
       forced: false,
+      liquidity,
+      clientOrderId,
+      postOnly,
+      reasonCode,
+      addonIndex,
+      repriceAttempt,
     });
 
     if (type === 'LIMIT' && tif === 'GTC' && execution.remainingAfter > 0n) {
@@ -400,6 +524,12 @@ export class DryRunEngine {
         remainingQty: execution.remainingAfter,
         reduceOnly,
         createdTsMs: timestampMs,
+        clientOrderId,
+        postOnly,
+        ttlMs,
+        reasonCode,
+        addonIndex,
+        repriceAttempt,
       });
     }
 
@@ -421,12 +551,24 @@ export class DryRunEngine {
     timestampMs: number;
     book: DryRunOrderBook;
     forced: boolean;
+    liquidity: 'MAKER' | 'TAKER';
+    clientOrderId?: string;
+    postOnly?: boolean;
+    reasonCode?: DryRunReasonCode;
+    addonIndex?: number;
+    repriceAttempt?: number;
   }): { result: DryRunOrderResult; remainingAfter: Fp; realizedPnlFp: Fp; feeFp: Fp } {
     const requestedQty = input.qty;
     const allowedQty = this.applyPositionCapBeforeExecution(input.side, requestedQty, input.reduceOnly, input.price, input.type, input.book);
     if (allowedQty <= 0n) {
       return {
-        result: this.makeRejected(input.orderId, input.side, input.type, fromFp(requestedQty), 'POSITION_LIMIT_REJECTED'),
+        result: this.makeRejected(input.orderId, input.side, input.type, fromFp(requestedQty), 'POSITION_LIMIT_REJECTED', input.reasonCode ?? undefined, {
+          clientOrderId: input.clientOrderId,
+          postOnly: input.postOnly,
+          reasonCode: input.reasonCode,
+          addonIndex: input.addonIndex,
+          repriceAttempt: input.repriceAttempt,
+        }),
         remainingAfter: fpZero,
         realizedPnlFp: fpZero,
         feeFp: fpZero,
@@ -445,10 +587,16 @@ export class DryRunEngine {
     });
 
     const pnlAndTrades = this.applyFillToPosition(input.side, fill.fillQty, fill.avgPrice, input.timestampMs);
-    const fee = fpMul(fill.notional, this.cfg.takerFeeRate);
+    const feeRate = fill.fillQty > 0n
+      ? (input.liquidity === 'MAKER' ? this.cfg.makerFeeRate : this.cfg.takerFeeRate)
+      : fpZero;
+    const fee = fpMul(fill.notional, feeRate);
     this.walletBalance = fpSub(fpAdd(this.walletBalance, pnlAndTrades.realizedPnl), fee);
     if (this.walletBalance < 0n) {
       this.walletBalance = 0n;
+    }
+    if (input.reduceOnly && this.position === null) {
+      this.pendingLimits.clear();
     }
 
     const status = this.resolveStatus(input.type, input.tif, requestedQty, fill.fillQty, fill.remainingQty);
@@ -469,6 +617,12 @@ export class DryRunEngine {
         slippageBps: fill.slippageBps,
         marketImpactBps: fill.marketImpactBps,
         reason: status === 'REJECTED' ? 'ORDER_REJECTED' : null,
+        reasonCode: input.reasonCode ?? null,
+        clientOrderId: input.clientOrderId ?? null,
+        postOnly: Boolean(input.postOnly),
+        maker: input.liquidity === 'MAKER',
+        addonIndex: input.addonIndex ?? null,
+        repriceAttempt: input.repriceAttempt ?? null,
         tradeIds: pnlAndTrades.tradeIds,
       },
       remainingAfter,
@@ -569,6 +723,65 @@ export class DryRunEngine {
         avgPrice: fpZero,
         slippageBps: 0,
         marketImpactBps: 0,
+      };
+    }
+
+    if (input.type === 'MARKET') {
+      const bestBid = Number(input.book.bids[0]?.price ?? 0);
+      const bestAsk = Number(input.book.asks[0]?.price ?? 0);
+      const mid = bestBid > 0 && bestAsk > 0 ? (bestBid + bestAsk) / 2 : 0;
+      const spread = bestBid > 0 && bestAsk > 0 ? Math.max(0, bestAsk - bestBid) : 0;
+      let basePrice = 0;
+      if (mid > 0) {
+        basePrice = input.side === 'BUY' ? mid + (spread / 2) : mid - (spread / 2);
+      } else if (bestBid > 0 || bestAsk > 0) {
+        basePrice = input.side === 'BUY' ? (bestAsk || bestBid) : (bestBid || bestAsk);
+      } else if (input.markPriceFallback > 0n) {
+        basePrice = fromFp(input.markPriceFallback);
+      } else {
+        basePrice = 1;
+      }
+
+      const levels = input.side === 'BUY' ? input.book.asks : input.book.bids;
+      let depth = 0;
+      for (const level of levels) {
+        const qty = Number(level?.qty ?? 0);
+        if (Number.isFinite(qty) && qty > 0) depth += qty;
+      }
+      let filled = input.forceFullClose ? targetQty : fpMin(targetQty, toFp(depth));
+      let remaining = input.forceFullClose ? fpZero : fpSub(targetQty, filled);
+      if (input.forceFullClose && filled <= 0n) {
+        filled = targetQty;
+        remaining = fpZero;
+      }
+      let avgPrice = filled > 0n ? toFp(basePrice) : fpZero;
+      let notional = fpMul(filled, avgPrice);
+
+      let slippageBps = 0;
+      let marketImpactBps = 0;
+      if (filled > 0n && avgPrice > 0n) {
+        const impact = this.marketImpactSimulator.adjustFill({
+          side: input.side,
+          type: input.type,
+          tif: input.tif,
+          requestedQty: targetQty,
+          filledQty: filled,
+          avgFillPrice: avgPrice,
+          book: input.book,
+        });
+        avgPrice = impact.adjustedAvgFillPrice;
+        notional = fpMul(filled, avgPrice);
+        slippageBps = impact.slippageBps;
+        marketImpactBps = impact.marketImpactBps;
+      }
+
+      return {
+        fillQty: filled,
+        remainingQty: remaining,
+        notional,
+        avgPrice,
+        slippageBps,
+        marketImpactBps,
       };
     }
 
@@ -759,6 +972,8 @@ export class DryRunEngine {
       timestampMs,
       book,
       forced: true,
+      liquidity: 'TAKER',
+      reasonCode: 'RISK_EMERGENCY',
     });
 
     this.pendingLimits.clear();
@@ -768,6 +983,7 @@ export class DryRunEngine {
         status: 'FILLED',
         remainingQty: 0,
         reason: 'FORCED_LIQUIDATION',
+        reasonCode: 'RISK_EMERGENCY',
       },
       realizedPnlFp: execution.realizedPnlFp,
       feeFp: execution.feeFp,
@@ -790,7 +1006,15 @@ export class DryRunEngine {
     side: DryRunSide,
     type: 'MARKET' | 'LIMIT',
     requestedQty: number,
-    reason: string
+    reason: string,
+    reasonCode?: DryRunReasonCode,
+    meta?: {
+      clientOrderId?: string;
+      postOnly?: boolean;
+      reasonCode?: DryRunReasonCode;
+      addonIndex?: number;
+      repriceAttempt?: number;
+    }
   ): DryRunOrderResult {
     return {
       orderId,
@@ -804,6 +1028,50 @@ export class DryRunEngine {
       fee: 0,
       realizedPnl: 0,
       reason,
+      reasonCode: reasonCode ?? meta?.reasonCode ?? null,
+      clientOrderId: meta?.clientOrderId ?? null,
+      postOnly: Boolean(meta?.postOnly),
+      maker: false,
+      addonIndex: Number.isFinite(meta?.addonIndex as number) ? Number(meta?.addonIndex) : null,
+      repriceAttempt: Number.isFinite(meta?.repriceAttempt as number) ? Number(meta?.repriceAttempt) : null,
+      tradeIds: [],
+    };
+  }
+
+  private makeCanceled(
+    orderId: string,
+    side: DryRunSide,
+    type: 'MARKET' | 'LIMIT',
+    requestedQty: number,
+    remainingQty: number,
+    reason: string,
+    reasonCode?: DryRunReasonCode,
+    meta?: {
+      clientOrderId?: string;
+      postOnly?: boolean;
+      reasonCode?: DryRunReasonCode;
+      addonIndex?: number;
+      repriceAttempt?: number;
+    }
+  ): DryRunOrderResult {
+    return {
+      orderId,
+      status: 'CANCELED',
+      side,
+      type,
+      requestedQty,
+      filledQty: 0,
+      remainingQty,
+      avgFillPrice: 0,
+      fee: 0,
+      realizedPnl: 0,
+      reason,
+      reasonCode: reasonCode ?? meta?.reasonCode ?? null,
+      clientOrderId: meta?.clientOrderId ?? null,
+      postOnly: Boolean(meta?.postOnly),
+      maker: false,
+      addonIndex: Number.isFinite(meta?.addonIndex as number) ? Number(meta?.addonIndex) : null,
+      repriceAttempt: Number.isFinite(meta?.repriceAttempt as number) ? Number(meta?.repriceAttempt) : null,
       tradeIds: [],
     };
   }

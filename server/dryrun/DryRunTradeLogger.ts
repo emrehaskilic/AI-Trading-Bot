@@ -1,7 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { DryRunReasonCode } from './types';
 
-export type DryRunLogEventType = 'SIGNAL' | 'ENTRY' | 'EXIT' | 'SNAPSHOT';
+export type DryRunLogEventType = 'SIGNAL' | 'ENTRY' | 'EXIT' | 'SNAPSHOT' | 'ACTION';
 
 export interface DryRunOrderflowMetrics {
   obiWeighted: number | null;
@@ -109,7 +110,30 @@ export interface DryRunSnapshotLog {
   } | null;
 }
 
-export type DryRunLogEvent = DryRunSignalLog | DryRunEntryLog | DryRunExitLog | DryRunSnapshotLog;
+export interface DryRunActionLog {
+  type: 'ACTION';
+  runId: string;
+  symbol: string;
+  timestampMs: number;
+  reason_code: DryRunReasonCode;
+  signalType: string | null;
+  signalScore: number | null;
+  signalSide: 'LONG' | 'SHORT' | null;
+  unrealizedPnlPct: number;
+  feePaid_increment: number;
+  spread_pct: number | null;
+  impact_estimate: number | null;
+  addonIndex: number | null;
+  flipState: {
+    confirmTicks: number;
+    requiredTicks: number;
+    lastOppositeSide: 'LONG' | 'SHORT' | null;
+    partialReduced: boolean;
+  } | null;
+  holdRemainingMs: number;
+}
+
+export type DryRunLogEvent = DryRunSignalLog | DryRunEntryLog | DryRunExitLog | DryRunSnapshotLog | DryRunActionLog;
 
 export interface DryRunLoggerConfig {
   dir: string;
@@ -152,7 +176,7 @@ export class DryRunTradeLogger {
   log(event: DryRunLogEvent): void {
     const eventTimeMs = Number.isFinite(event.timestampMs) && event.timestampMs > 0
       ? event.timestampMs
-      : Date.now();
+      : 0;
     this.enqueue({ eventTimeMs, payload: event });
   }
 

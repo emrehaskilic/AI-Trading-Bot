@@ -66,6 +66,8 @@ const PORT = parseInt(process.env.PORT || '8787', 10);
 const HOST = process.env.HOST || '0.0.0.0'; // Listen on all interfaces for Nginx proxy
 const BINANCE_REST_BASE = 'https://fapi.binance.com';
 const BINANCE_WS_BASE = 'wss://fstream.binance.com/stream';
+const DEFAULT_MAKER_FEE_RATE = Number(process.env.MAKER_FEE_BPS || '2') / 10000;
+const DEFAULT_TAKER_FEE_RATE = Number(process.env.TAKER_FEE_BPS || '4') / 10000;
 
 // Dynamic CORS - allow configured origins plus common development ports
 const ALLOWED_ORIGINS = [
@@ -1543,7 +1545,8 @@ app.post('/api/dry-run/start', async (req, res) => {
             walletBalanceStartUsdt: Number(req.body?.walletBalanceStartUsdt ?? 5000),
             initialMarginUsdt: Number(req.body?.initialMarginUsdt ?? 200),
             leverage: Number(req.body?.leverage ?? 10),
-            takerFeeRate: Number(req.body?.takerFeeRate ?? 0.0004),
+            makerFeeRate: req.body?.makerFeeRate != null ? Number(req.body.makerFeeRate) : undefined,
+            takerFeeRate: req.body?.takerFeeRate != null ? Number(req.body.takerFeeRate) : undefined,
             maintenanceMarginRate: Number(req.body?.maintenanceMarginRate ?? 0.005),
             fundingRates,
             fundingIntervalMs: Number(req.body?.fundingIntervalMs ?? (8 * 60 * 60 * 1000)),
@@ -1634,7 +1637,8 @@ app.post('/api/dry-run/run', (req, res) => {
             walletBalanceStartUsdt: Number(body.walletBalanceStartUsdt ?? 5000),
             initialMarginUsdt: Number(body.initialMarginUsdt ?? 200),
             leverage: Number(body.leverage ?? 1),
-            takerFeeRate: Number(body.takerFeeRate ?? 0.0004),
+            makerFeeRate: Number(body.makerFeeRate ?? DEFAULT_MAKER_FEE_RATE),
+            takerFeeRate: Number(body.takerFeeRate ?? DEFAULT_TAKER_FEE_RATE),
             maintenanceMarginRate: Number(body.maintenanceMarginRate ?? 0.005),
             fundingRate: Number(body.fundingRate ?? 0),
             fundingIntervalMs: Number(body.fundingIntervalMs ?? (8 * 60 * 60 * 1000)),
