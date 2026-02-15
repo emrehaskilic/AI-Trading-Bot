@@ -105,7 +105,7 @@ export interface FundingContext {
 export interface MetricsMessage {
   type: 'metrics';
   symbol: string;
-  state: 'LIVE' | 'STALE' | 'RESYNCING';
+  state: 'LIVE' | 'STALE' | 'RESYNCING' | 'UNKNOWN';
   snapshot: SnapshotMetadata;
   timeAndSales: TimeAndSalesMetrics;
   cvd: {

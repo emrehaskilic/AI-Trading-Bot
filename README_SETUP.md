@@ -14,13 +14,20 @@ API_KEY_SECRET=your-strong-api-key
 LOG_LEVEL=info
 ```
 
+Optional notification webhooks (keep these secret, never commit to VCS):
+
+```bash
+TELEGRAM_WEBHOOK_URL=https://api.telegram.org/bot.../sendMessage
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+```
+
 Optional frontend env (`.env.local`):
 
 ```bash
 VITE_PROXY_API_KEY=your-strong-api-key
 ```
 
-`VITE_PROXY_API_KEY` is required. Frontend startup fails fast when it is missing.
+`VITE_PROXY_API_KEY` must match `API_KEY_SECRET`. Frontend startup fails fast when it is missing.
 
 Optional dev host override (`.env.development.local`):
 

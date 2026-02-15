@@ -5,14 +5,14 @@ import MetricValue from './MetricValue';
 
 describe('MetricValue', () => {
   it('formats currency values', () => {
-    render(<MetricValue value={12.345} format="currency" />);
+    render(<MetricValue value={12.345} format="currency" locale="en-US" />);
     const element = screen.getByText('$12.35');
     expect(element).toBeInTheDocument();
     expect(element.className).toContain('text-green-500');
   });
 
   it('applies reverse coloring when enabled', () => {
-    render(<MetricValue value={2} reverseColor />);
+    render(<MetricValue value={2} reverseColor locale="en-US" />);
     const element = screen.getByText('2.00');
     expect(element.className).toContain('text-red-500');
   });

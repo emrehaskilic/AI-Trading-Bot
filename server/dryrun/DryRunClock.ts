@@ -1,8 +1,12 @@
 export class DryRunClock {
-  private nowMs = 0;
+  private nowMs: number | null = null;
 
   now(): number {
-    return this.nowMs > 0 ? this.nowMs : 1;
+    if (this.nowMs === null) {
+      console.warn('DryRunClock.now() called before set(), returning 1. This indicates an uninitialized state.');
+      return 1;
+    }
+    return this.nowMs;
   }
 
   set(timestampMs: number): void {

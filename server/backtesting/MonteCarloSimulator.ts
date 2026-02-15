@@ -19,6 +19,38 @@ function computeMaxDrawdown(pnlCurve: number[]): number {
   return maxDd;
 }
 
+export function generateRandomTrades(returnsSeries: number[], numTrades: number): number[] {
+  if (!returnsSeries.length || numTrades <= 0) return [];
+  const trades: number[] = [];
+  for (let i = 0; i < numTrades; i += 1) {
+    const idx = Math.floor(Math.random() * returnsSeries.length);
+    trades.push(returnsSeries[idx]);
+  }
+  return trades;
+}
+
+export function calculateRiskOfRuin(
+  tradePnLs: number[],
+  initialCapital: number,
+  ruinThreshold: number,
+  numRuns = 1000
+): number {
+  if (!tradePnLs.length || initialCapital <= 0) return 0;
+  let ruinCount = 0;
+  for (let i = 0; i < numRuns; i += 1) {
+    let equity = initialCapital;
+    for (let j = 0; j < tradePnLs.length; j += 1) {
+      const idx = Math.floor(Math.random() * tradePnLs.length);
+      equity += tradePnLs[idx];
+      if (equity <= initialCapital * (1 - ruinThreshold)) {
+        ruinCount += 1;
+        break;
+      }
+    }
+  }
+  return ruinCount / numRuns;
+}
+
 export class MonteCarloSimulator {
   constructor(private readonly config: MonteCarloConfig) {}
 

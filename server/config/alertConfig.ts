@@ -11,7 +11,18 @@ export function buildAlertConfigFromEnv(): AlertConfig {
       SIGNAL_STRENGTH: { priority: 'MEDIUM', minIntervalMs: 30_000 },
       ORDERBOOK_INTEGRITY: { priority: 'CRITICAL', minIntervalMs: 120_000 },
       DRYRUN_ENGINE: { priority: 'CRITICAL', minIntervalMs: 60_000 },
+      INTERNAL_ERROR: { priority: 'CRITICAL', minIntervalMs: 60_000 },
+      DAILY_KILL_SWITCH: { priority: 'CRITICAL', minIntervalMs: 60_000 },
       DAILY_REPORT: { priority: 'LOW', minIntervalMs: 86_400_000 },
     },
   };
+}
+
+let cachedAlertConfig: AlertConfig | null = null;
+
+export function getAlertConfig(): AlertConfig {
+  if (!cachedAlertConfig) {
+    cachedAlertConfig = buildAlertConfigFromEnv();
+  }
+  return cachedAlertConfig;
 }

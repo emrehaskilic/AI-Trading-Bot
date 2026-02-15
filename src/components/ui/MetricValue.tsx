@@ -2,20 +2,50 @@ import React from 'react';
 
 /**
  * Display a numeric metric with automatic colouring based on its sign.
- * Positive values are green, negative values are red and values near
- * zero are rendered in neutral colour.  The number of decimal places
- * can be customised via the format prop.
+ * Formatting uses Intl.NumberFormat for locale‑aware output.
  */
-const MetricValue: React.FC<{ value: number; format?: 'number' | 'currency' | 'percent'; reverseColor?: boolean }> = ({ value, format = 'number', reverseColor = false }) => {
+interface MetricValueProps {
+  value: number;
+  format?: 'number' | 'currency' | 'percentage';
+  reverseColor?: boolean;
+  currency?: string;
+  locale?: string;
+}
+
+const MetricValue: React.FC<MetricValueProps> = ({
+  value,
+  format = 'number',
+  reverseColor = false,
+  currency = 'USD',
+  locale,
+}) => {
   let color = 'text-zinc-300';
   if (value > 0.0001) color = reverseColor ? 'text-red-500' : 'text-green-500';
   if (value < -0.0001) color = reverseColor ? 'text-green-500' : 'text-red-500';
-  const formatted = format === 'currency'
-    ? `$${value.toFixed(2)}`
-    : format === 'percent'
-      ? `${(value * 100).toFixed(1)}%`
-      : value.toFixed(2);
-  return <span className={`font-mono font-medium ${color}`}>{formatted}</span>;
+
+  const resolvedLocale = locale || (typeof navigator !== 'undefined' ? navigator.language : 'en-US');
+  let formatted = '';
+  if (format === 'currency') {
+    formatted = new Intl.NumberFormat(resolvedLocale, {
+      style: 'currency',
+      currency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(value);
+  } else if (format === 'percentage') {
+    formatted = new Intl.NumberFormat(resolvedLocale, {
+      style: 'percent',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(value / 100);
+  } else {
+    formatted = new Intl.NumberFormat(resolvedLocale, {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(value);
+  }
+
+  return <span className={`font-mono font-medium ${color}`} aria-live="polite">{formatted}</span>;
 };
 
 export default MetricValue;

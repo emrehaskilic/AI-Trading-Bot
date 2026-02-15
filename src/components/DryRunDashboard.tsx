@@ -517,7 +517,11 @@ const DryRunDashboard: React.FC = () => {
             </button>
           </div>
 
-          {actionError && <div className="text-xs text-red-500">{actionError}</div>}
+          {actionError && (
+            <div className="text-xs text-red-500" role="alert" aria-live="assertive">
+              {actionError}
+            </div>
+          )}
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-5 gap-3">

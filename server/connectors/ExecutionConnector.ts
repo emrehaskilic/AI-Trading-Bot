@@ -4,6 +4,7 @@ import {
   CancelOrderRequest,
   ExecutionConnectorConfig,
   ExecutionEvent,
+  OrderType,
   MarginType,
   OpenOrdersSnapshotEvent,
   OrderUpdateEvent,
@@ -380,10 +381,15 @@ export class ExecutionConnector {
   expectedPrice(
     symbol: string,
     side: 'BUY' | 'SELL',
-    orderType: 'MARKET' | 'LIMIT' | 'STOP_MARKET' | 'TAKE_PROFIT_MARKET',
+    orderType: OrderType,
     limitPrice?: number
   ): number | null {
-    if (orderType === 'LIMIT') {
+    const normalizedType = orderType === 'STOP_LOSS'
+      ? 'STOP_MARKET'
+      : orderType === 'TAKE_PROFIT'
+        ? 'TAKE_PROFIT_MARKET'
+        : orderType;
+    if (normalizedType === 'LIMIT') {
       return typeof limitPrice === 'number' ? limitPrice : null;
     }
     const quote = this.getQuote(symbol);
@@ -472,7 +478,11 @@ export class ExecutionConnector {
       orderAttemptId,
       decisionId: context?.decisionId,
     });
-    const orderType = request.type;
+    const orderType = request.type === 'STOP_LOSS'
+      ? 'STOP_MARKET'
+      : request.type === 'TAKE_PROFIT'
+        ? 'TAKE_PROFIT_MARKET'
+        : request.type;
 
     const params: Record<string, string | number | boolean | undefined> = {
       symbol,
@@ -496,7 +506,8 @@ export class ExecutionConnector {
 
       const normalizedLimitPrice = this.normalizeLimitPrice(symbol, request.side, rawLimitPrice);
       params.price = normalizedLimitPrice;
-      params.timeInForce = request.timeInForce || 'GTC';
+      const tif = request.timeInForce === 'POST_ONLY' ? 'GTX' : request.timeInForce;
+      params.timeInForce = tif || 'GTC';
     }
 
     if (orderType === 'STOP_MARKET' || orderType === 'TAKE_PROFIT_MARKET') {

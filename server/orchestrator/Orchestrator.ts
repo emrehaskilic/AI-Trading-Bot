@@ -1071,8 +1071,8 @@ export class Orchestrator {
         const res = await this.executor.execute({
           symbol,
           side,
-          price,
-          quantity: sizingQty,
+          price: String(price),
+          quantity: String(sizingQty),
           reduceOnly,
         });
         this.logOrderAttemptAudit({
@@ -1198,22 +1198,23 @@ export class Orchestrator {
     clientOrderId: string;
   }): Promise<{ orderId: string; clientOrderId: string; price: number } | null> {
     const price = this.getMakerLimitPrice(input.symbol, input.side);
-    if (!(price > 0)) {
+    if (price == null || !(price > 0)) {
       this.log('LIMIT_REPRICE_PRICE_MISSING', { symbol: input.symbol, previousOrderId: input.previousOrderId });
       return null;
     }
+    const safePrice = price;
     try {
       const res = await this.connector.placeOrder({
         symbol: input.symbol,
         side: input.side,
         type: 'LIMIT',
         quantity: input.qty,
-        price,
+        price: safePrice,
         timeInForce: 'GTC',
         reduceOnly: input.reduceOnly,
         clientOrderId: input.clientOrderId,
       });
-      return { orderId: res.orderId, clientOrderId: input.clientOrderId, price };
+      return { orderId: res.orderId, clientOrderId: input.clientOrderId, price: safePrice };
     } catch (e: any) {
       this.log('LIMIT_REPRICE_ERROR', {
         symbol: input.symbol,

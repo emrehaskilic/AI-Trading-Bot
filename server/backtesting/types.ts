@@ -9,6 +9,10 @@ export interface MonteCarloResult {
   totalPnL: number;
   maxDrawdown: number;
   sharpeRatio: number;
+  pValue?: number;
+  confidenceInterval?: { lower: number; upper: number };
+  riskOfRuin?: number;
+  baselineSharpe?: number;
 }
 
 export interface WalkForwardConfig {
@@ -23,4 +27,13 @@ export interface WalkForwardReport {
   outSampleSharpe: number;
   optimalThreshold: number;
   overfittingDetected: boolean;
+}
+
+export interface RegimePerformanceReport {
+  regime: string;
+  totalPnL: number;
+  maxDrawdown: number;
+  winRate: number;
+  avgPnL: number;
+  sharpeRatio: number;
 }

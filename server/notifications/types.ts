@@ -5,7 +5,9 @@ export type AlertType =
   | 'SIGNAL_STRENGTH'
   | 'ORDERBOOK_INTEGRITY'
   | 'DRYRUN_ENGINE'
-  | 'DAILY_REPORT';
+  | 'DAILY_REPORT'
+  | 'DAILY_KILL_SWITCH'
+  | 'INTERNAL_ERROR';
 
 export type AlertPriority = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
 

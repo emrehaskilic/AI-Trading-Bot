@@ -36,6 +36,12 @@ import {
 } from './metrics/OrderbookManager';
 import { LegacyCalculator } from './metrics/LegacyCalculator';
 import { createOrchestratorFromEnv } from './orchestrator/Orchestrator';
+import { calculateSignalReturnCorrelation } from './metrics/SignalPerformance';
+import { analyzeLoserExits, analyzeWinnerExits, calculateAverageGrossEdgePerTrade, calculateFeeImpact, calculateFlipFrequency, calculatePrecisionRecall } from './metrics/TradeMetrics';
+import { calculateVolatilityRegime, identifyTrendChopRegime } from './metrics/MarketRegimeDetector';
+import { analyzeDrawdownClustering, calculateReturnDistribution, calculateSkewnessKurtosis } from './metrics/PortfolioMetrics';
+import { analyzePerformanceByOrderSize, analyzePerformanceBySpread, calculateSlippage } from './metrics/ExecutionMetrics';
+import { bootstrapMeanCI, tTestPValue } from './backtesting/Statistics';
 
 // [PHASE 1 & 2] New Imports
 import { KlineBackfill } from './backfill/KlineBackfill';
@@ -48,14 +54,15 @@ import { DryRunConfig, DryRunEngine, DryRunEventInput, DryRunSessionService, isU
 import { logger, requestLogger, serializeError } from './utils/logger';
 import { WebSocketManager } from './ws/WebSocketManager';
 import { AlertService } from './notifications/AlertService';
-import { buildAlertConfigFromEnv } from './config/alertConfig';
+import { getAlertConfig } from './config/alertConfig';
+import { NotificationService } from './notifications/NotificationService';
 import { HealthController } from './health/HealthController';
 import { MarketDataArchive } from './backfill/MarketDataArchive';
 import { SignalReplay } from './backfill/SignalReplay';
 import { ABTestManager } from './abtesting';
 import { PortfolioMonitor } from './risk/PortfolioMonitor';
 import { LatencyTracker } from './metrics/LatencyTracker';
-import { MonteCarloSimulator } from './backtesting/MonteCarloSimulator';
+import { MonteCarloSimulator, calculateRiskOfRuin, generateRandomTrades } from './backtesting/MonteCarloSimulator';
 import { WalkForwardAnalyzer } from './backtesting/WalkForwardAnalyzer';
 
 // =============================================================================
@@ -227,7 +234,9 @@ const strategyMap = new Map<string, StrategyEngine>();
 const backfillInFlight = new Set<string>();
 const backfillLastAttemptMs = new Map<string, number>();
 const BACKFILL_RETRY_INTERVAL_MS = 30_000;
-const alertService = new AlertService(buildAlertConfigFromEnv());
+const alertConfig = getAlertConfig();
+const alertService = new AlertService(alertConfig);
+const notificationService = new NotificationService(alertConfig);
 const orchestrator = createOrchestratorFromEnv(alertService);
 const dryRunSession = new DryRunSessionService(alertService);
 const abTestManager = new ABTestManager(alertService);
@@ -1778,7 +1787,30 @@ app.post('/api/backtest/monte-carlo', async (req, res) => {
             seed: req.body?.seed ? Number(req.body.seed) : undefined,
         });
         const results = simulator.run(returns);
-        res.json({ ok: true, results });
+        const pValue = tTestPValue(returns);
+        const confidenceInterval = bootstrapMeanCI(returns);
+        const baselineTrades = generateRandomTrades(returns, returns.length);
+        const baselineSharpe = (() => {
+            if (baselineTrades.length < 2) return 0;
+            const avg = baselineTrades.reduce((acc, v) => acc + v, 0) / baselineTrades.length;
+            const variance = baselineTrades.reduce((acc, v) => acc + Math.pow(v - avg, 2), 0) / baselineTrades.length;
+            const std = Math.sqrt(variance);
+            return std === 0 ? 0 : (avg / std) * Math.sqrt(252);
+        })();
+        const initialCapital = Number(req.body?.initialCapital ?? 10_000);
+        const ruinThreshold = Number(req.body?.ruinThreshold ?? 0.5);
+        const riskOfRuin = calculateRiskOfRuin(returns, initialCapital, ruinThreshold, Number(req.body?.ruinRuns ?? 500));
+
+        res.json({
+            ok: true,
+            results,
+            stats: {
+                pValue,
+                confidenceInterval,
+                baselineSharpe,
+                riskOfRuin,
+            },
+        });
     } catch (e: any) {
         res.status(500).json({ ok: false, error: e?.message || 'monte_carlo_failed' });
     }
@@ -1821,6 +1853,149 @@ app.post('/api/backtest/walk-forward', async (req, res) => {
     }
 });
 
+app.post('/api/analytics/edge-validation', (req, res) => {
+    try {
+        const signals = Array.isArray(req.body?.signals) ? req.body.signals : [];
+        const prices = Array.isArray(req.body?.prices) ? req.body.prices : [];
+        const trades = Array.isArray(req.body?.trades) ? req.body.trades : [];
+        const lookaheadMs = Number(req.body?.lookaheadMs ?? 60 * 60 * 1000);
+        const profitThreshold = Number(req.body?.profitThreshold ?? 0);
+
+        const correlation = calculateSignalReturnCorrelation(signals, prices, lookaheadMs);
+        const precisionRecall = calculatePrecisionRecall(trades, profitThreshold);
+
+        const tradePnLs = trades.map((trade: any) => {
+            const side = trade.side === 'SELL' ? -1 : 1;
+            const gross = (Number(trade.exitPrice) - Number(trade.entryPrice)) * Number(trade.quantity) * side;
+            return gross - Number(trade.fees || 0);
+        });
+
+        const pValue = tTestPValue(tradePnLs);
+        const confidenceInterval = bootstrapMeanCI(tradePnLs);
+        const baselineTrades = generateRandomTrades(tradePnLs, tradePnLs.length);
+
+        res.json({
+            ok: true,
+            correlation,
+            precisionRecall,
+            statistics: {
+                pValue,
+                confidenceInterval,
+                baselineMean: baselineTrades.length ? baselineTrades.reduce((a, b) => a + b, 0) / baselineTrades.length : 0,
+            },
+        });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'edge_validation_failed' });
+    }
+});
+
+app.post('/api/analytics/regime-analysis', (req, res) => {
+    try {
+        const priceSeries = Array.isArray(req.body?.prices) ? req.body.prices : [];
+        const trades = Array.isArray(req.body?.trades) ? req.body.trades : [];
+        const prices: number[] = priceSeries.map((p: any) => Number(p.price ?? p));
+        const timestamps: number[] = priceSeries.map((p: any, idx: number) => Number(p.timestampMs ?? p.timestamp ?? idx));
+
+        const volRegimes = calculateVolatilityRegime(prices);
+        const trendRegimes = identifyTrendChopRegime(prices);
+
+        const buckets = new Map<string, number[]>();
+        trades.forEach((trade: any) => {
+            const entryTs = Number(trade.entryTimestampMs ?? trade.timestampMs ?? 0);
+            const idx = timestamps.findIndex((ts) => ts >= entryTs);
+            const index = idx >= 0 ? idx : timestamps.length - 1;
+            const vol = volRegimes[index] || 'MEDIUM';
+            const trend = trendRegimes[index] || 'CHOP';
+            const key = `${vol}_${trend}`;
+            const side = trade.side === 'SELL' ? -1 : 1;
+            const pnl = (Number(trade.exitPrice) - Number(trade.entryPrice)) * Number(trade.quantity) * side - Number(trade.fees || 0);
+            if (!buckets.has(key)) buckets.set(key, []);
+            buckets.get(key)?.push(pnl);
+        });
+
+        const regimeReports = Array.from(buckets.entries()).map(([regime, pnls]) => {
+            const totalPnL = pnls.reduce((a, b) => a + b, 0);
+            const winRate = pnls.length ? pnls.filter((p) => p > 0).length / pnls.length : 0;
+            let peak = 0;
+            let maxDd = 0;
+            let running = 0;
+            pnls.forEach((p) => {
+                running += p;
+                peak = Math.max(peak, running);
+                maxDd = Math.max(maxDd, peak - running);
+            });
+            const avgPnL = pnls.length ? totalPnL / pnls.length : 0;
+            const variance = pnls.length ? pnls.reduce((a, b) => a + Math.pow(b - avgPnL, 2), 0) / pnls.length : 0;
+            const std = Math.sqrt(variance);
+            const sharpeRatio = std === 0 ? 0 : (avgPnL / std) * Math.sqrt(252);
+            return { regime, totalPnL, maxDrawdown: maxDd, winRate, avgPnL, sharpeRatio };
+        });
+
+        res.json({
+            ok: true,
+            regimes: {
+                volatility: volRegimes,
+                trend: trendRegimes,
+            },
+            regimeReports,
+        });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'regime_analysis_failed' });
+    }
+});
+
+app.post('/api/analytics/risk-profile', (req, res) => {
+    try {
+        const returns = Array.isArray(req.body?.returns) ? req.body.returns.map(Number) : [];
+        const equityCurve = Array.isArray(req.body?.equityCurve) ? req.body.equityCurve.map(Number) : [];
+        const distribution = calculateReturnDistribution(returns);
+        const skewKurt = calculateSkewnessKurtosis(returns);
+        const drawdowns = analyzeDrawdownClustering(equityCurve);
+
+        res.json({ ok: true, distribution, skewKurt, drawdowns });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'risk_profile_failed' });
+    }
+});
+
+app.post('/api/analytics/execution-impact', (req, res) => {
+    try {
+        const executions = Array.isArray(req.body?.executions) ? req.body.executions : [];
+        const trades = Array.isArray(req.body?.trades) ? req.body.trades : [];
+        const slippage = calculateSlippage(executions);
+        const spreadPerf = analyzePerformanceBySpread(trades);
+        const sizePerf = analyzePerformanceByOrderSize(trades);
+
+        res.json({ ok: true, slippage, spreadPerformance: spreadPerf, orderSizePerformance: sizePerf });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'execution_impact_failed' });
+    }
+});
+
+app.post('/api/analytics/trade-metrics', (req, res) => {
+    try {
+        const trades = Array.isArray(req.body?.trades) ? req.body.trades : [];
+        const precisionRecall = calculatePrecisionRecall(trades, Number(req.body?.profitThreshold ?? 0));
+        const feeImpact = calculateFeeImpact(trades);
+        const flipFrequency = calculateFlipFrequency(trades);
+        const avgGrossEdge = calculateAverageGrossEdgePerTrade(trades);
+        const winners = analyzeWinnerExits(trades);
+        const losers = analyzeLoserExits(trades);
+
+        res.json({
+            ok: true,
+            precisionRecall,
+            feeImpact,
+            flipFrequency,
+            avgGrossEdge,
+            winners,
+            losers,
+        });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'trade_metrics_failed' });
+    }
+});
+
 app.use((err: any, req: Request, res: Response, next: NextFunction) => {
     const statusCode = Number.isFinite(err?.statusCode) ? Number(err.statusCode) : 500;
     const errorCode = typeof err?.code === 'string' ? err.code : 'internal_server_error';
@@ -1831,6 +2006,15 @@ app.use((err: any, req: Request, res: Response, next: NextFunction) => {
         errorCode,
         error: serializeError(err),
     });
+    if (statusCode >= 500) {
+        notificationService.sendAlert('INTERNAL_ERROR', err?.message || 'Unhandled server error', {
+            details: {
+                method: req.method,
+                path: req.originalUrl || req.url,
+                errorCode,
+            },
+        }).catch(() => undefined);
+    }
 
     if (res.headersSent) {
         next(err);

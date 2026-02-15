@@ -21,6 +21,8 @@ import * as TimeframeAggregatorTests from './TimeframeAggregator.test';
 import * as MarketImpactSimulatorTests from './MarketImpactSimulator.test';
 import * as OrderbookIntegrityMonitorTests from './OrderbookIntegrityMonitor.test';
 import * as StrategyEngineTests from './StrategyEngine.test';
+import * as DryRunClockTests from './DryRunClock.test';
+import * as FreezeControllerTests from './FreezeController.test';
 
 export const testSuites: { name: string; fn: () => void }[] = [
     { name: 'TimeAndSales', fn: TimeAndSalesTests.runTests },
@@ -46,4 +48,6 @@ export const testSuites: { name: string; fn: () => void }[] = [
     { name: 'MarketImpactSimulator', fn: MarketImpactSimulatorTests.runTests },
     { name: 'OrderbookIntegrityMonitor', fn: OrderbookIntegrityMonitorTests.runTests },
     { name: 'StrategyEngine', fn: StrategyEngineTests.runTests },
+    { name: 'DryRunClock', fn: DryRunClockTests.runTests },
+    { name: 'FreezeController', fn: FreezeControllerTests.runTests },
 ];

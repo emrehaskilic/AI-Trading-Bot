@@ -380,7 +380,11 @@ export const Dashboard: React.FC = () => {
                 {executionStatus.connection.executionEnabled ? 'ENABLED' : 'DISABLED'}
               </span>
             </div>
-            {connectionError && <div className="text-xs text-red-500 font-medium italic">{connectionError}</div>}
+            {connectionError && (
+              <div className="text-xs text-red-500 font-medium italic" role="alert" aria-live="assertive">
+                {connectionError}
+              </div>
+            )}
 
             <div className="pt-2 border-t border-zinc-800">
               <button
@@ -484,7 +488,11 @@ export const Dashboard: React.FC = () => {
                 ))}
               </div>
 
-              {settingsError && <div className="text-xs text-red-500">{settingsError}</div>}
+              {settingsError && (
+                <div className="text-xs text-red-500" role="alert" aria-live="assertive">
+                  {settingsError}
+                </div>
+              )}
               {!settingsError && settingsSavedAt > 0 && (
                 <div className="text-[10px] text-zinc-600">Settings saved: {new Date(settingsSavedAt).toLocaleTimeString()}</div>
               )}
@@ -507,15 +515,21 @@ export const Dashboard: React.FC = () => {
                 <div className="text-center">Signal</div>
               </div>
               <div className="bg-black/20 divide-y divide-zinc-900">
-                {activeSymbols.map((symbol) => {
-                  const msg: MetricsMessage | undefined = marketData[symbol];
-                  if (!msg) return (
-                    <div key={symbol} className="px-5 py-4 text-xs text-zinc-600 italic">
-                      Initializing {symbol}...
-                    </div>
-                  );
-                  return <SymbolRow key={symbol} symbol={symbol} data={msg} showLatency={false} />;
-                })}
+                {activeSymbols.length === 0 ? (
+                  <div className="px-5 py-6 text-xs text-zinc-600 italic">
+                    Select at least one symbol to start streaming telemetry.
+                  </div>
+                ) : (
+                  activeSymbols.map((symbol) => {
+                    const msg: MetricsMessage | undefined = marketData[symbol];
+                    if (!msg) return (
+                      <div key={symbol} className="px-5 py-4 text-xs text-zinc-600 italic">
+                        Initializing {symbol}...
+                      </div>
+                    );
+                    return <SymbolRow key={symbol} symbol={symbol} data={msg} showLatency={false} />;
+                  })
+                )}
               </div>
             </div>
           </div>

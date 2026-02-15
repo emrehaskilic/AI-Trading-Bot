@@ -35,6 +35,8 @@ type PositionInternal = {
   signedQty: Fp;
   entryPrice: Fp;
   entryTimestampMs: number;
+  maxFavorablePrice: Fp;
+  maxAdversePrice: Fp;
 } | null;
 
 type PendingLimitOrder = {
@@ -144,6 +146,8 @@ export class DryRunEngine {
 
     const markPrice = toFp(event.markPrice);
     const book = this.normalizeBook(event.orderBook);
+
+    this.updatePositionExtremes(markPrice);
 
     if (!this.fundingBoundaryInitialized) {
       this.lastFundingBoundaryTsUTC = Math.floor(event.timestampMs / this.cfg.fundingIntervalMs) * this.cfg.fundingIntervalMs;
@@ -266,6 +270,8 @@ export class DryRunEngine {
         entryTimestampMs: Number.isFinite(snapshot.position.entryTimestampMs as number)
           ? Number(snapshot.position.entryTimestampMs)
           : 0,
+        maxFavorablePrice: toFp(snapshot.position.entryPrice),
+        maxAdversePrice: toFp(snapshot.position.entryPrice),
       };
     } else {
       this.position = null;
@@ -616,6 +622,8 @@ export class DryRunEngine {
         realizedPnl: fpRoundTo(pnlAndTrades.realizedPnl, 8),
         slippageBps: fill.slippageBps,
         marketImpactBps: fill.marketImpactBps,
+        maePct: pnlAndTrades.maePct,
+        mfePct: pnlAndTrades.mfePct,
         reason: status === 'REJECTED' ? 'ORDER_REJECTED' : null,
         reasonCode: input.reasonCode ?? null,
         clientOrderId: input.clientOrderId ?? null,
@@ -853,12 +861,25 @@ export class DryRunEngine {
     };
   }
 
+  private updatePositionExtremes(markPrice: Fp): void {
+    if (!this.position || this.position.signedQty === 0n) {
+      return;
+    }
+    if (this.position.signedQty > 0n) {
+      this.position.maxFavorablePrice = fpMax(this.position.maxFavorablePrice, markPrice);
+      this.position.maxAdversePrice = fpMin(this.position.maxAdversePrice, markPrice);
+    } else {
+      this.position.maxFavorablePrice = fpMin(this.position.maxFavorablePrice, markPrice);
+      this.position.maxAdversePrice = fpMax(this.position.maxAdversePrice, markPrice);
+    }
+  }
+
   private applyFillToPosition(
     side: DryRunSide,
     fillQty: Fp,
     fillPrice: Fp,
     timestampMs: number
-  ): { realizedPnl: Fp; tradeIds: string[] } {
+  ): { realizedPnl: Fp; tradeIds: string[]; maePct?: number; mfePct?: number } {
     if (fillQty <= 0n) {
       return { realizedPnl: fpZero, tradeIds: [] };
     }
@@ -871,6 +892,8 @@ export class DryRunEngine {
         signedQty: delta,
         entryPrice: fillPrice,
         entryTimestampMs: timestampMs,
+        maxFavorablePrice: fillPrice,
+        maxAdversePrice: fillPrice,
       };
       return { realizedPnl: fpZero, tradeIds: [] };
     }
@@ -890,6 +913,8 @@ export class DryRunEngine {
         signedQty: fpAdd(currentQty, delta),
         entryPrice: newEntry,
         entryTimestampMs: this.position!.entryTimestampMs,
+        maxFavorablePrice: this.position!.maxFavorablePrice,
+        maxAdversePrice: this.position!.maxAdversePrice,
       };
       return { realizedPnl: realized, tradeIds };
     }
@@ -905,10 +930,19 @@ export class DryRunEngine {
       })
     );
 
+    const mfe = currentSign > 0
+      ? fpSub(this.position!.maxFavorablePrice, this.position!.entryPrice)
+      : fpSub(this.position!.entryPrice, this.position!.maxFavorablePrice);
+    const mae = currentSign > 0
+      ? fpSub(this.position!.maxAdversePrice, this.position!.entryPrice)
+      : fpSub(this.position!.entryPrice, this.position!.maxAdversePrice);
+    const mfePct = this.position!.entryPrice > 0n ? (fromFp(mfe) / fromFp(this.position!.entryPrice)) * 100 : 0;
+    const maePct = this.position!.entryPrice > 0n ? (fromFp(mae) / fromFp(this.position!.entryPrice)) * 100 : 0;
+
     const newQty = fpAdd(currentQty, delta);
     if (newQty === 0n) {
       this.position = null;
-      return { realizedPnl: realized, tradeIds };
+      return { realizedPnl: realized, tradeIds, maePct, mfePct };
     }
 
     if (fpSign(newQty) === currentSign) {
@@ -916,16 +950,20 @@ export class DryRunEngine {
         signedQty: newQty,
         entryPrice: this.position!.entryPrice,
         entryTimestampMs: this.position!.entryTimestampMs,
+        maxFavorablePrice: this.position!.maxFavorablePrice,
+        maxAdversePrice: this.position!.maxAdversePrice,
       };
-      return { realizedPnl: realized, tradeIds };
+      return { realizedPnl: realized, tradeIds, maePct, mfePct };
     }
 
     this.position = {
       signedQty: newQty,
       entryPrice: fillPrice,
       entryTimestampMs: timestampMs,
+      maxFavorablePrice: fillPrice,
+      maxAdversePrice: fillPrice,
     };
-    return { realizedPnl: realized, tradeIds };
+    return { realizedPnl: realized, tradeIds, maePct, mfePct };
   }
 
   private checkAndForceLiquidation(

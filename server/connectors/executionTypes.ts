@@ -1,7 +1,7 @@
 export type Side = 'BUY' | 'SELL';
 export type PositionSide = 'LONG' | 'SHORT';
-export type OrderType = 'MARKET' | 'LIMIT' | 'STOP_MARKET' | 'TAKE_PROFIT_MARKET';
-export type TimeInForce = 'GTC' | 'IOC' | 'FOK';
+export type OrderType = 'MARKET' | 'LIMIT' | 'STOP_MARKET' | 'TAKE_PROFIT_MARKET' | 'STOP_LOSS' | 'TAKE_PROFIT';
+export type TimeInForce = 'GTC' | 'IOC' | 'FOK' | 'POST_ONLY';
 export type MarginType = 'ISOLATED' | 'CROSSED';
 
 export interface TestnetQuote {

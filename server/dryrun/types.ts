@@ -93,6 +93,8 @@ export interface DryRunOrderResult {
   realizedPnl: number;
   slippageBps?: number;
   marketImpactBps?: number;
+  maePct?: number;
+  mfePct?: number;
   reason: string | null;
   reasonCode?: DryRunReasonCode | null;
   clientOrderId?: string | null;

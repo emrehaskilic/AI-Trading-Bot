@@ -51,6 +51,18 @@ export class MarketImpactSimulator {
     };
   }
 
+  simulateImpact(side: DryRunSide, quantity: number, price: number): number {
+    if (!Number.isFinite(quantity) || !Number.isFinite(price) || price <= 0) {
+      return price;
+    }
+    const participation = Math.max(0, quantity);
+    const impactBps = clamp(this.config.impactFactorBps * Math.sqrt(participation), 0, this.config.maxSlippageBps);
+    const factor = side === 'BUY'
+      ? 1 + (impactBps / 10000)
+      : 1 - (impactBps / 10000);
+    return price * factor;
+  }
+
   adjustFill(input: MarketImpactAdjustmentInput): MarketImpactAdjustment {
     if (input.filledQty <= 0n || input.avgFillPrice <= 0n) {
       return {
