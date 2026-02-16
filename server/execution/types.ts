@@ -16,6 +16,8 @@ export interface ExecutionResult {
   ok: boolean;
   orderId?: string;
   error?: string;
+  errorCode?: string;
+  errorType?: 'TRANSIENT' | 'PERMANENT';
   executedQuantity?: string;
   executedPrice?: string;
   fee?: string;
@@ -23,6 +25,9 @@ export interface ExecutionResult {
   feeTier?: 'MAKER' | 'TAKER';
   requestedPrice?: string;
   filledPrice?: string;
+  requestTimestampMs?: number;
+  responseTimestampMs?: number;
+  latencyMs?: number;
 }
 
 export interface IExecutor {

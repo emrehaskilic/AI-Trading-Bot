@@ -18,4 +18,5 @@ export interface IPositionManager {
   closeTrade(orderId: string, closePrice: string, fees: string): void;
   getAccountBalance(): number;
   getInitialCapital(): number;
+  getCurrentLeverage?(): number;
 }

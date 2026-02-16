@@ -22,8 +22,8 @@ export interface DryRunSignalLog {
   vetoReason: string | null;
   candidate: {
     entryPrice: number;
-    tpPrice: number;
-    slPrice: number;
+    tpPrice?: number;
+    slPrice?: number;
   } | null;
   orderflow: DryRunOrderflowMetrics;
   boost?: {

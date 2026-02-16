@@ -8,6 +8,7 @@ function assert(condition: any, message: string): void {
 const stubMetrics: IMetricsCollector = {
   recordExecution: () => undefined,
   recordPnL: () => undefined,
+  recordExecutionLatency: () => undefined,
   getDailyPnL: () => -10,
   getInitialCapital: () => 100,
   getCurrentEquity: () => 90,
@@ -16,6 +17,8 @@ const stubMetrics: IMetricsCollector = {
   getWinRate: () => 0,
   getTotalTrades: () => 0,
   getAveragePnLPerTrade: () => 0,
+  getAverageExecutionLatency: () => 0,
+  getTotalFeesPaid: () => 0,
   getMaxDrawdown: () => 0,
   resetDailyMetrics: () => undefined,
 };

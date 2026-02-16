@@ -23,6 +23,8 @@ import * as OrderbookIntegrityMonitorTests from './OrderbookIntegrityMonitor.tes
 // StrategyEngine removed; NEW_STRATEGY_V1.1 tests below.
 import * as DryRunClockTests from './DryRunClock.test';
 import * as FreezeControllerTests from './FreezeController.test';
+import * as AutonomousMetricsPolicyTests from './AutonomousMetricsPolicy.test';
+import * as PositionSizerTests from './PositionSizer.test';
 
 export const testSuites: { name: string; fn: () => void }[] = [
     { name: 'TimeAndSales', fn: TimeAndSalesTests.runTests },
@@ -49,4 +51,6 @@ export const testSuites: { name: string; fn: () => void }[] = [
     { name: 'HardReversal', fn: HardReversalTests.runTests },
     { name: 'DryRunClock', fn: DryRunClockTests.runTests },
     { name: 'FreezeController', fn: FreezeControllerTests.runTests },
+    { name: 'AutonomousMetricsPolicy', fn: AutonomousMetricsPolicyTests.runTests },
+    { name: 'PositionSizer', fn: PositionSizerTests.runTests },
 ];

@@ -311,7 +311,7 @@ export class NewStrategyV11 {
 
     if (regime === 'EV') {
       const burstSide = input.trades.consecutiveBurst.side;
-      const burstAligned = burstSide && (desiredSide === 'LONG' ? burstSide === 'buy' : burstSide === 'sell');
+      const burstAligned = Boolean(burstSide && (desiredSide === 'LONG' ? burstSide === 'buy' : burstSide === 'sell'));
       const volHigh = volLevel > 0.8;
       const dfsGate = dfsP >= (volHigh ? 0.95 : 0.90);
       return burstAligned && dfsGate && Math.sign(dfs) === (desiredSide === 'LONG' ? 1 : -1);

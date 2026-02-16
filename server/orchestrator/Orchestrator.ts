@@ -79,6 +79,7 @@ export class Orchestrator {
   ) {
     this.capitalSettings.leverage = Math.min(this.connector.getPreferredLeverage(), config.maxLeverage);
     this.connector.setPreferredLeverage(this.capitalSettings.leverage);
+    const latencyAlertMs = Number(process.env.EXECUTION_LATENCY_ALERT_MS || 1200);
 
     this.executor = new DryRunExecutor(async (decision) => {
       return {
@@ -89,6 +90,16 @@ export class Orchestrator {
         fee: '0',
         feeTier: 'MAKER',
       };
+    }, undefined, {
+      onLatency: (latencyMs) => {
+        if (!this.alertService) return;
+        if (latencyMs < latencyAlertMs) return;
+        void this.alertService.send(
+          'EXECUTION_LATENCY_HIGH',
+          `execution_latency_ms=${Math.round(latencyMs)}`,
+          'HIGH'
+        );
+      },
     });
 
     this.logger = new OrchestratorLogger({

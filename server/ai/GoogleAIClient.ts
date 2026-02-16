@@ -23,7 +23,7 @@ export async function generateContent(config: GoogleAIConfig, prompt: string): P
   }
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-  const body = {
+  const bodyBase = {
     contents: [
       {
         role: 'user',
@@ -33,6 +33,13 @@ export async function generateContent(config: GoogleAIConfig, prompt: string): P
     generationConfig: {
       temperature: typeof config.temperature === 'number' ? config.temperature : 0,
       maxOutputTokens: typeof config.maxOutputTokens === 'number' ? config.maxOutputTokens : 256,
+    },
+  };
+
+  const bodyWithSchema = {
+    ...bodyBase,
+    generationConfig: {
+      ...bodyBase.generationConfig,
       responseMimeType: 'application/json',
       responseSchema: {
         type: 'OBJECT',
@@ -48,18 +55,36 @@ export async function generateContent(config: GoogleAIConfig, prompt: string): P
     },
   };
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  const execute = async (body: any): Promise<{ payload: any; status: number }> => {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`ai_http_${res.status}:${text.slice(0, 300)}`);
+    }
+    const payload = await res.json();
+    return { payload, status: res.status };
+  };
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`ai_http_${res.status}:${text.slice(0, 200)}`);
+  let payload: any;
+  try {
+    payload = (await execute(bodyWithSchema)).payload;
+  } catch (err: any) {
+    const message = String(err?.message || '');
+    const unsupportedSchema =
+      message.includes('responseSchema')
+      || message.includes('responseMimeType')
+      || message.includes('Invalid JSON payload')
+      || message.includes('GenerateContentRequest.generation_config');
+    if (!unsupportedSchema) {
+      throw err;
+    }
+    payload = (await execute(bodyBase)).payload;
   }
 
-  const payload: any = await res.json();
   const candidate = Array.isArray(payload?.candidates) ? payload.candidates[0] : null;
   const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
   const text = parts

@@ -1,87 +1,9 @@
 import { DecisionLog } from '../telemetry/DecisionLog';
-import { StrategyAction, StrategyActionType, StrategyDecision, StrategyDecisionLog, StrategyRegime, StrategySide } from '../types/strategy';
+import { StrategyAction, StrategyActionType, StrategyDecision, StrategyDecisionLog, StrategySide } from '../types/strategy';
 import { DryRunSessionService } from '../dryrun/DryRunSessionService';
 import { generateContent } from './GoogleAIClient';
-
-type AIDryRunConfig = {
-  apiKey: string;
-  model: string;
-  decisionIntervalMs: number;
-  temperature: number;
-  maxOutputTokens: number;
-};
-
-type AIDryRunStatus = {
-  active: boolean;
-  model: string | null;
-  decisionIntervalMs: number;
-  temperature: number;
-  maxOutputTokens: number;
-  apiKeySet: boolean;
-  lastError: string | null;
-  symbols: string[];
-};
-
-type AIMetricsSnapshot = {
-  symbol: string;
-  timestampMs: number;
-  decision: {
-    regime: StrategyRegime;
-    dfs: number;
-    dfsPercentile: number;
-    volLevel: number;
-    gatePassed: boolean;
-    thresholds: {
-      longEntry: number;
-      longBreak: number;
-      shortEntry: number;
-      shortBreak: number;
-    };
-  };
-  market: {
-    price: number;
-    vwap: number;
-    spreadPct: number | null;
-    delta1s: number;
-    delta5s: number;
-    deltaZ: number;
-    cvdSlope: number;
-    obiWeighted: number;
-    obiDeep: number;
-    obiDivergence: number;
-  };
-  trades: {
-    printsPerSecond: number;
-    tradeCount: number;
-    aggressiveBuyVolume: number;
-    aggressiveSellVolume: number;
-    burstCount: number;
-    burstSide: 'buy' | 'sell' | null;
-  };
-  openInterest: {
-    oiChangePct: number | null;
-  };
-  absorption: {
-    value: number;
-    side: 'buy' | 'sell' | null;
-  };
-  volatility: number;
-  position: {
-    side: StrategySide;
-    qty: number;
-    entryPrice: number;
-    unrealizedPnlPct: number;
-    addsUsed: number;
-  } | null;
-};
-
-type AIAction = {
-  action: 'HOLD' | 'ENTRY' | 'EXIT' | 'REDUCE' | 'ADD';
-  side?: 'LONG' | 'SHORT';
-  sizeMultiplier?: number;
-  reducePct?: number;
-  reason?: string;
-};
+import { AutonomousMetricsPolicy, AutonomousPolicyDecision } from './AutonomousMetricsPolicy';
+import { AIAction, AIDryRunConfig, AIDryRunStatus, AIMetricsSnapshot } from './types';
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
@@ -111,6 +33,8 @@ export class AIDryRunController {
   private symbols = new Set<string>();
   private readonly lastDecisionTs = new Map<string, number>();
   private readonly pending = new Set<string>();
+  private readonly holdStreak = new Map<string, number>();
+  private readonly policy = new AutonomousMetricsPolicy();
   private lastError: string | null = null;
 
   constructor(
@@ -119,25 +43,39 @@ export class AIDryRunController {
     private readonly log?: (event: string, data?: Record<string, unknown>) => void
   ) { }
 
-  start(input: { symbols: string[]; apiKey: string; model: string; decisionIntervalMs?: number; temperature?: number; maxOutputTokens?: number }): void {
+  start(input: {
+    symbols: string[];
+    apiKey?: string;
+    model?: string;
+    decisionIntervalMs?: number;
+    temperature?: number;
+    maxOutputTokens?: number;
+    localOnly?: boolean;
+  }): void {
     const symbols = input.symbols.map((s) => s.toUpperCase()).filter(Boolean);
+    const apiKey = String(input.apiKey || '').trim();
+    const model = String(input.model || '').trim();
+    const localOnly = Boolean(input.localOnly) || !apiKey || !model;
     this.symbols = new Set(symbols);
     this.config = {
-      apiKey: input.apiKey,
-      model: input.model,
+      apiKey,
+      model,
       decisionIntervalMs: Math.max(500, Number(input.decisionIntervalMs ?? 2000)),
       temperature: Number.isFinite(input.temperature as number) ? Number(input.temperature) : 0.3,
       maxOutputTokens: Math.max(64, Number(input.maxOutputTokens ?? 256)),
+      localOnly,
     };
     this.active = true;
     this.lastError = null;
-    this.log?.('AI_DRY_RUN_START', { symbols, model: this.config.model });
+    this.holdStreak.clear();
+    this.log?.('AI_DRY_RUN_START', { symbols, model: this.config.model || null, localOnly });
   }
 
   stop(): void {
     this.active = false;
     this.symbols.clear();
     this.pending.clear();
+    this.holdStreak.clear();
     this.log?.('AI_DRY_RUN_STOP', {});
   }
 
@@ -152,11 +90,12 @@ export class AIDryRunController {
   getStatus(): AIDryRunStatus {
     return {
       active: this.isActive(),
-      model: this.config?.model ?? null,
+      model: this.config?.model ? this.config.model : null,
       decisionIntervalMs: this.config?.decisionIntervalMs ?? 0,
       temperature: this.config?.temperature ?? 0,
       maxOutputTokens: this.config?.maxOutputTokens ?? 0,
       apiKeySet: Boolean(this.config?.apiKey),
+      localOnly: Boolean(this.config?.localOnly),
       lastError: this.lastError,
       symbols: [...this.symbols],
     };
@@ -175,10 +114,27 @@ export class AIDryRunController {
 
     this.pending.add(snapshot.symbol);
     try {
+      const policyDecision = this.policy.decide(snapshot);
+      if (this.config.localOnly || !this.config.apiKey || !this.config.model) {
+        this.applyResolvedAction(snapshot, policyDecision.action, {
+          source: 'policy_local_only',
+          policy: policyDecision,
+        });
+        this.lastDecisionTs.set(snapshot.symbol, nowMs);
+        this.lastError = null;
+        return;
+      }
+
       const prompt = this.buildPrompt(snapshot);
       this.log?.('AI_CALLING_GEMINI', { symbol: snapshot.symbol, promptLen: prompt.length });
+      const aiConfig = {
+        apiKey: this.config.apiKey,
+        model: this.config.model,
+        temperature: this.config.temperature,
+        maxOutputTokens: this.config.maxOutputTokens,
+      };
 
-      const response = await generateContent(this.config, prompt);
+      const response = await generateContent(aiConfig, prompt);
       this.log?.('AI_GEMINI_RESPONSE', {
         symbol: snapshot.symbol,
         text: response.text?.slice(0, 300) || null,
@@ -195,7 +151,7 @@ export class AIDryRunController {
           error: this.lastError,
           meta: response.meta || null,
         });
-        this.submitFallbackHold(snapshot, 'empty_response');
+        this.submitFallbackPolicy(snapshot, 'empty_response', policyDecision);
         return;
       }
 
@@ -214,32 +170,33 @@ export class AIDryRunController {
           error: this.lastError,
           text: response.text.slice(0, 500),
         });
-        this.submitFallbackHold(snapshot, 'parse_failed');
+        this.submitFallbackPolicy(snapshot, 'parse_failed', policyDecision);
         return;
       }
 
       if (action.action === 'ENTRY' && !action.side) {
         this.lastError = 'ai_invalid_side';
         this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError, action });
-        this.submitFallbackHold(snapshot, 'invalid_side');
+        this.submitFallbackPolicy(snapshot, 'invalid_side', policyDecision);
         return;
       }
 
-      const decision = this.buildDecision(snapshot, action);
-      if (decision.actions.length > 0 || decision.reasons.includes('NOOP')) {
-        if (decision.actions.length > 0) {
-          this.log?.('AI_SUBMITTING_DECISION', { symbol: snapshot.symbol, actions: decision.actions.map((a) => ({ type: a.type, side: (a as any).side, reason: a.reason })) });
-        }
-        this.dryRunSession.submitStrategyDecision(snapshot.symbol, decision, snapshot.timestampMs);
-      }
-
+      const resolved = this.applyPolicyGuardrails(snapshot, action, policyDecision);
+      this.applyResolvedAction(snapshot, resolved.action, {
+        source: resolved.source,
+        policy: policyDecision,
+      });
       this.lastDecisionTs.set(snapshot.symbol, nowMs);
-      this.recordDecisionLog(snapshot, decision, action);
       this.lastError = null;
     } catch (error: any) {
       this.lastError = error?.message || 'ai_decision_failed';
       this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError });
-      this.submitFallbackHold(snapshot, 'runtime_error', { error: this.lastError });
+      this.submitFallbackPolicy(
+        snapshot,
+        'runtime_error',
+        this.policy.decide(snapshot),
+        { error: this.lastError }
+      );
     } finally {
       this.pending.delete(snapshot.symbol);
     }
@@ -281,6 +238,7 @@ export class AIDryRunController {
       '- sizeMultiplier range: 0.1 to 2.0.',
       '- reducePct range: 0.1 to 1.0.',
       '- If signal quality is weak, choose HOLD.',
+      '- Avoid repeated HOLD when flat and directional evidence is strong.',
       '',
       'Available metrics:',
       '- market.price, vwap: Price level',
@@ -457,10 +415,15 @@ export class AIDryRunController {
   }
 
   private async retryParseAction(snapshot: AIMetricsSnapshot, rawText: string): Promise<AIAction | null> {
-    if (!this.config) return null;
+    if (!this.config || !this.config.apiKey || !this.config.model) return null;
     try {
       const retryPrompt = this.buildRepairPrompt(rawText);
-      const retryResponse = await generateContent(this.config, retryPrompt);
+      const retryResponse = await generateContent({
+        apiKey: this.config.apiKey,
+        model: this.config.model,
+        temperature: this.config.temperature,
+        maxOutputTokens: this.config.maxOutputTokens,
+      }, retryPrompt);
       this.log?.('AI_GEMINI_RESPONSE', {
         symbol: snapshot.symbol,
         text: retryResponse.text?.slice(0, 300) || null,
@@ -475,38 +438,108 @@ export class AIDryRunController {
     }
   }
 
-  private submitFallbackHold(
+  private submitFallbackPolicy(
     snapshot: AIMetricsSnapshot,
     fallback: 'empty_response' | 'parse_failed' | 'invalid_side' | 'runtime_error',
+    policy: AutonomousPolicyDecision,
     details?: Record<string, unknown>
   ): void {
-    const decision = this.buildDecision(snapshot, { action: 'HOLD', reason: `fallback_${fallback}` });
-    decision.actions = decision.actions.map((action) => {
-      if (action.type !== StrategyActionType.NOOP) return action;
-      return {
-        ...action,
-        metadata: {
-          ...(action.metadata || {}),
-          ai: true,
-          fallback,
-          ...(details || {}),
-        },
-      };
+    const action = policy.action;
+    const source = action.action === 'HOLD' ? 'policy_fallback_hold' : 'policy_fallback_trade';
+    this.applyResolvedAction(snapshot, action, {
+      source,
+      fallback,
+      policy,
+      extraMeta: details,
     });
-    decision.log.actions = decision.actions;
-    this.dryRunSession.submitStrategyDecision(snapshot.symbol, decision, snapshot.timestampMs);
     this.lastDecisionTs.set(snapshot.symbol, snapshot.timestampMs);
-    this.recordDecisionLog(snapshot, decision, { action: 'HOLD', reason: `fallback_${fallback}` });
-    this.log?.('AI_FALLBACK_HOLD', { symbol: snapshot.symbol, fallback });
+    this.log?.('AI_FALLBACK_POLICY', {
+      symbol: snapshot.symbol,
+      fallback,
+      action: action.action,
+      side: action.side || null,
+      confidence: policy.confidence,
+    });
   }
 
-  private buildDecision(snapshot: AIMetricsSnapshot, aiAction: AIAction): StrategyDecision {
+  private applyPolicyGuardrails(
+    snapshot: AIMetricsSnapshot,
+    aiAction: AIAction,
+    policy: AutonomousPolicyDecision
+  ): { action: AIAction; source: string } {
+    if (!snapshot.position && (aiAction.action === 'ADD' || aiAction.action === 'REDUCE' || aiAction.action === 'EXIT')) {
+      return { action: policy.action, source: 'policy_flat_state_override' };
+    }
+
+    if (aiAction.action === 'HOLD') {
+      const nextHoldStreak = (this.holdStreak.get(snapshot.symbol) || 0) + 1;
+      const allowOverride = policy.action.action !== 'HOLD'
+        && policy.confidence >= 0.78
+        && (nextHoldStreak >= 2 || !snapshot.position);
+      if (allowOverride) {
+        return { action: policy.action, source: 'policy_override_ai_hold' };
+      }
+      return { action: aiAction, source: 'ai' };
+    }
+    return { action: aiAction, source: 'ai' };
+  }
+
+  private applyResolvedAction(
+    snapshot: AIMetricsSnapshot,
+    action: AIAction,
+    context: {
+      source: string;
+      fallback?: string;
+      policy?: AutonomousPolicyDecision;
+      extraMeta?: Record<string, unknown>;
+    }
+  ): void {
+    if (action.action === 'HOLD') {
+      this.holdStreak.set(snapshot.symbol, (this.holdStreak.get(snapshot.symbol) || 0) + 1);
+    } else {
+      this.holdStreak.set(snapshot.symbol, 0);
+    }
+
+    const decision = this.buildDecision(snapshot, action, {
+      source: context.source,
+      fallback: context.fallback,
+      policyConfidence: context.policy?.confidence,
+      policyDiagnostics: context.policy?.diagnostics,
+      ...(context.extraMeta || {}),
+    });
+    if (decision.actions.length > 0 || decision.reasons.includes('NOOP')) {
+      if (decision.actions.length > 0) {
+        this.log?.('AI_SUBMITTING_DECISION', {
+          symbol: snapshot.symbol,
+          source: context.source,
+          actions: decision.actions.map((a) => ({ type: a.type, side: (a as any).side, reason: a.reason })),
+          policyConfidence: context.policy?.confidence ?? null,
+        });
+      }
+      this.dryRunSession.submitStrategyDecision(snapshot.symbol, decision, snapshot.timestampMs);
+    }
+    this.recordDecisionLog(snapshot, decision, action);
+  }
+
+  private buildDecision(
+    snapshot: AIMetricsSnapshot,
+    aiAction: AIAction,
+    contextMeta?: Record<string, unknown>
+  ): StrategyDecision {
     const actions: StrategyAction[] = [];
     const nowMs = snapshot.timestampMs;
     const regime = snapshot.decision.regime;
 
     if (aiAction.action === 'HOLD') {
-      actions.push({ type: StrategyActionType.NOOP, reason: 'NOOP', metadata: { ai: true, note: aiAction.reason || null } });
+      actions.push({
+        type: StrategyActionType.NOOP,
+        reason: 'NOOP',
+        metadata: {
+          ai: true,
+          note: aiAction.reason || null,
+          ...(contextMeta || {}),
+        },
+      });
     }
 
     if (aiAction.action === 'ENTRY' && aiAction.side) {
@@ -516,7 +549,7 @@ export class AIDryRunController {
         reason: 'ENTRY_TR',
         expectedPrice: snapshot.market.price,
         sizeMultiplier: clamp(Number(aiAction.sizeMultiplier ?? 1), 0.1, 2),
-        metadata: { ai: true, note: aiAction.reason || null },
+        metadata: { ai: true, note: aiAction.reason || null, ...(contextMeta || {}) },
       });
     }
 
@@ -527,7 +560,7 @@ export class AIDryRunController {
         reason: 'AI_ADD',
         expectedPrice: snapshot.market.price,
         sizeMultiplier: clamp(Number(aiAction.sizeMultiplier ?? 0.5), 0.1, 2),
-        metadata: { ai: true, note: aiAction.reason || null },
+        metadata: { ai: true, note: aiAction.reason || null, ...(contextMeta || {}) },
       });
     }
 
@@ -536,7 +569,7 @@ export class AIDryRunController {
         type: StrategyActionType.REDUCE,
         reason: 'REDUCE_SOFT',
         reducePct: clamp(Number(aiAction.reducePct ?? 0.5), 0.1, 1),
-        metadata: { ai: true, note: aiAction.reason || null },
+        metadata: { ai: true, note: aiAction.reason || null, ...(contextMeta || {}) },
       });
     }
 
@@ -544,7 +577,7 @@ export class AIDryRunController {
       actions.push({
         type: StrategyActionType.EXIT,
         reason: 'EXIT_HARD',
-        metadata: { ai: true, note: aiAction.reason || null },
+        metadata: { ai: true, note: aiAction.reason || null, ...(contextMeta || {}) },
       });
     }
 
@@ -565,6 +598,7 @@ export class AIDryRunController {
       actions,
       stats: {
         aiDecision: 1,
+        policyConfidence: Number(contextMeta?.policyConfidence ?? 0) || null,
       },
     };
 

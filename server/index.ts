@@ -66,6 +66,8 @@ import { PortfolioMonitor } from './risk/PortfolioMonitor';
 import { LatencyTracker } from './metrics/LatencyTracker';
 import { MonteCarloSimulator, calculateRiskOfRuin, generateRandomTrades } from './backtesting/MonteCarloSimulator';
 import { WalkForwardAnalyzer } from './backtesting/WalkForwardAnalyzer';
+import { MarketDataValidator } from './connectors/MarketDataValidator';
+import { MarketDataMonitor } from './connectors/MarketDataMonitor';
 
 // =============================================================================
 // Configuration
@@ -250,6 +252,11 @@ const marketArchive = new MarketDataArchive();
 const signalReplay = new SignalReplay(marketArchive);
 const portfolioMonitor = new PortfolioMonitor();
 const latencyTracker = new LatencyTracker();
+const marketDataValidator = new MarketDataValidator(alertService);
+const marketDataMonitor = new MarketDataMonitor(alertService, {
+    maxSilenceMs: Number(process.env.MARKET_DATA_MAX_SILENCE_MS || 10_000),
+});
+marketDataMonitor.startMonitoring();
 orchestrator.setKillSwitch(KILL_SWITCH);
 if (typeof process.env.EXECUTION_MODE !== 'undefined') {
     log('CONFIG_WARNING', { message: 'EXECUTION_MODE is deprecated and ignored' });
@@ -920,6 +927,7 @@ async function processSymbolEvent(s: string, d: any) {
         meta.depthMsgCount10s++;
         meta.lastDepthMsgTs = now;
         healthController.setLastDataReceivedAt(now);
+        marketDataMonitor.recordDataArrival(s, Number(d.E || d.T || now));
 
         ensureMonitors(s);
         enqueueDepthUpdate(s, {
@@ -934,9 +942,23 @@ async function processSymbolEvent(s: string, d: any) {
         ensureMonitors(s);
         meta.tradeMsgCount++;
         healthController.setLastDataReceivedAt(now);
-        const p = parseFloat(d.p);
-        const q = parseFloat(d.q);
-        const t = d.T;
+        const rawPrice = parseFloat(d.p);
+        const rawQty = parseFloat(d.q);
+        const rawTs = Number(d.T || now);
+        const validatedTrade = marketDataValidator.validate({
+            symbol: s,
+            price: rawPrice,
+            quantity: rawQty,
+            timestamp: rawTs,
+        });
+        if (!validatedTrade) {
+            return;
+        }
+        marketDataMonitor.recordDataArrival(s, validatedTrade.timestamp);
+
+        const p = validatedTrade.price;
+        const q = validatedTrade.quantity;
+        const t = validatedTrade.timestamp;
         const side = d.m ? 'sell' : 'buy';
         latencyTracker.record('trade_ingest_ms', Math.max(0, now - Number(t || now)));
         if (p > 0) {
@@ -1585,10 +1607,7 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
 
         const apiKey = String(req.body?.apiKey || '').trim();
         const model = String(req.body?.model || '').trim();
-        if (!apiKey || !model) {
-            res.status(400).json({ ok: false, error: 'ai_config_required' });
-            return;
-        }
+        const localOnly = Boolean(req.body?.localOnly) || !apiKey || !model;
 
         const info = await fetchExchangeInfo();
         const symbols = Array.isArray(info?.symbols) ? info.symbols : [];
@@ -1625,6 +1644,7 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
             decisionIntervalMs: Number(req.body?.decisionIntervalMs ?? 1000),
             temperature: Number(req.body?.temperature ?? 0),
             maxOutputTokens: Number(req.body?.maxOutputTokens ?? 256),
+            localOnly,
         });
 
         updateDryRunHealthFlag();
@@ -2226,6 +2246,7 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 
 function shutdown(): void {
     wsManager.shutdown();
+    marketDataMonitor.stopMonitoring();
     if (ws) {
         ws.close();
         ws = null;
