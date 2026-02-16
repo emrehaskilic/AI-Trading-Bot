@@ -84,6 +84,13 @@ type AIAction = {
 };
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+const normalizeSide = (raw?: string | null): StrategySide | null => {
+  const value = String(raw || '').trim().toUpperCase();
+  if (!value) return null;
+  if (value === 'LONG' || value === 'BUY') return 'LONG';
+  if (value === 'SHORT' || value === 'SELL') return 'SHORT';
+  return null;
+};
 
 export class AIDryRunController {
   private active = false;
@@ -163,10 +170,23 @@ export class AIDryRunController {
       this.log?.('AI_CALLING_GEMINI', { symbol: snapshot.symbol, promptLen: prompt.length });
       const response = await generateContent(this.config, prompt);
       this.log?.('AI_GEMINI_RESPONSE', { symbol: snapshot.symbol, text: response.text?.slice(0, 200) || null });
-      if (!response.text) return;
+      if (!response.text) {
+        this.lastError = 'ai_empty_response';
+        this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError });
+        return;
+      }
       const action = this.parseAction(response.text);
       this.log?.('AI_PARSED_ACTION', { symbol: snapshot.symbol, action });
-      if (!action) return;
+      if (!action) {
+        this.lastError = 'ai_parse_failed';
+        this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError });
+        return;
+      }
+      if ((action.action === 'ENTRY' || action.action === 'ADD') && !action.side) {
+        this.lastError = 'ai_invalid_side';
+        this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError });
+        return;
+      }
 
       const decision = this.buildDecision(snapshot, action);
       if (decision.actions.length > 0) {
@@ -176,6 +196,7 @@ export class AIDryRunController {
 
       this.lastDecisionTs.set(snapshot.symbol, nowMs);
       this.recordDecisionLog(snapshot, decision, action);
+      this.lastError = null;
     } catch (error: any) {
       this.lastError = error?.message || 'ai_decision_failed';
       this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError });
@@ -249,11 +270,23 @@ export class AIDryRunController {
     try {
       const parsed = JSON.parse(jsonText) as AIAction;
       if (!parsed || typeof parsed.action !== 'string') return null;
-      const action = parsed.action.toUpperCase();
-      if (!['HOLD', 'ENTRY', 'EXIT', 'REDUCE', 'ADD'].includes(action)) return null;
+      const rawAction = parsed.action.trim().toUpperCase();
+      let action: AIAction['action'] | null = null;
+      let side = normalizeSide(parsed.side);
+      if (['HOLD', 'ENTRY', 'EXIT', 'REDUCE', 'ADD'].includes(rawAction)) {
+        action = rawAction as AIAction['action'];
+      } else if (rawAction === 'BUY' || rawAction === 'LONG') {
+        action = 'ENTRY';
+        side = side ?? 'LONG';
+      } else if (rawAction === 'SELL' || rawAction === 'SHORT') {
+        action = 'ENTRY';
+        side = side ?? 'SHORT';
+      } else {
+        return null;
+      }
       return {
-        action: action as AIAction['action'],
-        side: parsed.side,
+        action,
+        side: side ?? undefined,
         sizeMultiplier: parsed.sizeMultiplier,
         reducePct: parsed.reducePct,
         reason: parsed.reason,
