@@ -112,6 +112,7 @@ const MIN_RESYNC_INTERVAL_MS = 15000;
 const GRACE_PERIOD_MS = 5000;
 const CLIENT_HEARTBEAT_INTERVAL_MS = Number(process.env.CLIENT_HEARTBEAT_INTERVAL_MS || 15000);
 const CLIENT_STALE_CONNECTION_MS = Number(process.env.CLIENT_STALE_CONNECTION_MS || 60000);
+const WS_MAX_SUBSCRIPTIONS = Number(process.env.WS_MAX_SUBSCRIPTIONS || 500);
 const BACKFILL_RECORDING_ENABLED = parseEnvFlag(process.env.BACKFILL_RECORDING_ENABLED);
 const BACKFILL_SNAPSHOT_INTERVAL_MS = Number(process.env.BACKFILL_SNAPSHOT_INTERVAL_MS || 2000);
 
@@ -452,7 +453,7 @@ async function fetchExchangeInfo() {
         if (!res.ok) throw new Error(`Status ${res.status}`);
         const data: any = await res.json();
         const symbols = data.symbols
-            .filter((s: any) => s.status === 'TRADING' && s.contractType === 'PERPETUAL' && s.quoteAsset === 'USDT')
+            .filter((s: any) => s.status === 'TRADING' && s.contractType === 'PERPETUAL')
             .map((s: any) => s.symbol).sort();
         exchangeInfoCache = { data: { symbols }, timestamp: Date.now() };
         return exchangeInfoCache.data;
@@ -570,6 +571,7 @@ const wsManager = new WebSocketManager({
     },
     heartbeatIntervalMs: CLIENT_HEARTBEAT_INTERVAL_MS,
     staleConnectionMs: CLIENT_STALE_CONNECTION_MS,
+    maxSubscriptionsPerClient: WS_MAX_SUBSCRIPTIONS,
 });
 let autoScaleForcedSingle = false;
 const healthController = new HealthController(wsManager, {
@@ -592,7 +594,9 @@ function buildDepthStream(symbolLower: string): string {
 function updateStreams() {
     const forcedSorted = [...dryRunForcedSymbols].sort();
     const requiredSorted = wsManager.getRequiredSymbols();
-    const limitedSymbols = requiredSorted.slice(0, Math.max(AUTO_SCALE_MIN_SYMBOLS, symbolConcurrencyLimit));
+    const baseLimit = Math.max(AUTO_SCALE_MIN_SYMBOLS, symbolConcurrencyLimit);
+    const effectiveLimit = Math.max(baseLimit, requiredSorted.length, forcedSorted.length);
+    const limitedSymbols = requiredSorted.slice(0, effectiveLimit);
     const effective = new Set<string>([...forcedSorted, ...limitedSymbols]);
 
     // Debug Log
@@ -602,7 +606,8 @@ function updateStreams() {
             requestedCount: requiredSorted.length,
             requested: requiredSorted,
             activeLimit: symbolConcurrencyLimit,
-            limitCalculated: Math.max(AUTO_SCALE_MIN_SYMBOLS, symbolConcurrencyLimit),
+            limitCalculated: effectiveLimit,
+            baseLimit,
             kept: limitedSymbols,
             dropped: requiredSorted.slice(limitedSymbols.length),
         });
@@ -612,6 +617,7 @@ function updateStreams() {
         log('AUTO_SCALE_APPLIED', {
             requested: requiredSorted.length,
             activeLimit: symbolConcurrencyLimit,
+            limitCalculated: effectiveLimit,
             kept: limitedSymbols,
             dropped: requiredSorted.slice(limitedSymbols.length),
         });

@@ -235,7 +235,7 @@ export class ExecutionConnector {
       if (!res.ok) throw new Error(`Status ${res.status}`);
       const data: any = await res.json();
       return data.symbols
-        .filter((s: any) => s.status === 'TRADING' && s.contractType === 'PERPETUAL' && s.quoteAsset === 'USDT')
+        .filter((s: any) => s.status === 'TRADING' && s.contractType === 'PERPETUAL')
         .map((s: any) => s.symbol)
         .sort();
     } catch (e: any) {
@@ -738,7 +738,7 @@ export class ExecutionConnector {
     const body: any = await response.json();
     const symbols = Array.isArray(body.symbols) ? body.symbols : [];
     return symbols
-      .filter((s: any) => s.status === 'TRADING' && s.contractType === 'PERPETUAL' && s.quoteAsset === 'USDT')
+      .filter((s: any) => s.status === 'TRADING' && s.contractType === 'PERPETUAL')
       .map((s: any) => String(s.symbol))
       .sort();
   }
