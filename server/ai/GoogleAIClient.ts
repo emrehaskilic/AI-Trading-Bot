@@ -50,19 +50,26 @@ export async function generateContent(config: GoogleAIConfig, prompt: string): P
 
   const payload: any = await res.json();
   const candidate = Array.isArray(payload?.candidates) ? payload.candidates[0] : null;
+  const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+  const text = parts
+    .map((part: any) => (typeof part?.text === 'string' ? part.text : ''))
+    .filter(Boolean)
+    .join('\n')
+    .trim();
 
-  let text = '';
-  if (candidate?.content?.parts && Array.isArray(candidate.content.parts)) {
-    text = candidate.content.parts.map((p: any) => p.text || '').join('');
-  }
+  const blockReason = payload?.promptFeedback?.blockReason
+    ? String(payload.promptFeedback.blockReason)
+    : undefined;
+  const finishReason = candidate?.finishReason ? String(candidate.finishReason) : null;
+  const safety = payload?.promptFeedback?.safetyRatings ?? candidate?.safetyRatings ?? null;
 
   return {
     text: text || null,
     raw: payload,
     meta: {
-      blockReason: payload.promptFeedback?.blockReason,
-      finishReason: candidate?.finishReason || null,
-      safety: candidate?.safetyRatings,
+      blockReason,
+      finishReason,
+      safety,
     },
   };
 }
