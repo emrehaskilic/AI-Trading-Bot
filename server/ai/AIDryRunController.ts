@@ -27,6 +27,10 @@ const DEFAULT_MAX_DECISION_INTERVAL_MS = 2_500;
 const DEFAULT_MIN_DECISION_INTERVAL_MS = 500;
 const DEFAULT_ADD_MARGIN_USAGE_CAP = clamp(Number(process.env.AI_ADD_MARGIN_USAGE_CAP || 0.85), 0.3, 0.98);
 const DEFAULT_ADD_MIN_UPNL_PCT = clamp(Number(process.env.AI_ADD_MIN_UPNL_PCT || 0.0015), 0, 0.05);
+const DEFAULT_FALLBACK_MODELS = String(process.env.AI_FALLBACK_MODELS || 'gemini-2.5-flash-lite,gemini-2.0-flash')
+  .split(',')
+  .map((m) => m.trim())
+  .filter(Boolean);
 const PLAN_VERSION = 1 as const;
 
 const normalizeSide = (raw?: string | null): StrategySide | null => {
@@ -129,7 +133,7 @@ export class AIDryRunController {
       apiKey,
       model,
       decisionIntervalMs: clamp(Number(input.decisionIntervalMs ?? 1000), DEFAULT_MIN_DECISION_INTERVAL_MS, DEFAULT_MAX_DECISION_INTERVAL_MS),
-      temperature: Number.isFinite(input.temperature as number) ? Number(input.temperature) : 0.1,
+      temperature: Number.isFinite(input.temperature as number) ? Number(input.temperature) : 0,
       maxOutputTokens: Math.max(128, Number(input.maxOutputTokens ?? 512)),
       localOnly,
       minHoldMs: DEFAULT_MIN_HOLD_MS,
@@ -227,22 +231,11 @@ export class AIDryRunController {
         proposedPlan = this.buildSafeHoldPlan(promptNonce, 'LOCAL_ONLY');
       } else {
         const prompt = this.buildPrompt(enrichedSnapshot, promptNonce);
-        this.log?.('AI_CALLING_GEMINI', { symbol: snapshot.symbol, promptLen: prompt.length, promptNonce });
-        const response = await generateContent({
-          apiKey: this.config.apiKey,
-          model: this.config.model,
-          temperature: this.config.temperature,
-          maxOutputTokens: this.config.maxOutputTokens,
-          responseSchema: this.buildResponseSchema(),
-        }, prompt);
-
-        let plan = this.parsePlan(response.text, promptNonce);
-        if (!plan && response.text) {
-          plan = await this.retryParsePlan(promptNonce, response.text);
-        }
+        const resolved = await this.resolvePlanWithFallback(prompt, promptNonce, snapshot.symbol);
+        const plan = resolved.plan;
         if (!plan) {
           this.telemetry.invalidLLMResponses += 1;
-          this.lastError = 'ai_invalid_or_unparseable_response';
+          this.lastError = resolved.error || 'ai_invalid_or_unparseable_response';
           proposedPlan = this.buildSafeHoldPlan(promptNonce, 'INVALID_AI_RESPONSE');
         } else {
           proposedPlan = plan;
@@ -310,6 +303,93 @@ export class AIDryRunController {
     }
   }
 
+  private async resolvePlanWithFallback(
+    prompt: string,
+    promptNonce: string,
+    symbol: string
+  ): Promise<{ plan: AIDecisionPlan | null; error: string | null }> {
+    if (!this.config || !this.config.apiKey || !this.config.model) {
+      return { plan: null, error: 'ai_config_missing' };
+    }
+
+    const modelSequence = this.buildModelSequence(this.config.model);
+    let lastError: string | null = null;
+
+    for (const model of modelSequence) {
+      try {
+        this.log?.('AI_CALLING_GEMINI', { symbol, promptLen: prompt.length, promptNonce, model });
+        const response = await generateContent({
+          apiKey: this.config.apiKey,
+          model,
+          temperature: this.config.temperature,
+          maxOutputTokens: this.config.maxOutputTokens,
+          responseSchema: this.buildResponseSchema(),
+        }, prompt);
+        this.log?.('AI_GEMINI_RESPONSE', {
+          symbol,
+          model,
+          promptNonce,
+          finishReason: response.meta?.finishReason || null,
+          blockReason: response.meta?.blockReason || null,
+          hasText: Boolean(response.text),
+          textLen: response.text ? response.text.length : 0,
+        });
+
+        let plan = this.parsePlan(response.text, promptNonce);
+        if (!plan && response.text) {
+          plan = await this.retryParsePlan(promptNonce, response.text, model);
+        }
+        if (plan) {
+          return { plan, error: null };
+        }
+
+        lastError = 'ai_invalid_or_unparseable_response';
+        this.log?.('AI_PARSE_FAILED', { symbol, model, promptNonce });
+      } catch (error: any) {
+        const message = String(error?.message || 'ai_decision_failed');
+        lastError = message;
+        this.log?.('AI_MODEL_CALL_FAILED', { symbol, model, promptNonce, error: message });
+        if (!this.shouldTryNextModel(message)) {
+          break;
+        }
+      }
+    }
+
+    return { plan: null, error: lastError || 'ai_invalid_or_unparseable_response' };
+  }
+
+  private buildModelSequence(primaryModel: string): string[] {
+    const normalizedPrimary = String(primaryModel || '').trim();
+    const sequence: string[] = [];
+    if (normalizedPrimary) {
+      sequence.push(normalizedPrimary);
+    }
+    for (const fallback of DEFAULT_FALLBACK_MODELS) {
+      if (!fallback) continue;
+      if (!sequence.some((item) => item.toLowerCase() === fallback.toLowerCase())) {
+        sequence.push(fallback);
+      }
+    }
+    return sequence;
+  }
+
+  private shouldTryNextModel(errorMessage: string): boolean {
+    const msg = String(errorMessage || '').toLowerCase();
+    if (!msg) return true;
+    return (
+      msg.includes('ai_http_429')
+      || msg.includes('ai_http_500')
+      || msg.includes('ai_http_502')
+      || msg.includes('ai_http_503')
+      || msg.includes('ai_http_504')
+      || msg.includes('ai_http_404')
+      || msg.includes('not found')
+      || msg.includes('unavailable')
+      || msg.includes('resource exhausted')
+      || msg.includes('deadline exceeded')
+    );
+  }
+
   private buildPrompt(snapshot: AIMetricsSnapshot, nonce: string): string {
     const payload = {
       nonce,
@@ -342,6 +422,8 @@ export class AIDryRunController {
       '- maxAdds must stay in [0, 5].',
       '- reducePct is null or in [0.1, 1.0].',
       '- explanationTags max length is 5.',
+      '- Keep numbers short (max 4 decimal places).',
+      '- If uncertain, return HOLD.',
       '',
       'You should manage full lifecycle: entry, add, reduce, exit.',
       'Prefer add-on only when winner conditions and trend integrity hold.',
@@ -357,9 +439,10 @@ export class AIDryRunController {
   private buildResponseSchema(): Record<string, unknown> {
     return {
       type: 'OBJECT',
-      required: ['version', 'nonce', 'intent', 'urgency', 'entryStyle', 'maxAdds', 'addRule', 'addTrigger', 'reducePct', 'invalidationHint', 'explanationTags', 'confidence'],
+      required: ['version', 'nonce', 'intent'],
       properties: {
-        version: { type: 'NUMBER', enum: [1] },
+        // Gemini schema validator expects string enums; keep version numeric and validate value in parser.
+        version: { type: 'NUMBER' },
         nonce: { type: 'STRING' },
         intent: { type: 'STRING', enum: ['HOLD', 'ENTER', 'MANAGE', 'EXIT'] },
         side: { type: 'STRING', enum: ['LONG', 'SHORT'] },
@@ -388,25 +471,45 @@ export class AIDryRunController {
 
   private parsePlan(text: string | null, expectedNonce: string): AIDecisionPlan | null {
     const raw = this.extractJsonObject(text);
-    if (!raw) return null;
+    if (!raw) {
+      return this.parseLoosePlan(text, expectedNonce);
+    }
 
     let parsed: Record<string, unknown>;
     try {
       const json = JSON.parse(raw);
-      if (!json || typeof json !== 'object' || Array.isArray(json)) return null;
-      parsed = json as Record<string, unknown>;
+      if (!json || typeof json !== 'object') {
+        return this.parseLoosePlan(text, expectedNonce);
+      }
+      if (Array.isArray(json)) {
+        const firstObject = json.find((item) => item && typeof item === 'object' && !Array.isArray(item));
+        if (!firstObject || typeof firstObject !== 'object') {
+          return this.parseLoosePlan(text, expectedNonce);
+        }
+        parsed = firstObject as Record<string, unknown>;
+      } else {
+        parsed = json as Record<string, unknown>;
+      }
     } catch {
-      return null;
+      return this.parseLoosePlan(text, expectedNonce);
     }
 
-    const version = Number(parsed.version);
-    const nonce = String(parsed.nonce || '');
-    if (version !== PLAN_VERSION || nonce !== expectedNonce) return null;
+    const version = Number(parsed.version ?? PLAN_VERSION);
+    if (version !== PLAN_VERSION) return null;
 
-    const intent = this.parseIntent(parsed.intent);
+    const nonceRaw = String(parsed.nonce || '').trim();
+    const nonce = nonceRaw || expectedNonce;
+    if (nonce !== expectedNonce) return null;
+
+    const actionLike = parsed.intent ?? parsed.action ?? parsed.decision ?? parsed.tradeAction ?? parsed.type;
+    const intent = this.parseIntent(actionLike);
     if (!intent) return null;
 
-    const side = normalizeSide(String(parsed.side || '')) as 'LONG' | 'SHORT' | null;
+    const sideFromFields = normalizeSide(
+      String(parsed.side ?? parsed.direction ?? parsed.positionSide ?? '')
+    ) as 'LONG' | 'SHORT' | null;
+    const sideFromAction = normalizeSide(String(actionLike || '')) as 'LONG' | 'SHORT' | null;
+    const side = sideFromFields ?? sideFromAction;
     if (intent === 'ENTER' && !side) return null;
 
     const urgency = this.parseUrgency(parsed.urgency);
@@ -434,7 +537,9 @@ export class AIDryRunController {
 
     const explanationTags = Array.isArray(parsed.explanationTags)
       ? parsed.explanationTags.map(toTag).filter((v): v is AIExplanationTag => Boolean(v)).slice(0, 5)
-      : [];
+      : typeof parsed.explanationTags === 'string'
+        ? String(parsed.explanationTags).split(',').map((tag) => toTag(tag)).filter((v): v is AIExplanationTag => Boolean(v)).slice(0, 5)
+        : [];
 
     return {
       version: PLAN_VERSION,
@@ -457,13 +562,129 @@ export class AIDryRunController {
   private extractJsonObject(text: string | null): string | null {
     const trimmed = normalizeJsonCandidate(String(text || '').trim());
     if (!trimmed) return null;
+
     const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
     const candidate = fenced && fenced[1] ? normalizeJsonCandidate(fenced[1]) : trimmed;
-    if (!candidate.startsWith('{') || !candidate.endsWith('}')) return null;
-    return candidate;
+
+    const direct = this.tryParseJsonObject(candidate);
+    if (direct) return direct;
+
+    const balanced = this.extractBalancedJsonObject(candidate);
+    if (balanced) return balanced;
+
+    return null;
   }
 
-  private async retryParsePlan(expectedNonce: string, rawText: string): Promise<AIDecisionPlan | null> {
+  private tryParseJsonObject(candidate: string): string | null {
+    const normalized = normalizeJsonCandidate(candidate);
+    if (!normalized) return null;
+    try {
+      const parsed = JSON.parse(normalized);
+      if (parsed && typeof parsed === 'object') {
+        if (Array.isArray(parsed)) {
+          const firstObject = parsed.find((item) => item && typeof item === 'object' && !Array.isArray(item));
+          if (!firstObject || typeof firstObject !== 'object') return null;
+          return JSON.stringify(firstObject);
+        }
+        return JSON.stringify(parsed);
+      }
+    } catch {
+      // ignore and continue to balanced extraction
+    }
+    return null;
+  }
+
+  private extractBalancedJsonObject(text: string): string | null {
+    const source = String(text || '');
+    for (let i = 0; i < source.length; i += 1) {
+      if (source[i] !== '{') continue;
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      for (let j = i; j < source.length; j += 1) {
+        const ch = source[j];
+        if (inString) {
+          if (escaped) {
+            escaped = false;
+            continue;
+          }
+          if (ch === '\\') {
+            escaped = true;
+            continue;
+          }
+          if (ch === '"') {
+            inString = false;
+          }
+          continue;
+        }
+        if (ch === '"') {
+          inString = true;
+          continue;
+        }
+        if (ch === '{') {
+          depth += 1;
+          continue;
+        }
+        if (ch === '}') {
+          depth -= 1;
+          if (depth === 0) {
+            const candidate = normalizeJsonCandidate(source.slice(i, j + 1));
+            const parsed = this.tryParseJsonObject(candidate);
+            if (parsed) return parsed;
+            break;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  private parseLoosePlan(text: string | null, expectedNonce: string): AIDecisionPlan | null {
+    const raw = String(text || '').trim();
+    if (!raw) return null;
+
+    const upper = raw.toUpperCase();
+    const intent =
+      upper.includes('ENTER') || upper.includes('ENTRY') || upper.includes('"ACTION":"BUY"') || upper.includes('"ACTION":"SELL"')
+        ? 'ENTER'
+        : upper.includes('ADD') || upper.includes('REDUCE') || upper.includes('MANAGE')
+          ? 'MANAGE'
+          : upper.includes('EXIT') || upper.includes('CLOSE')
+            ? 'EXIT'
+            : upper.includes('HOLD') || upper.includes('WAIT') || upper.includes('NOOP')
+              ? 'HOLD'
+              : null;
+    if (!intent) return null;
+
+    const side = intent === 'ENTER'
+      ? (normalizeSide(upper.includes('SHORT') || upper.includes('SELL') ? 'SHORT' : upper.includes('LONG') || upper.includes('BUY') ? 'LONG' : '') as 'LONG' | 'SHORT' | null)
+      : null;
+    if (intent === 'ENTER' && !side) return null;
+
+    return {
+      version: PLAN_VERSION,
+      nonce: expectedNonce,
+      intent,
+      side,
+      urgency: 'MED',
+      entryStyle: 'HYBRID',
+      sizeMultiplier: 0.5,
+      maxAdds: 1,
+      addRule: 'WINNER_ONLY',
+      addTrigger: {
+        minUnrealizedPnlPct: DEFAULT_ADD_MIN_UPNL_PCT,
+        trendIntact: false,
+        obiSupportMin: 0.1,
+        deltaConfirm: false,
+      },
+      reducePct: intent === 'MANAGE' && upper.includes('REDUCE') ? 0.5 : null,
+      invalidationHint: 'NONE',
+      explanationTags: [],
+      confidence: 0.25,
+    };
+  }
+
+  private async retryParsePlan(expectedNonce: string, rawText: string, modelOverride?: string): Promise<AIDecisionPlan | null> {
     if (!this.config || !this.config.apiKey || !this.config.model) return null;
     this.telemetry.repairCalls += 1;
     const retryPrompt = [
@@ -472,13 +693,16 @@ export class AIDryRunController {
       `Nonce must be exactly: ${expectedNonce}`,
       'version must be 1.',
       'intent must be HOLD, ENTER, MANAGE, or EXIT.',
+      'Optional fields may be omitted.',
+      'Use short numeric values.',
+      `Minimal valid example: {"version":1,"nonce":"${expectedNonce}","intent":"HOLD","confidence":0.2}`,
       'Input:',
       rawText.slice(0, 4000),
     ].join('\n');
     try {
       const retryResponse = await generateContent({
         apiKey: this.config.apiKey,
-        model: this.config.model,
+        model: modelOverride || this.config.model,
         temperature: 0,
         maxOutputTokens: this.config.maxOutputTokens,
         responseSchema: this.buildResponseSchema(),
@@ -799,9 +1023,11 @@ export class AIDryRunController {
 
   private parseIntent(raw: unknown): AIDecisionIntent | null {
     const value = String(raw || '').trim().toUpperCase();
-    return value === 'HOLD' || value === 'ENTER' || value === 'MANAGE' || value === 'EXIT'
-      ? value
-      : null;
+    if (value === 'HOLD' || value === 'WAIT' || value === 'NOOP') return 'HOLD';
+    if (value === 'ENTER' || value === 'ENTRY' || value === 'BUY' || value === 'SELL' || value === 'LONG' || value === 'SHORT') return 'ENTER';
+    if (value === 'MANAGE' || value === 'ADD' || value === 'REDUCE') return 'MANAGE';
+    if (value === 'EXIT' || value === 'CLOSE') return 'EXIT';
+    return null;
   }
 
   private parseUrgency(raw: unknown): AIUrgency {
