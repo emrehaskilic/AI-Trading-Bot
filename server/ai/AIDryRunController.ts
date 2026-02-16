@@ -84,6 +84,7 @@ type AIAction = {
 };
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+
 const normalizeSide = (raw?: string | null): StrategySide | null => {
   const value = String(raw || '').trim().toUpperCase();
   if (!value) return null;
@@ -91,6 +92,7 @@ const normalizeSide = (raw?: string | null): StrategySide | null => {
   if (value === 'SHORT' || value === 'SELL') return 'SHORT';
   return null;
 };
+
 const parseFloatSafe = (value: unknown): number | undefined => {
   const n = Number(value);
   return Number.isFinite(n) ? n : undefined;
@@ -156,10 +158,9 @@ export class AIDryRunController {
   async onMetrics(snapshot: AIMetricsSnapshot): Promise<void> {
     if (!this.isActive() || !this.config) return;
     if (!this.isTrackingSymbol(snapshot.symbol)) return;
-    // NOTE: We intentionally do NOT block on gatePassed for AI dry run.
-    // The gate check is too strict for local simulation (latency thresholds of 1-2s),
-    // and the AI receives gate status in the prompt to make its own judgment.
-    // if (!snapshot.decision.gatePassed) return;
+
+    // NOTE: Gate check is bypassed for AI autonomy, as requested.
+    // The AI receives the gate status in the prompt.
 
     const nowMs = snapshot.timestampMs;
     const lastTs = this.lastDecisionTs.get(snapshot.symbol) || 0;
@@ -172,29 +173,69 @@ export class AIDryRunController {
     try {
       const prompt = this.buildPrompt(snapshot);
       this.log?.('AI_CALLING_GEMINI', { symbol: snapshot.symbol, promptLen: prompt.length });
+
       const response = await generateContent(this.config, prompt);
-      this.log?.('AI_GEMINI_RESPONSE', { symbol: snapshot.symbol, text: response.text?.slice(0, 200) || null });
+
+      this.log?.('AI_GEMINI_RESPONSE', {
+        symbol: snapshot.symbol,
+        text: response.text?.slice(0, 300) || null,
+        finishReason: response.meta?.finishReason
+      });
+
       if (!response.text) {
         this.lastError = 'ai_empty_response';
-        this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError });
+        this.log?.('AI_DRY_RUN_ERROR', {
+          symbol: snapshot.symbol,
+          error: this.lastError,
+          meta: response.meta,
+          rawSummary: JSON.stringify(response.raw || {}).slice(0, 200)
+        });
+
+        // Fail-safe: Submit HOLD explicitly so the system knows an attempt was made
+        await this.submitFallbackHold(snapshot, 'ai_empty_response');
         return;
       }
-      const action = this.parseAction(response.text);
-      this.log?.('AI_PARSED_ACTION', { symbol: snapshot.symbol, action });
+
+      let action = this.parseAction(response.text);
+
+      // Retry mechanism if parsing fails
+      if (!action) {
+        this.log?.('AI_PARSE_RETRY', { symbol: snapshot.symbol });
+        const retryPrompt = `Convert the following into ONE valid JSON action object only. Allowed action: HOLD/ENTRY/ADD/REDUCE/EXIT. Input: ${response.text.slice(0, 2000)}`;
+        try {
+          const retryResponse = await generateContent(this.config, retryPrompt);
+          if (retryResponse.text) {
+            action = this.parseAction(retryResponse.text);
+          }
+        } catch (e) {
+          // ignore retry errors
+        }
+      }
+
       if (!action) {
         this.lastError = 'ai_parse_failed';
-        this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError });
+        this.log?.('AI_DRY_RUN_ERROR', {
+          symbol: snapshot.symbol,
+          error: this.lastError,
+          responseText: response.text.slice(0, 500)
+        });
+        await this.submitFallbackHold(snapshot, 'ai_parse_failed');
         return;
       }
-      if (action.action === 'ENTRY' && !action.side) {
+
+      if ((action.action === 'ENTRY' || action.action === 'ADD') && !action.side) {
         this.lastError = 'ai_invalid_side';
-        this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError });
+        this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError, action });
+        await this.submitFallbackHold(snapshot, 'ai_invalid_side');
         return;
       }
 
       const decision = this.buildDecision(snapshot, action);
-      if (decision.actions.length > 0) {
-        this.log?.('AI_SUBMITTING_DECISION', { symbol: snapshot.symbol, actions: decision.actions.map(a => ({ type: a.type, side: (a as any).side, reason: a.reason })) });
+      if (decision.actions.length > 0 || decision.reasons.includes('NOOP')) {
+        // Log non-NOOP decisions or if we want to log every AI heartbeat
+        if (decision.actions.length > 0) {
+          this.log?.('AI_SUBMITTING_DECISION', { symbol: snapshot.symbol, actions: decision.actions.map(a => ({ type: a.type, side: (a as any).side, reason: a.reason })) });
+        }
         this.dryRunSession.submitStrategyDecision(snapshot.symbol, decision, snapshot.timestampMs);
       }
 
@@ -204,6 +245,10 @@ export class AIDryRunController {
     } catch (error: any) {
       this.lastError = error?.message || 'ai_decision_failed';
       this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError });
+      // Try to submit fallback even on generic error if possible
+      try {
+        await this.submitFallbackHold(snapshot, 'ai_exception');
+      } catch { }
     } finally {
       this.pending.delete(snapshot.symbol);
     }
@@ -221,11 +266,11 @@ export class AIDryRunController {
       volatility: snapshot.volatility,
       position: pos
         ? {
-            side: pos.side,
-            qty: pos.qty,
-            entryPrice: pos.entryPrice,
-            unrealizedPnlPct: pos.unrealizedPnlPct,
-            addsUsed: pos.addsUsed,
+          side: pos.side,
+          qty: pos.qty,
+          entryPrice: pos.entryPrice,
+          unrealizedPnlPct: pos.unrealizedPnlPct,
+          addsUsed: pos.addsUsed,
         }
         : null,
     };
@@ -285,77 +330,82 @@ export class AIDryRunController {
   }
 
   private parseAction(text: string): AIAction | null {
-    const trimmed = text.trim();
-    if (!trimmed) return null;
+    if (!text) return null;
 
-    const toAction = (raw: unknown): AIAction | null => {
-      if (!raw || typeof raw !== 'object') return null;
-      const parsed = raw as Record<string, unknown>;
-      if (typeof parsed.action !== 'string') return null;
-      const rawAction = parsed.action.trim().toUpperCase();
-      let action: AIAction['action'] | null = null;
-      let side = normalizeSide(parsed.side as string | undefined);
-      if (['HOLD', 'ENTRY', 'EXIT', 'REDUCE', 'ADD'].includes(rawAction)) {
-        action = rawAction as AIAction['action'];
-      } else if (rawAction === 'BUY' || rawAction === 'LONG') {
-        action = 'ENTRY';
-        side = side ?? 'LONG';
-      } else if (rawAction === 'SELL' || rawAction === 'SHORT') {
-        action = 'ENTRY';
-        side = side ?? 'SHORT';
-      } else {
-        return null;
-      }
-      return {
-        action,
-        side: side ?? undefined,
-        sizeMultiplier: parseFloatSafe(parsed.sizeMultiplier),
-        reducePct: parseFloatSafe(parsed.reducePct),
-        reason: typeof parsed.reason === 'string' ? parsed.reason : undefined,
-      };
-    };
+    const candidates: string[] = [];
 
-    const candidateStrings: string[] = [];
-    const seen = new Set<string>();
-    const pushCandidate = (value: string) => {
-      const v = value.trim();
-      if (!v || seen.has(v)) return;
-      seen.add(v);
-      candidateStrings.push(v);
-    };
+    // 1. Full Text
+    candidates.push(text);
 
-    pushCandidate(trimmed);
-
-    const fenced = [...trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)];
-    for (const match of fenced) {
-      pushCandidate(match[1] || '');
+    // 2. Markdown Fences
+    const fenceMatches = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)];
+    for (const match of fenceMatches) {
+      if (match[1]) candidates.push(match[1]);
     }
 
-    const firstBrace = trimmed.indexOf('{');
-    const lastBrace = trimmed.lastIndexOf('}');
-    if (firstBrace >= 0 && lastBrace > firstBrace) {
-      pushCandidate(trimmed.slice(firstBrace, lastBrace + 1));
+    // 3. Braced Object
+    // Find the maximal block starting with { and ending with }
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      candidates.push(text.slice(start, end + 1));
     }
 
-    const objectLike = trimmed.match(/\{[\s\S]*?\}/g) || [];
-    for (const piece of objectLike) {
-      pushCandidate(piece);
+    // 4. Multiple objects? Just in case, try all { ... } blocks
+    const objectMatches = text.match(/\{[\s\S]*?\}/g);
+    if (objectMatches) {
+      candidates.push(...objectMatches);
     }
 
-    for (const candidate of candidateStrings) {
+    for (const candidate of candidates) {
       try {
-        const parsed = JSON.parse(candidate);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          const fromArray = toAction(parsed[0]);
-          if (fromArray) return fromArray;
-        }
-        const action = toAction(parsed);
+        const clean = candidate.trim();
+        if (!clean) continue;
+        const parsed = JSON.parse(clean);
+
+        // If array, take first
+        const item = Array.isArray(parsed) ? parsed[0] : parsed;
+        const action = this.toAction(item);
         if (action) return action;
       } catch {
         continue;
       }
     }
+
     return null;
+  }
+
+  private toAction(raw: any): AIAction | null {
+    if (!raw || typeof raw !== 'object') return null;
+
+    const rawAction = String(raw.action || '').trim().toUpperCase();
+    if (!rawAction) return null;
+
+    let action: AIAction['action'] | null = null;
+    let side: StrategySide | undefined = normalizeSide(raw.side) || undefined;
+
+    // Mapping and Normalization
+    if (['HOLD', 'ENTRY', 'EXIT', 'REDUCE', 'ADD'].includes(rawAction)) {
+      action = rawAction as AIAction['action'];
+    } else if (rawAction === 'BUY' || rawAction === 'LONG') {
+      action = 'ENTRY';
+      side = side ?? 'LONG';
+    } else if (rawAction === 'SELL' || rawAction === 'SHORT') {
+      action = 'ENTRY';
+      side = side ?? 'SHORT';
+    } else if (rawAction === 'NOOP' || rawAction === 'WAIT') {
+      action = 'HOLD';
+    }
+
+    if (!action) return null;
+
+    return {
+      action,
+      side,
+      sizeMultiplier: parseFloatSafe(raw.sizeMultiplier),
+      reducePct: parseFloatSafe(raw.reducePct),
+      reason: typeof raw.reason === 'string' ? raw.reason : undefined,
+    };
   }
 
   private buildDecision(snapshot: AIMetricsSnapshot, aiAction: AIAction): StrategyDecision {
@@ -382,7 +432,7 @@ export class AIDryRunController {
       actions.push({
         type: StrategyActionType.ADD,
         side: undefined,
-        reason: 'AI_ADD',
+        reason: 'ADD_WINNER', // Using ADD_WINNER as per valid Reason types
         expectedPrice: snapshot.market.price,
         sizeMultiplier: clamp(Number(aiAction.sizeMultiplier ?? 0.5), 0.1, 2),
         metadata: { ai: true, note: aiAction.reason || null },
@@ -404,6 +454,12 @@ export class AIDryRunController {
         reason: 'EXIT_HARD',
         metadata: { ai: true, note: aiAction.reason || null },
       });
+    }
+
+    // Default to NOOP if no actions created (e.g. ENTRY without side)
+    // Though we guard against that in onMetrics
+    if (actions.length === 0 && aiAction.action !== 'HOLD') {
+      actions.push({ type: StrategyActionType.NOOP, reason: 'NOOP', metadata: { ai: true, note: 'invalid_action_fallback' } });
     }
 
     const log: StrategyDecisionLog = {
@@ -434,6 +490,38 @@ export class AIDryRunController {
       actions,
       log,
     };
+  }
+
+  private async submitFallbackHold(snapshot: AIMetricsSnapshot, fallbackReason: string): Promise<void> {
+    this.log?.('AI_FALLBACK_HOLD', { symbol: snapshot.symbol, reason: fallbackReason });
+    const actions: StrategyAction[] = [];
+    actions.push({ type: StrategyActionType.NOOP, reason: 'NOOP', metadata: { ai: true, fallback: fallbackReason } });
+
+    const decision: StrategyDecision = {
+      symbol: snapshot.symbol,
+      timestampMs: snapshot.timestampMs,
+      regime: snapshot.decision.regime,
+      gatePassed: snapshot.decision.gatePassed,
+      dfs: snapshot.decision.dfs,
+      dfsPercentile: snapshot.decision.dfsPercentile,
+      volLevel: snapshot.decision.volLevel,
+      actions,
+      reasons: ['NOOP'],
+      log: {
+        timestampMs: snapshot.timestampMs,
+        symbol: snapshot.symbol,
+        regime: snapshot.decision.regime,
+        gate: { passed: snapshot.decision.gatePassed, reason: null, details: { ai: true, fallback: fallbackReason } },
+        dfs: snapshot.decision.dfs,
+        dfsPercentile: snapshot.decision.dfsPercentile,
+        volLevel: snapshot.decision.volLevel,
+        thresholds: snapshot.decision.thresholds,
+        reasons: ['NOOP'],
+        actions,
+        stats: { aiDecision: 1 },
+      }
+    };
+    await this.dryRunSession.submitStrategyDecision(snapshot.symbol, decision, snapshot.timestampMs);
   }
 
   private recordDecisionLog(snapshot: AIMetricsSnapshot, decision: StrategyDecision, action: AIAction): void {

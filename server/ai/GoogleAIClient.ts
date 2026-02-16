@@ -7,6 +7,12 @@ export type GoogleAIConfig = {
 
 export type GoogleAIResponse = {
   text: string | null;
+  raw?: any;
+  meta?: {
+    blockReason?: string;
+    finishReason?: string | null;
+    safety?: any;
+  };
 };
 
 export async function generateContent(config: GoogleAIConfig, prompt: string): Promise<GoogleAIResponse> {
@@ -44,7 +50,19 @@ export async function generateContent(config: GoogleAIConfig, prompt: string): P
 
   const payload: any = await res.json();
   const candidate = Array.isArray(payload?.candidates) ? payload.candidates[0] : null;
-  const parts = candidate?.content?.parts;
-  const text = Array.isArray(parts) && parts.length > 0 ? String(parts[0]?.text || '') : '';
-  return { text: text || null };
+
+  let text = '';
+  if (candidate?.content?.parts && Array.isArray(candidate.content.parts)) {
+    text = candidate.content.parts.map((p: any) => p.text || '').join('');
+  }
+
+  return {
+    text: text || null,
+    raw: payload,
+    meta: {
+      blockReason: payload.promptFeedback?.blockReason,
+      finishReason: candidate?.finishReason || null,
+      safety: candidate?.safetyRatings,
+    },
+  };
 }
