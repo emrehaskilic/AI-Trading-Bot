@@ -109,7 +109,8 @@ const AUTO_SCALE_LIVE_UP_PCT = Number(process.env.AUTO_SCALE_LIVE_UP_PCT || 90);
 const AUTO_SCALE_UP_HOLD_MS = 10 * 60 * 1000;
 const DEPTH_LEVELS = Number(process.env.DEPTH_LEVELS || 20);
 const DEPTH_STREAM_MODE = String(process.env.DEPTH_STREAM_MODE || 'diff').toLowerCase(); // diff | partial
-const WS_UPDATE_SPEED = String(process.env.WS_UPDATE_SPEED || '250ms'); // 100ms | 250ms
+const WS_UPDATE_SPEED_RAW = String(process.env.WS_UPDATE_SPEED || '250ms');
+const WS_UPDATE_SPEED = normalizeWsUpdateSpeed(WS_UPDATE_SPEED_RAW);
 const BLOCKED_TELEMETRY_INTERVAL_MS = Number(process.env.BLOCKED_TELEMETRY_INTERVAL_MS || 1000);
 const MIN_RESYNC_INTERVAL_MS = 15000;
 const GRACE_PERIOD_MS = 5000;
@@ -130,6 +131,15 @@ function parseEnvFlag(value: string | undefined): boolean {
 const EXECUTION_ENABLED_ENV = parseEnvFlag(process.env.EXECUTION_ENABLED);
 let EXECUTION_ENABLED = false;
 const EXECUTION_ENV = 'testnet';
+
+function normalizeWsUpdateSpeed(raw: string): '100ms' | '250ms' | '500ms' {
+    const value = String(raw || '').trim().toLowerCase();
+    if (value === '100' || value === '100ms') return '100ms';
+    if (value === '500' || value === '500ms') return '500ms';
+    // Binance Futures diff/partial depth default speed is encoded without suffix.
+    // We keep "250ms" as logical value and map it to no suffix in buildDepthStream.
+    return '250ms';
+}
 
 // =============================================================================
 // Logging
@@ -193,6 +203,7 @@ interface SymbolMeta {
     depthQueue: Array<{
         U: number;
         u: number;
+        pu?: number;
         b: [string, string][];
         a: [string, string][];
         eventTimeMs: number;
@@ -543,6 +554,7 @@ async function fetchSnapshot(symbol: string, trigger: string, force = false) {
         });
 
         if (snapshotResult.ok) {
+            getIntegrity(symbol).resetAfterSnapshot(now);
             // Directly transition to LIVE as per c4c8a70 logic
             transitionOrderbookState(symbol, 'LIVE', 'snapshot_applied_success');
             log('SNAPSHOT_OK', { symbol, trigger, lastUpdateId: data.lastUpdateId });
@@ -594,10 +606,11 @@ function updateDryRunHealthFlag(): void {
 }
 
 function buildDepthStream(symbolLower: string): string {
+    const speedSuffix = WS_UPDATE_SPEED === '250ms' ? '' : `@${WS_UPDATE_SPEED}`;
     if (DEPTH_STREAM_MODE === 'partial') {
-        return `${symbolLower}@depth${DEPTH_LEVELS}@${WS_UPDATE_SPEED}`;
+        return `${symbolLower}@depth${DEPTH_LEVELS}${speedSuffix}`;
     }
-    return `${symbolLower}@depth@${WS_UPDATE_SPEED}`;
+    return `${symbolLower}@depth${speedSuffix}`;
 }
 
 function updateStreams() {
@@ -686,7 +699,7 @@ function updateStreams() {
 
 
 
-function enqueueDepthUpdate(symbol: string, update: { U: number; u: number; b: [string, string][]; a: [string, string][]; eventTimeMs: number; receiptTimeMs: number }) {
+function enqueueDepthUpdate(symbol: string, update: { U: number; u: number; pu?: number; b: [string, string][]; a: [string, string][]; eventTimeMs: number; receiptTimeMs: number }) {
     const meta = getMeta(symbol);
     meta.depthQueue.push(update);
     if (meta.depthQueue.length > DEPTH_QUEUE_MAX) {
@@ -734,6 +747,8 @@ async function processDepthQueue(symbol: string) {
                 meta.desyncCount++;
                 meta.desyncEvents.push(now);
                 meta.goodSequenceStreak = 0;
+                // Drop queued updates from the broken sequence and resync from fresh snapshot.
+                meta.depthQueue = [];
                 log('DEPTH_DESYNC', { symbol, U: update.U, u: update.u, lastUpdateId: ob.lastUpdateId });
                 transitionOrderbookState(symbol, 'RESYNCING', 'sequence_gap', { U: update.U, u: update.u, lastUpdateId: ob.lastUpdateId });
                 await fetchSnapshot(symbol, 'sequence_gap', true);
@@ -749,6 +764,7 @@ async function processDepthQueue(symbol: string) {
                 symbol,
                 sequenceStart: update.U,
                 sequenceEnd: update.u,
+                prevSequenceEnd: update.pu,
                 eventTimeMs: update.eventTimeMs || now,
                 bestBid: bestBid(ob),
                 bestAsk: bestAsk(ob),
@@ -766,6 +782,7 @@ async function processDepthQueue(symbol: string) {
                 if (timeSinceResync > MIN_RESYNC_INTERVAL_MS) {
                     meta.lastResyncTs = now;
                     getIntegrity(symbol).markReconnect(now);
+                    meta.depthQueue = [];
                     transitionOrderbookState(symbol, 'RESYNCING', 'integrity_reconnect', {
                         level: integrity.level,
                         message: integrity.message,
@@ -933,6 +950,7 @@ async function processSymbolEvent(s: string, d: any) {
         enqueueDepthUpdate(s, {
             U: Number(d.U || 0),
             u: Number(d.u || 0),
+            pu: Number(d.pu || 0),
             b: Array.isArray(d.b) ? d.b : [],
             a: Array.isArray(d.a) ? d.a : [],
             eventTimeMs: Number(d.E || d.T || now),

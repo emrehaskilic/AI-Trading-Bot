@@ -19,6 +19,7 @@ export type OrderbookUiState =
 export interface BufferedDepthUpdate {
   U: number;
   u: number;
+  pu?: number;
   b: [string, string][];
   a: [string, string][];
   eventTimeMs: number;
@@ -161,14 +162,27 @@ export function applyDepthUpdate(state: OrderbookState, update: BufferedDepthUpd
   }
 
   const expected = state.lastUpdateId + 1;
-  if (update.U > expected) {
-    state.stats.desyncs++;
-    return { ok: false, applied: false, dropped: false, buffered: false, gapDetected: true };
-  }
+  const hasPrevUpdatePointer = Number.isFinite(update.pu) && Number(update.pu) > 0;
+  if (hasPrevUpdatePointer) {
+    // Binance Futures continuity rule: each event should chain via pu.
+    // We still allow the first overlapping event after snapshot/bootstrap.
+    const chainsByPu = Number(update.pu) === state.lastUpdateId;
+    const overlapsExpected = update.U <= expected && update.u >= expected;
+    if (!chainsByPu && !overlapsExpected) {
+      state.stats.desyncs++;
+      return { ok: false, applied: false, dropped: false, buffered: false, gapDetected: true };
+    }
+  } else {
+    // Legacy/spot-compatible sequence checks.
+    if (update.U > expected) {
+      state.stats.desyncs++;
+      return { ok: false, applied: false, dropped: false, buffered: false, gapDetected: true };
+    }
 
-  if (update.u < expected) {
-    state.stats.dropped++;
-    return { ok: true, applied: false, dropped: true, buffered: false, gapDetected: false };
+    if (update.u < expected) {
+      state.stats.dropped++;
+      return { ok: true, applied: false, dropped: true, buffered: false, gapDetected: false };
+    }
   }
 
   const apply = applyDelta(state, update);

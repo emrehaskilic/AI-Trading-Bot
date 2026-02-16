@@ -16,6 +16,7 @@ export interface OrderbookIntegrityInput {
   symbol: string;
   sequenceStart: number;
   sequenceEnd: number;
+  prevSequenceEnd?: number;
   eventTimeMs: number;
   bestBid: number | null;
   bestAsk: number | null;
@@ -59,8 +60,15 @@ export class OrderbookIntegrityMonitor {
   observe(input: OrderbookIntegrityInput): OrderbookIntegrityStatus {
     this.lastUpdateTimestamp = input.nowMs;
 
-    if (this.lastSequenceEnd > 0 && input.sequenceStart > this.lastSequenceEnd + 1) {
-      this.sequenceGapCount += 1;
+    if (this.lastSequenceEnd > 0) {
+      const hasPrevPointer = Number.isFinite(input.prevSequenceEnd) && Number(input.prevSequenceEnd) > 0;
+      if (hasPrevPointer) {
+        if (Number(input.prevSequenceEnd) !== this.lastSequenceEnd) {
+          this.sequenceGapCount += 1;
+        }
+      } else if (input.sequenceStart > this.lastSequenceEnd + 1) {
+        this.sequenceGapCount += 1;
+      }
     }
     this.lastSequenceEnd = Math.max(this.lastSequenceEnd, input.sequenceEnd);
 
@@ -95,6 +103,21 @@ export class OrderbookIntegrityMonitor {
   markReconnect(nowMs: number): void {
     this.reconnectCount += 1;
     this.lastReconnectTimestamp = nowMs;
+    // A reconnect starts a fresh sequence baseline.
+    this.sequenceGapCount = 0;
+    this.lastSequenceEnd = 0;
+    this.crossedBookDetected = false;
+    this.avgStalenessMs = 0;
+    this.lastUpdateTimestamp = nowMs;
+  }
+
+  resetAfterSnapshot(nowMs: number): void {
+    // Snapshot establishes a new authoritative baseline.
+    this.sequenceGapCount = 0;
+    this.lastSequenceEnd = 0;
+    this.crossedBookDetected = false;
+    this.avgStalenessMs = 0;
+    this.lastUpdateTimestamp = nowMs;
   }
 
   getStatus(nowMs: number): OrderbookIntegrityStatus {
