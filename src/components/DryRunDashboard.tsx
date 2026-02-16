@@ -3,6 +3,7 @@ import SymbolRow from './SymbolRow';
 import MobileSymbolCard from './MobileSymbolCard';
 import { useTelemetrySocket } from '../services/useTelemetrySocket';
 import { withProxyApiKey } from '../services/proxyAuth';
+import { getProxyApiBase } from '../services/proxyBase';
 import { MetricsMessage } from '../types/metrics';
 
 interface DryRunConsoleLog {
@@ -148,13 +149,12 @@ const formatTs = (ts: number): string => {
 };
 
 const DryRunDashboard: React.FC = () => {
-  const hostname = window.location.hostname;
-  const proxyUrl = (import.meta as any).env?.VITE_PROXY_API || `http://${hostname}:8787`;
+  const proxyUrl = getProxyApiBase();
   const fetchWithAuth = (url: string, init?: RequestInit) => fetch(url, withProxyApiKey(init));
 
   const [availablePairs, setAvailablePairs] = useState<string[]>([]);
   const [isLoadingPairs, setIsLoadingPairs] = useState(true);
-  const [selectedPairs, setSelectedPairs] = useState<string[]>(['BTCUSDT', 'ETHUSDT']);
+  const [selectedPairs, setSelectedPairs] = useState<string[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
   const [isDropdownOpen, setDropdownOpen] = useState(false);
 
@@ -191,7 +191,7 @@ const DryRunDashboard: React.FC = () => {
           });
         }
       } catch {
-        setAvailablePairs(['BTCUSDT', 'ETHUSDT', 'SOLUSDT']);
+        setAvailablePairs([]);
       } finally {
         setIsLoadingPairs(false);
       }

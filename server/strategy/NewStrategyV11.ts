@@ -437,7 +437,9 @@ export class NewStrategyV11 {
     if (this.lastExitTs <= 0 || !this.lastExitSide) return false;
     const flip = this.lastExitSide !== side;
     const volAdj = this.volMultiplier(volLevel);
-    const cooldownMs = flip\n+      ? this.config.cooldownFlipS * 1000 * volAdj\n+      : this.config.cooldownSameS * 1000;
+    const cooldownMs = flip
+      ? this.config.cooldownFlipS * 1000 * volAdj
+      : this.config.cooldownSameS * 1000;
     return nowMs < this.lastExitTs + cooldownMs;
   }
 

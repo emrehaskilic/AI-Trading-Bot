@@ -4,6 +4,7 @@ import { MetricsState, MetricsMessage } from '../types/metrics';
 import SymbolRow from './SymbolRow';
 import MobileSymbolCard from './MobileSymbolCard';
 import { withProxyApiKey } from '../services/proxyAuth';
+import { getProxyApiBase } from '../services/proxyBase';
 
 type ConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR';
 
@@ -78,8 +79,7 @@ export const Dashboard: React.FC = () => {
   const activeSymbols = useMemo(() => selectedPairs, [selectedPairs]);
   const marketData: MetricsState = useTelemetrySocket(activeSymbols);
 
-  const hostname = window.location.hostname;
-  const proxyUrl = (import.meta as any).env?.VITE_PROXY_API || `http://${hostname}:8787`;
+  const proxyUrl = getProxyApiBase();
   const fetchWithAuth = (url: string, init?: RequestInit) => fetch(url, withProxyApiKey(init));
 
   useEffect(() => {

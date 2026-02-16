@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { MetricsMessage, MetricsState } from '../types/metrics';
 import { proxyWebSocketProtocols } from './proxyAuth';
+import { getProxyWsBase } from './proxyBase';
 
 /**
  * Hook that connects to the backend telemetry WebSocket and
@@ -37,14 +38,7 @@ export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
       reconnectTimeoutRef.current = null;
     }
 
-    // Determine proxy base from Vite env or default to current hostname
-    const hostname = window.location.hostname;
-    const port = window.location.port || '8787';
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-
-    // Try to use same port for WS if we're on the Nginx proxy (port 80/443)
-    const wsPort = (port === '80' || port === '443' || port === '') ? '' : ':8787';
-    const proxyWs = (import.meta as any).env?.VITE_PROXY_WS || `${protocol}//${hostname}${wsPort}`;
+    const proxyWs = getProxyWsBase();
     const url = `${proxyWs}/ws?symbols=${activeSymbols.join(',')}`;
 
     console.log(`[Telemetry] Connecting to WS: ${url} (attempt ${reconnectAttempts.current + 1})`);
