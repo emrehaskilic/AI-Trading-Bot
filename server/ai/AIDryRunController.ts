@@ -91,6 +91,10 @@ const normalizeSide = (raw?: string | null): StrategySide | null => {
   if (value === 'SHORT' || value === 'SELL') return 'SHORT';
   return null;
 };
+const parseFloatSafe = (value: unknown): number | undefined => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : undefined;
+};
 
 export class AIDryRunController {
   private active = false;
@@ -282,16 +286,15 @@ export class AIDryRunController {
 
   private parseAction(text: string): AIAction | null {
     const trimmed = text.trim();
-    const start = trimmed.indexOf('{');
-    const end = trimmed.lastIndexOf('}');
-    if (start < 0 || end <= start) return null;
-    const jsonText = trimmed.slice(start, end + 1);
-    try {
-      const parsed = JSON.parse(jsonText) as AIAction;
-      if (!parsed || typeof parsed.action !== 'string') return null;
+    if (!trimmed) return null;
+
+    const toAction = (raw: unknown): AIAction | null => {
+      if (!raw || typeof raw !== 'object') return null;
+      const parsed = raw as Record<string, unknown>;
+      if (typeof parsed.action !== 'string') return null;
       const rawAction = parsed.action.trim().toUpperCase();
       let action: AIAction['action'] | null = null;
-      let side = normalizeSide(parsed.side);
+      let side = normalizeSide(parsed.side as string | undefined);
       if (['HOLD', 'ENTRY', 'EXIT', 'REDUCE', 'ADD'].includes(rawAction)) {
         action = rawAction as AIAction['action'];
       } else if (rawAction === 'BUY' || rawAction === 'LONG') {
@@ -306,13 +309,53 @@ export class AIDryRunController {
       return {
         action,
         side: side ?? undefined,
-        sizeMultiplier: parsed.sizeMultiplier,
-        reducePct: parsed.reducePct,
-        reason: parsed.reason,
+        sizeMultiplier: parseFloatSafe(parsed.sizeMultiplier),
+        reducePct: parseFloatSafe(parsed.reducePct),
+        reason: typeof parsed.reason === 'string' ? parsed.reason : undefined,
       };
-    } catch {
-      return null;
+    };
+
+    const candidateStrings: string[] = [];
+    const seen = new Set<string>();
+    const pushCandidate = (value: string) => {
+      const v = value.trim();
+      if (!v || seen.has(v)) return;
+      seen.add(v);
+      candidateStrings.push(v);
+    };
+
+    pushCandidate(trimmed);
+
+    const fenced = [...trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)];
+    for (const match of fenced) {
+      pushCandidate(match[1] || '');
     }
+
+    const firstBrace = trimmed.indexOf('{');
+    const lastBrace = trimmed.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      pushCandidate(trimmed.slice(firstBrace, lastBrace + 1));
+    }
+
+    const objectLike = trimmed.match(/\{[\s\S]*?\}/g) || [];
+    for (const piece of objectLike) {
+      pushCandidate(piece);
+    }
+
+    for (const candidate of candidateStrings) {
+      try {
+        const parsed = JSON.parse(candidate);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const fromArray = toAction(parsed[0]);
+          if (fromArray) return fromArray;
+        }
+        const action = toAction(parsed);
+        if (action) return action;
+      } catch {
+        continue;
+      }
+    }
+    return null;
   }
 
   private buildDecision(snapshot: AIMetricsSnapshot, aiAction: AIAction): StrategyDecision {

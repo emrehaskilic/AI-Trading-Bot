@@ -27,6 +27,7 @@ export async function generateContent(config: GoogleAIConfig, prompt: string): P
     generationConfig: {
       temperature: typeof config.temperature === 'number' ? config.temperature : 0,
       maxOutputTokens: typeof config.maxOutputTokens === 'number' ? config.maxOutputTokens : 256,
+      responseMimeType: 'application/json',
     },
   };
 
