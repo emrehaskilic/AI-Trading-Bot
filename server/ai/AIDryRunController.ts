@@ -97,7 +97,7 @@ export class AIDryRunController {
     private readonly dryRunSession: DryRunSessionService,
     private readonly decisionLog?: DecisionLog,
     private readonly log?: (event: string, data?: Record<string, unknown>) => void
-  ) {}
+  ) { }
 
   start(input: { symbols: string[]; apiKey: string; model: string; decisionIntervalMs?: number; temperature?: number; maxOutputTokens?: number }): void {
     const symbols = input.symbols.map((s) => s.toUpperCase()).filter(Boolean);
@@ -145,23 +145,32 @@ export class AIDryRunController {
   async onMetrics(snapshot: AIMetricsSnapshot): Promise<void> {
     if (!this.isActive() || !this.config) return;
     if (!this.isTrackingSymbol(snapshot.symbol)) return;
-    if (!snapshot.decision.gatePassed) return;
+    // NOTE: We intentionally do NOT block on gatePassed for AI dry run.
+    // The gate check is too strict for local simulation (latency thresholds of 1-2s),
+    // and the AI receives gate status in the prompt to make its own judgment.
+    // if (!snapshot.decision.gatePassed) return;
 
     const nowMs = snapshot.timestampMs;
     const lastTs = this.lastDecisionTs.get(snapshot.symbol) || 0;
     if (nowMs - lastTs < this.config.decisionIntervalMs) return;
     if (this.pending.has(snapshot.symbol)) return;
 
+    this.log?.('AI_DECISION_START', { symbol: snapshot.symbol, gatePassed: snapshot.decision.gatePassed, nowMs, lastTs, interval: this.config.decisionIntervalMs });
+
     this.pending.add(snapshot.symbol);
     try {
       const prompt = this.buildPrompt(snapshot);
+      this.log?.('AI_CALLING_GEMINI', { symbol: snapshot.symbol, promptLen: prompt.length });
       const response = await generateContent(this.config, prompt);
+      this.log?.('AI_GEMINI_RESPONSE', { symbol: snapshot.symbol, text: response.text?.slice(0, 200) || null });
       if (!response.text) return;
       const action = this.parseAction(response.text);
+      this.log?.('AI_PARSED_ACTION', { symbol: snapshot.symbol, action });
       if (!action) return;
 
       const decision = this.buildDecision(snapshot, action);
       if (decision.actions.length > 0) {
+        this.log?.('AI_SUBMITTING_DECISION', { symbol: snapshot.symbol, actions: decision.actions.map(a => ({ type: a.type, side: (a as any).side, reason: a.reason })) });
         this.dryRunSession.submitStrategyDecision(snapshot.symbol, decision, snapshot.timestampMs);
       }
 
@@ -193,25 +202,33 @@ export class AIDryRunController {
       volatility: snapshot.volatility,
       position: pos
         ? {
-            side: pos.side,
-            qty: pos.qty,
-            entryPrice: pos.entryPrice,
-            unrealizedPnlPct: pos.unrealizedPnlPct,
-            addsUsed: pos.addsUsed,
-          }
+          side: pos.side,
+          qty: pos.qty,
+          entryPrice: pos.entryPrice,
+          unrealizedPnlPct: pos.unrealizedPnlPct,
+          addsUsed: pos.addsUsed,
+        }
         : null,
     };
 
     return [
       'You are an autonomous trading decision engine for a futures paper-trading simulation.',
-      'Use only the provided metrics. Output strict JSON ONLY with no extra text.',
+      'Analyze ALL provided metrics carefully and make a trading decision. Output strict JSON ONLY with no extra text.',
       'Allowed actions: HOLD, ENTRY, EXIT, REDUCE, ADD.',
+      '',
       'Rules:',
-      '- If gatePassed=false, output HOLD.',
-      '- If position is null, do not output ADD/REDUCE/EXIT.',
-      '- If position exists, ENTRY should only be used to flip after EXIT; otherwise use ADD/REDUCE/EXIT.',
+      '- gatePassed is informational only; you may trade regardless of its value.',
+      '- If position is null, you may only output HOLD or ENTRY.',
+      '- If position exists, use ADD/REDUCE/EXIT to manage it. Use ENTRY only to flip after EXIT.',
       '- sizeMultiplier must be between 0.1 and 2.0 when provided.',
       '- reducePct must be between 0.1 and 1.0 when provided.',
+      '',
+      'Decision guidelines:',
+      '- Look for strong directional signals: high dfsPercentile (>0.80 for LONG, <0.20 for SHORT), aligned delta/cvdSlope/obiDeep.',
+      '- Consider volatility, absorption, and open interest for confirmation.',
+      '- If multiple metrics align directionally, prefer ENTRY over HOLD.',
+      '- Manage risk: EXIT or REDUCE when signals reverse against your position.',
+      '',
       'Output JSON schema:',
       '{"action":"HOLD"} or {"action":"ENTRY","side":"LONG|SHORT","sizeMultiplier":0.5,"reason":"..."}',
       '{"action":"ADD","side":"LONG|SHORT","sizeMultiplier":0.5,"reason":"..."}',
@@ -330,7 +347,7 @@ export class AIDryRunController {
       ...decision.log,
       stats: {
         ...decision.log.stats,
-        aiAction: action.action,
+        aiAction: ['HOLD', 'ENTRY', 'EXIT', 'REDUCE', 'ADD'].indexOf(action.action),
       },
     };
     this.decisionLog.record(payload);

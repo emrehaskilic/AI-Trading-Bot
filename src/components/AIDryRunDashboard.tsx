@@ -159,10 +159,17 @@ const formatTs = (ts: number): string => {
 };
 
 const MODEL_OPTIONS = [
-  { value: 'gemini-1.5-flash', label: 'Gemini 1.5 Flash' },
-  { value: 'gemini-1.5-pro', label: 'Gemini 1.5 Pro' },
-  { value: 'gemini-1.0-pro', label: 'Gemini 1.0 Pro' },
-  { value: 'custom', label: 'Custom' },
+  // Gemini 3 (Latest)
+  { value: 'gemini-3-pro-preview', label: 'Gemini 3 Pro Preview' },
+  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview' },
+  // Gemini 2.5 (Stable)
+  { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro (Stable)' },
+  { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash (Stable)' },
+  { value: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash-Lite (Stable)' },
+  // Gemini 2.0 (Deprecated March 2026)
+  { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash' },
+  // Custom
+  { value: 'custom', label: 'Custom Model' },
 ];
 
 const AIDryRunDashboard: React.FC = () => {
@@ -184,8 +191,10 @@ const AIDryRunDashboard: React.FC = () => {
   const [initialMargin, setInitialMargin] = useState('200');
   const [leverage, setLeverage] = useState('10');
   const [apiKey, setApiKey] = useState('');
-  const [model, setModel] = useState('gemini-1.5-flash');
+  const [model, setModel] = useState('gemini-2.5-flash');
   const [customModel, setCustomModel] = useState('');
+  const [apiKeyStatus, setApiKeyStatus] = useState<'idle' | 'validating' | 'valid' | 'invalid'>('idle');
+  const [apiKeyError, setApiKeyError] = useState<string | null>(null);
 
   const activeMetricSymbols = useMemo(
     () => (status.running && status.symbols.length > 0 ? status.symbols : selectedPairs),
@@ -324,6 +333,33 @@ const AIDryRunDashboard: React.FC = () => {
     }
   };
 
+  const validateApiKey = async () => {
+    const key = apiKey.trim();
+    if (!key) {
+      setApiKeyStatus('invalid');
+      setApiKeyError('API key is empty');
+      return;
+    }
+    setApiKeyStatus('validating');
+    setApiKeyError(null);
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`
+      );
+      if (res.ok) {
+        setApiKeyStatus('valid');
+        setApiKeyError(null);
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setApiKeyStatus('invalid');
+        setApiKeyError(data?.error?.message || `HTTP ${res.status}`);
+      }
+    } catch (e: any) {
+      setApiKeyStatus('invalid');
+      setApiKeyError(e?.message || 'Network error');
+    }
+  };
+
   const summary = status.summary;
   const perf = summary.performance || DEFAULT_STATUS.summary.performance!;
   const marginHealthPct = summary.marginHealth * 100;
@@ -442,17 +478,37 @@ const AIDryRunDashboard: React.FC = () => {
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <label className="text-xs text-zinc-500">
+            <div className="text-xs text-zinc-500">
               Google AI API Key
-              <input
-                type="password"
-                value={apiKey}
-                disabled={status.running}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder="AIza..."
-                className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm font-mono"
-              />
-            </label>
+              <div className="flex gap-2 mt-1">
+                <input
+                  type="password"
+                  value={apiKey}
+                  disabled={status.running}
+                  onChange={(e) => { setApiKey(e.target.value); setApiKeyStatus('idle'); setApiKeyError(null); }}
+                  placeholder="AIza..."
+                  className="flex-1 bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm font-mono"
+                />
+                <button
+                  onClick={validateApiKey}
+                  disabled={status.running || apiKeyStatus === 'validating' || !apiKey.trim()}
+                  className={`px-3 py-2 rounded text-xs font-bold whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed transition-colors ${apiKeyStatus === 'valid'
+                    ? 'bg-emerald-700 text-white'
+                    : apiKeyStatus === 'invalid'
+                      ? 'bg-red-700 text-white'
+                      : 'bg-zinc-700 hover:bg-zinc-600 text-zinc-200 border border-zinc-600'
+                    }`}
+                >
+                  {apiKeyStatus === 'validating' ? '⏳ Checking...' : apiKeyStatus === 'valid' ? '✓ Valid' : apiKeyStatus === 'invalid' ? '✗ Invalid' : 'Validate Key'}
+                </button>
+              </div>
+              {apiKeyStatus === 'valid' && (
+                <div className="text-emerald-400 text-[11px] mt-1">✓ API key is valid and ready to use.</div>
+              )}
+              {apiKeyStatus === 'invalid' && apiKeyError && (
+                <div className="text-red-400 text-[11px] mt-1">✗ {apiKeyError}</div>
+              )}
+            </div>
 
             <label className="text-xs text-zinc-500">
               Google AI Model
@@ -481,7 +537,7 @@ const AIDryRunDashboard: React.FC = () => {
                 className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm font-mono"
               />
             </label>
-          </div>
+          )}
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
             <button
