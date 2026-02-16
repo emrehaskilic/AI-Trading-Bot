@@ -761,7 +761,40 @@ export class DryRunSessionService {
       const desiredOrderSide = actionSide === 'LONG' ? 'BUY' : actionSide === 'SHORT' ? 'SELL' : null;
 
       if (action.type === StrategyActionType.ENTRY && desiredOrderSide) {
-        if (position || session.lastState.openLimitOrders.length > 0) continue;
+        // AI decided to ENTRY. Handle existing position if any.
+        if (position && position.side !== actionSide) {
+          const closeQty = roundTo(position.qty, 6);
+          if (closeQty > 0) {
+            session.manualOrders.push({
+              side: position.side === 'LONG' ? 'SELL' : 'BUY',
+              type: 'MARKET',
+              qty: closeQty,
+              timeInForce: 'IOC',
+              reduceOnly: true,
+              reasonCode: 'AI_REVERSAL_EXIT',
+            });
+            this.addConsoleLog('INFO', normalized, `AI reversal: closing ${position.side} before ${actionSide}`, session.lastEventTimestampMs);
+          }
+        }
+
+        if (position && position.side === actionSide) {
+          const referencePrice = Number(action.expectedPrice) || session.latestMarkPrice || position.entryPrice;
+          const sizing = this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 0.5);
+          if (sizing.qty > 0) {
+            session.engine.setLeverageOverride(sizing.leverage);
+            session.manualOrders.push({
+              side: desiredOrderSide,
+              type: 'MARKET',
+              qty: sizing.qty,
+              timeInForce: 'IOC',
+              reduceOnly: false,
+              reasonCode: 'AI_ADD',
+            });
+            this.addConsoleLog('INFO', normalized, `AI add ${actionSide} +${sizing.qty}`, session.lastEventTimestampMs);
+          }
+          continue;
+        }
+
         const referencePrice = Number(action.expectedPrice) || session.latestMarkPrice || 0;
         if (!(referencePrice > 0)) continue;
         const sizing = this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 1);
@@ -772,32 +805,33 @@ export class DryRunSessionService {
           qty: sizing.qty,
           markPrice: referencePrice,
           orderBook: session.lastOrderBook,
-          urgency: clampNumber(decision.dfsPercentile || 0, 0, 0, 1),
+          urgency: 0.5,
         });
-        const reasonCode: DryRunReasonCode = action.reason === 'HARD_REVERSAL_ENTRY' ? 'HARD_REVERSAL_ENTRY' : 'ENTRY_MARKET';
         for (const order of entryOrders) {
-          session.manualOrders.push({ ...order, reasonCode });
+          session.manualOrders.push({ ...order, reasonCode: 'AI_ENTRY' });
         }
         session.lastEntryEventTs = decisionTs;
-        this.addConsoleLog('INFO', normalized, `Decision ENTRY ${actionSide} ${sizing.qty} @ ~${referencePrice}`, session.lastEventTimestampMs);
+        this.addConsoleLog('INFO', normalized, `AI entry ${actionSide} ${sizing.qty} @ ~${referencePrice}`, session.lastEventTimestampMs);
         continue;
       }
 
-      if (action.type === StrategyActionType.ADD && position && desiredOrderSide) {
-        if (position.side !== actionSide) continue;
-        const referencePrice = Number(action.expectedPrice) || session.latestMarkPrice || position.entryPrice;
+      if (action.type === StrategyActionType.ADD) {
+        const currentPosition = session.lastState.position;
+        if (!currentPosition) continue;
+        const currentSide = currentPosition.side === 'LONG' ? 'BUY' : 'SELL';
+        const referencePrice = Number(action.expectedPrice) || session.latestMarkPrice || currentPosition.entryPrice;
         const sizing = this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 0.5);
         if (!(sizing.qty > 0)) continue;
         session.engine.setLeverageOverride(sizing.leverage);
         session.manualOrders.push({
-          side: desiredOrderSide,
+          side: currentSide,
           type: 'MARKET',
           qty: sizing.qty,
           timeInForce: 'IOC',
           reduceOnly: false,
-          reasonCode: 'ADD_MARKET',
+          reasonCode: 'AI_ADD',
         });
-        this.addConsoleLog('INFO', normalized, `Decision ADD ${actionSide} ${sizing.qty}`, session.lastEventTimestampMs);
+        this.addConsoleLog('INFO', normalized, `AI add to ${currentPosition.side} +${sizing.qty}`, session.lastEventTimestampMs);
         continue;
       }
 
@@ -811,8 +845,9 @@ export class DryRunSessionService {
           qty: reduceQty,
           timeInForce: 'IOC',
           reduceOnly: true,
-          reasonCode: action.reason === 'REDUCE_EXHAUSTION' ? 'REDUCE_EXHAUSTION' : 'REDUCE_SOFT',
+          reasonCode: 'AI_REDUCE',
         });
+        this.addConsoleLog('INFO', normalized, `AI reduce ${position.side} -${reduceQty} (${(reducePct * 100).toFixed(0)}%)`, session.lastEventTimestampMs);
         continue;
       }
 
@@ -825,8 +860,9 @@ export class DryRunSessionService {
           qty: exitQty,
           timeInForce: 'IOC',
           reduceOnly: true,
-          reasonCode: action.reason === 'EXIT_HARD_REVERSAL' ? 'HARD_REVERSAL_EXIT' : 'EXIT_MARKET',
+          reasonCode: 'AI_EXIT',
         });
+        this.addConsoleLog('INFO', normalized, `AI exit ${position.side} completely`, session.lastEventTimestampMs);
         session.pendingExitReason = action.reason;
       }
     }

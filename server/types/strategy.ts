@@ -41,6 +41,7 @@ export type DecisionReason =
   | 'ENTRY_BLOCKED_GATE'
   | 'ENTRY_BLOCKED_FILTERS'
   | 'ADD_WINNER'
+  | 'AI_ADD'
   | 'ADD_BLOCKED'
   | 'REDUCE_SOFT'
   | 'REDUCE_EXHAUSTION'

@@ -112,8 +112,8 @@ export class AIDryRunController {
     this.config = {
       apiKey: input.apiKey,
       model: input.model,
-      decisionIntervalMs: Math.max(250, Number(input.decisionIntervalMs ?? 1000)),
-      temperature: Number.isFinite(input.temperature as number) ? Number(input.temperature) : 0,
+      decisionIntervalMs: Math.max(500, Number(input.decisionIntervalMs ?? 2000)),
+      temperature: Number.isFinite(input.temperature as number) ? Number(input.temperature) : 0.3,
       maxOutputTokens: Math.max(64, Number(input.maxOutputTokens ?? 256)),
     };
     this.active = true;
@@ -182,7 +182,7 @@ export class AIDryRunController {
         this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError });
         return;
       }
-      if ((action.action === 'ENTRY' || action.action === 'ADD') && !action.side) {
+      if (action.action === 'ENTRY' && !action.side) {
         this.lastError = 'ai_invalid_side';
         this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError });
         return;
@@ -210,12 +210,6 @@ export class AIDryRunController {
     const payload = {
       symbol: snapshot.symbol,
       timestampMs: snapshot.timestampMs,
-      gatePassed: snapshot.decision.gatePassed,
-      regime: snapshot.decision.regime,
-      dfs: snapshot.decision.dfs,
-      dfsPercentile: snapshot.decision.dfsPercentile,
-      volLevel: snapshot.decision.volLevel,
-      thresholds: snapshot.decision.thresholds,
       market: snapshot.market,
       trades: snapshot.trades,
       openInterest: snapshot.openInterest,
@@ -223,36 +217,61 @@ export class AIDryRunController {
       volatility: snapshot.volatility,
       position: pos
         ? {
-          side: pos.side,
-          qty: pos.qty,
-          entryPrice: pos.entryPrice,
-          unrealizedPnlPct: pos.unrealizedPnlPct,
-          addsUsed: pos.addsUsed,
+            side: pos.side,
+            qty: pos.qty,
+            entryPrice: pos.entryPrice,
+            unrealizedPnlPct: pos.unrealizedPnlPct,
+            addsUsed: pos.addsUsed,
         }
         : null,
     };
 
     return [
-      'You are an autonomous trading decision engine for a futures paper-trading simulation.',
-      'Analyze ALL provided metrics carefully and make a trading decision. Output strict JSON ONLY with no extra text.',
-      'Allowed actions: HOLD, ENTRY, EXIT, REDUCE, ADD.',
+      'You are a FULLY AUTONOMOUS AI trading agent for futures paper-trading.',
+      'You have complete freedom to make ANY trading decision you want.',
       '',
-      'Rules:',
-      '- gatePassed is informational only; you may trade regardless of its value.',
-      '- If position is null, you may only output HOLD or ENTRY.',
-      '- If position exists, use ADD/REDUCE/EXIT to manage it. Use ENTRY only to flip after EXIT.',
-      '- sizeMultiplier must be between 0.1 and 2.0 when provided.',
-      '- reducePct must be between 0.1 and 1.0 when provided.',
+      'YOUR MISSION: Make profitable trades using your own judgment.',
       '',
-      'Decision guidelines:',
-      '- Look for strong directional signals: high dfsPercentile (>0.80 for LONG, <0.20 for SHORT), aligned delta/cvdSlope/obiDeep.',
-      '- Consider volatility, absorption, and open interest for confirmation.',
-      '- If multiple metrics align directionally, prefer ENTRY over HOLD.',
-      '- Manage risk: EXIT or REDUCE when signals reverse against your position.',
+      'YOU DECIDE EVERYTHING:',
+      '- WHEN to enter, exit, add, reduce positions',
+      '- WHICH direction (LONG or SHORT)',
+      '- HOW MUCH size to use (sizeMultiplier 0.1-2.0, reducePct 0.1-1.0)',
+      '- WHETHER to close entire position or partial',
+      '- WHETHER to add to existing or reverse direction',
       '',
-      'Output JSON schema:',
-      '{"action":"HOLD"} or {"action":"ENTRY","side":"LONG|SHORT","sizeMultiplier":0.5,"reason":"..."}',
-      '{"action":"ADD","side":"LONG|SHORT","sizeMultiplier":0.5,"reason":"..."}',
+      'NO RULES. NO CONSTRAINTS. Trust your analysis.',
+      '',
+      'AVAILABLE METRICS (interpret however you want):',
+      '- market.price, vwap: Price level',
+      '- market.delta1s, delta5s, deltaZ: Momentum',
+      '- market.cvdSlope, obiWeighted, obiDeep, obiDivergence: Order flow',
+      '- trades.printsPerSecond, burstCount, burstSide: Activity',
+      '- openInterest.oiChangePct: Market positioning',
+      '- absorption.value, side: Large order absorption',
+      '- volatility: Risk level',
+      '',
+      'CURRENT STATE:',
+      pos
+        ? `You have a ${pos.side} position: qty=${pos.qty}, entry=${pos.entryPrice}, PnL=${pos.unrealizedPnlPct.toFixed(4)}%`
+        : 'No open position.',
+      '',
+      'ACTIONS YOU CAN TAKE:',
+      '- HOLD: Do nothing, wait',
+      '- ENTRY: Open new position (specify side: LONG or SHORT, and sizeMultiplier)',
+      '- ADD: Add to existing position (only if you have a position)',
+      '- REDUCE: Partially close position (specify reducePct)',
+      '- EXIT: Close entire position',
+      '',
+      'MULTI-STEP DECISIONS ARE YOUR CHOICE:',
+      '- Want to reverse? You can EXIT then ENTRY, or just ENTRY (we handle the close)',
+      '- Want to scale? Use ADD multiple times',
+      '- Want to de-risk? Use REDUCE or EXIT',
+      '',
+      'Output strict JSON ONLY:',
+      '{"action":"HOLD"}',
+      '{"action":"ENTRY","side":"LONG","sizeMultiplier":0.5,"reason":"..."}',
+      '{"action":"ENTRY","side":"SHORT","sizeMultiplier":0.5,"reason":"..."}',
+      '{"action":"ADD","sizeMultiplier":0.3,"reason":"..."}',
       '{"action":"REDUCE","reducePct":0.5,"reason":"..."}',
       '{"action":"EXIT","reason":"..."}',
       '',
@@ -316,11 +335,11 @@ export class AIDryRunController {
       });
     }
 
-    if (aiAction.action === 'ADD' && aiAction.side) {
+    if (aiAction.action === 'ADD') {
       actions.push({
         type: StrategyActionType.ADD,
-        side: aiAction.side as StrategySide,
-        reason: 'ADD_WINNER',
+        side: undefined,
+        reason: 'AI_ADD',
         expectedPrice: snapshot.market.price,
         sizeMultiplier: clamp(Number(aiAction.sizeMultiplier ?? 0.5), 0.1, 2),
         metadata: { ai: true, note: aiAction.reason || null },
