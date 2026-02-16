@@ -97,6 +97,13 @@ const parseFloatSafe = (value: unknown): number | undefined => {
   const n = Number(value);
   return Number.isFinite(n) ? n : undefined;
 };
+const normalizeJsonCandidate = (value: string): string => {
+  return String(value || '')
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, '"')
+    .replace(/,\s*([}\]])/g, '$1')
+    .trim();
+};
 
 export class AIDryRunController {
   private active = false;
@@ -180,7 +187,9 @@ export class AIDryRunController {
       });
 
       if (!response.text) {
-        this.lastError = 'ai_empty_response';
+        const blockReason = response.meta?.blockReason || 'none';
+        const finishReason = response.meta?.finishReason || 'none';
+        this.lastError = `ai_empty_response:block=${blockReason};finish=${finishReason}`;
         this.log?.('AI_DRY_RUN_ERROR', {
           symbol: snapshot.symbol,
           error: this.lastError,
@@ -258,21 +267,22 @@ export class AIDryRunController {
     };
 
     return [
-      'You are a FULLY AUTONOMOUS AI trading agent for futures paper-trading.',
-      'You have complete freedom to make ANY trading decision you want.',
+      'You are an AI decision engine for a futures paper-trading simulation.',
+      'Use only the provided metrics and current position.',
       '',
-      'YOUR MISSION: Make profitable trades using your own judgment.',
+      'Goal: maximize simulated risk-adjusted returns.',
       '',
-      'YOU DECIDE EVERYTHING:',
-      '- WHEN to enter, exit, add, reduce positions',
-      '- WHICH direction (LONG or SHORT)',
-      '- HOW MUCH size to use (sizeMultiplier 0.1-2.0, reducePct 0.1-1.0)',
-      '- WHETHER to close entire position or partial',
-      '- WHETHER to add to existing or reverse direction',
+      'Return exactly ONE JSON object. No markdown. No extra text.',
+      'Allowed actions: HOLD, ENTRY, ADD, REDUCE, EXIT.',
       '',
-      'NO RULES. NO CONSTRAINTS. Trust your analysis.',
+      'Rules:',
+      '- ENTRY requires side LONG or SHORT.',
+      '- ADD uses current position direction.',
+      '- sizeMultiplier range: 0.1 to 2.0.',
+      '- reducePct range: 0.1 to 1.0.',
+      '- If signal quality is weak, choose HOLD.',
       '',
-      'AVAILABLE METRICS (interpret however you want):',
+      'Available metrics:',
       '- market.price, vwap: Price level',
       '- market.delta1s, delta5s, deltaZ: Momentum',
       '- market.cvdSlope, obiWeighted, obiDeep, obiDivergence: Order flow',
@@ -281,24 +291,12 @@ export class AIDryRunController {
       '- absorption.value, side: Large order absorption',
       '- volatility: Risk level',
       '',
-      'CURRENT STATE:',
+      'Current position:',
       pos
         ? `You have a ${pos.side} position: qty=${pos.qty}, entry=${pos.entryPrice}, PnL=${pos.unrealizedPnlPct.toFixed(4)}%`
         : 'No open position.',
       '',
-      'ACTIONS YOU CAN TAKE:',
-      '- HOLD: Do nothing, wait',
-      '- ENTRY: Open new position (specify side: LONG or SHORT, and sizeMultiplier)',
-      '- ADD: Add to existing position (only if you have a position)',
-      '- REDUCE: Partially close position (specify reducePct)',
-      '- EXIT: Close entire position',
-      '',
-      'MULTI-STEP DECISIONS ARE YOUR CHOICE:',
-      '- Want to reverse? You can EXIT then ENTRY, or just ENTRY (we handle the close)',
-      '- Want to scale? Use ADD multiple times',
-      '- Want to de-risk? Use REDUCE or EXIT',
-      '',
-      'Output strict JSON ONLY:',
+      'Output examples:',
       '{"action":"HOLD"}',
       '{"action":"ENTRY","side":"LONG","sizeMultiplier":0.5,"reason":"..."}',
       '{"action":"ENTRY","side":"SHORT","sizeMultiplier":0.5,"reason":"..."}',
@@ -394,10 +392,14 @@ export class AIDryRunController {
     const candidates: string[] = [];
     const seen = new Set<string>();
     const pushCandidate = (value: string) => {
-      const v = value.trim();
-      if (!v || seen.has(v)) return;
-      seen.add(v);
-      candidates.push(v);
+      const raw = value.trim();
+      if (!raw) return;
+      const normalized = normalizeJsonCandidate(raw);
+      for (const candidate of [raw, normalized]) {
+        if (!candidate || seen.has(candidate)) continue;
+        seen.add(candidate);
+        candidates.push(candidate);
+      }
     };
 
     pushCandidate(trimmed);

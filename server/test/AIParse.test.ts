@@ -77,6 +77,15 @@ test('AIParse Logic', async (t) => {
         assert.strictEqual(res?.side, 'LONG');
     });
 
+    await t.test('Smart quotes and trailing comma are normalized', () => {
+        const text = '```json\n{“action”: “ENTRY”, “side”: “LONG”, “sizeMultiplier”: “0.8”,}\n```';
+        const res = parse(text);
+        assert.ok(res);
+        assert.strictEqual(res?.action, 'ENTRY');
+        assert.strictEqual(res?.side, 'LONG');
+        assert.strictEqual(res?.sizeMultiplier, 0.8);
+    });
+
     await t.test('Invalid or empty input returns null', () => {
         assert.strictEqual(parse(''), null);
         assert.strictEqual(parse('Just some text'), null);

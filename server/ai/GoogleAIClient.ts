@@ -16,7 +16,7 @@ export type GoogleAIResponse = {
 };
 
 export async function generateContent(config: GoogleAIConfig, prompt: string): Promise<GoogleAIResponse> {
-  const model = config.model.trim();
+  const model = config.model.trim().replace(/^models\//i, '');
   const apiKey = config.apiKey.trim();
   if (!model || !apiKey) {
     throw new Error('ai_config_missing');
@@ -34,6 +34,17 @@ export async function generateContent(config: GoogleAIConfig, prompt: string): P
       temperature: typeof config.temperature === 'number' ? config.temperature : 0,
       maxOutputTokens: typeof config.maxOutputTokens === 'number' ? config.maxOutputTokens : 256,
       responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        required: ['action'],
+        properties: {
+          action: { type: 'STRING', enum: ['HOLD', 'ENTRY', 'EXIT', 'REDUCE', 'ADD'] },
+          side: { type: 'STRING', enum: ['LONG', 'SHORT'] },
+          sizeMultiplier: { type: 'NUMBER' },
+          reducePct: { type: 'NUMBER' },
+          reason: { type: 'STRING' },
+        },
+      },
     },
   };
 
