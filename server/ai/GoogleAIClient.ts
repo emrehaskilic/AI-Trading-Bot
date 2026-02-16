@@ -3,6 +3,7 @@ export type GoogleAIConfig = {
   model: string;
   temperature?: number;
   maxOutputTokens?: number;
+  responseSchema?: Record<string, unknown>;
 };
 
 export type GoogleAIResponse = {
@@ -33,25 +34,29 @@ export async function generateContent(config: GoogleAIConfig, prompt: string): P
     generationConfig: {
       temperature: typeof config.temperature === 'number' ? config.temperature : 0,
       maxOutputTokens: typeof config.maxOutputTokens === 'number' ? config.maxOutputTokens : 256,
+      responseMimeType: 'application/json',
     },
   };
+
+  const requestedSchema = config.responseSchema && typeof config.responseSchema === 'object'
+    ? config.responseSchema
+    : {
+      type: 'OBJECT',
+      required: ['version', 'nonce', 'intent', 'confidence'],
+      properties: {
+        version: { type: 'NUMBER', enum: [1] },
+        nonce: { type: 'STRING' },
+        intent: { type: 'STRING', enum: ['HOLD', 'ENTER', 'MANAGE', 'EXIT'] },
+        side: { type: 'STRING', enum: ['LONG', 'SHORT'] },
+        confidence: { type: 'NUMBER' },
+      },
+    };
 
   const bodyWithSchema = {
     ...bodyBase,
     generationConfig: {
       ...bodyBase.generationConfig,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: 'OBJECT',
-        required: ['action'],
-        properties: {
-          action: { type: 'STRING', enum: ['HOLD', 'ENTRY', 'EXIT', 'REDUCE', 'ADD'] },
-          side: { type: 'STRING', enum: ['LONG', 'SHORT'] },
-          sizeMultiplier: { type: 'NUMBER' },
-          reducePct: { type: 'NUMBER' },
-          reason: { type: 'STRING' },
-        },
-      },
+      responseSchema: requestedSchema,
     },
   };
 

@@ -173,4 +173,17 @@ export class DecisionEngine {
     if (allowed === 'SHORT') return side === 'SELL';
     return true;
   }
+
+  computeCooldownMs(deltaZ: number, printsPerSecond: number, minMs: number, maxMs: number): number {
+    const lo = Math.max(0, Math.min(minMs, maxMs));
+    const hi = Math.max(0, Math.max(minMs, maxMs));
+    if (hi <= lo) return lo;
+
+    const absDelta = Math.max(0, Math.abs(Number(deltaZ) || 0));
+    const activity = Math.max(0, Math.min(1, (Number(printsPerSecond) || 0) / 10));
+    const conviction = Math.max(0, Math.min(1, absDelta / 3));
+    const acceleration = (conviction * 0.65) + (activity * 0.35);
+    const cooldown = hi - ((hi - lo) * acceleration);
+    return Math.max(lo, Math.min(hi, Math.round(cooldown)));
+  }
 }

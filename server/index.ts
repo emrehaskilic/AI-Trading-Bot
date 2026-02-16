@@ -1067,9 +1067,18 @@ async function processSymbolEvent(s: string, d: any) {
         const isDryRunTracked = dryRunSession.isTrackingSymbol(s);
         const aiActive = aiDryRun.isActive() && aiDryRun.isTrackingSymbol(s);
         if (aiActive) {
+            const snapshotTs = Number(t || now);
+            const rawPosition = dryRunSession.getStrategyPosition(s);
+            const riskState = dryRunSession.getAIDryRunRiskState(s, snapshotTs);
+            const executionState = dryRunSession.getAIDryRunExecutionState(s, snapshotTs);
+            const blockedReasons: string[] = [];
+            if (!decision.gatePassed) blockedReasons.push('GATE_NOT_PASSED');
+            if (spreadPct != null && spreadPct > 0.6) blockedReasons.push('SPREAD_TOO_WIDE');
+            if (tasMetrics.printsPerSecond < 0.25 || tasMetrics.tradeCount < 4) blockedReasons.push('ACTIVITY_WEAK');
+
             void aiDryRun.onMetrics({
                 symbol: s,
-                timestampMs: Number(t || now),
+                timestampMs: snapshotTs,
                 decision: {
                     regime: decision.regime,
                     dfs: decision.dfs,
@@ -1101,7 +1110,13 @@ async function processSymbolEvent(s: string, d: any) {
                 openInterest: { oiChangePct: oiMetrics ? oiMetrics.oiChangePct : null },
                 absorption: { value: absVal, side: absVal ? side : null },
                 volatility: backfill.getState().atr || 0,
-                position: dryRunSession.getStrategyPosition(s),
+                blockedReasons,
+                riskState,
+                executionState,
+                position: rawPosition ? {
+                    ...rawPosition,
+                    timeInPositionMs: Math.max(0, Number(rawPosition.timeInPositionMs || 0)),
+                } : null,
             });
         } else if (isDryRunTracked) {
             if (Math.random() < 0.05) {

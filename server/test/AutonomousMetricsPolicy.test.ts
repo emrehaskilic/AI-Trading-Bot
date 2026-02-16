@@ -1,11 +1,24 @@
-import { AutonomousMetricsPolicy } from '../ai/AutonomousMetricsPolicy';
-import { AIMetricsSnapshot } from '../ai/types';
+import { AIDryRunController } from '../ai/AIDryRunController';
+import { AIDecisionPlan, AIMetricsSnapshot } from '../ai/types';
 
 function assert(condition: unknown, message: string): void {
   if (!condition) throw new Error(message);
 }
 
-function buildSnapshot(overrides?: Partial<AIMetricsSnapshot>): AIMetricsSnapshot {
+type SnapshotOverrides = Partial<
+  Omit<AIMetricsSnapshot, 'decision' | 'riskState' | 'executionState' | 'market' | 'trades' | 'openInterest' | 'absorption' | 'position'>
+> & {
+  decision?: Partial<AIMetricsSnapshot['decision']>;
+  riskState?: Partial<AIMetricsSnapshot['riskState']>;
+  executionState?: Partial<AIMetricsSnapshot['executionState']>;
+  market?: Partial<AIMetricsSnapshot['market']>;
+  trades?: Partial<AIMetricsSnapshot['trades']>;
+  openInterest?: Partial<AIMetricsSnapshot['openInterest']>;
+  absorption?: Partial<AIMetricsSnapshot['absorption']>;
+  position?: AIMetricsSnapshot['position'];
+};
+
+function buildSnapshot(overrides?: SnapshotOverrides): AIMetricsSnapshot {
   const base: AIMetricsSnapshot = {
     symbol: 'BTCUSDT',
     timestampMs: Date.now(),
@@ -21,6 +34,22 @@ function buildSnapshot(overrides?: Partial<AIMetricsSnapshot>): AIMetricsSnapsho
         shortEntry: 0.15,
         shortBreak: 0.45,
       },
+    },
+    blockedReasons: [],
+    riskState: {
+      equity: 10_000,
+      leverage: 10,
+      startingMarginUser: 250,
+      marginInUse: 900,
+      drawdownPct: -0.01,
+      dailyLossLock: false,
+      cooldownMsRemaining: 0,
+    },
+    executionState: {
+      lastAction: 'NONE',
+      holdStreak: 0,
+      lastAddMsAgo: null,
+      lastFlipMsAgo: null,
     },
     market: {
       price: 60_000,
@@ -57,81 +86,184 @@ function buildSnapshot(overrides?: Partial<AIMetricsSnapshot>): AIMetricsSnapsho
     ...base,
     ...overrides,
     decision: { ...base.decision, ...(overrides?.decision || {}) },
+    riskState: { ...base.riskState, ...(overrides?.riskState || {}) },
+    executionState: { ...base.executionState, ...(overrides?.executionState || {}) },
     market: { ...base.market, ...(overrides?.market || {}) },
     trades: { ...base.trades, ...(overrides?.trades || {}) },
     openInterest: { ...base.openInterest, ...(overrides?.openInterest || {}) },
     absorption: { ...base.absorption, ...(overrides?.absorption || {}) },
+    position: overrides?.position === undefined ? base.position : overrides.position,
+    blockedReasons: overrides?.blockedReasons ?? base.blockedReasons,
   };
 }
 
+function buildPlan(overrides?: Partial<AIDecisionPlan>): AIDecisionPlan {
+  return {
+    version: 1,
+    nonce: 'nonce-1',
+    intent: 'HOLD',
+    side: null,
+    urgency: 'MED',
+    entryStyle: 'HYBRID',
+    sizeMultiplier: 1,
+    maxAdds: 3,
+    addRule: 'WINNER_ONLY',
+    addTrigger: {
+      minUnrealizedPnlPct: 0.0015,
+      trendIntact: true,
+      obiSupportMin: 0.1,
+      deltaConfirm: true,
+    },
+    reducePct: null,
+    invalidationHint: 'NONE',
+    explanationTags: ['TREND_INTACT'],
+    confidence: 0.7,
+    ...(overrides || {}),
+  };
+}
+
+function getController(): AIDryRunController {
+  const mockSession = {
+    submitStrategyDecision: () => [],
+    getStrategyPosition: () => null,
+  };
+  return new AIDryRunController(mockSession as any);
+}
+
 export function runTests() {
-  const policy = new AutonomousMetricsPolicy();
-
   {
-    const decision = policy.decide(buildSnapshot());
-    assert(decision.action.action === 'ENTRY', 'strong bullish flat snapshot should produce ENTRY');
-    assert(decision.action.side === 'LONG', 'bullish entry should be LONG');
+    const controller = getController();
+    const parsePlan = (controller as any).parsePlan.bind(controller);
+    const buildSafeHoldPlan = (controller as any).buildSafeHoldPlan.bind(controller);
+    const parsed = parsePlan(JSON.stringify(buildPlan({ nonce: 'nonce-mismatch' })), 'nonce-1');
+    assert(parsed === null, 'nonce mismatch should invalidate plan');
+    const fallback = buildSafeHoldPlan('nonce-1', 'INVALID_AI_RESPONSE');
+    assert(fallback.intent === 'HOLD', 'nonce mismatch fallback should hold');
   }
 
   {
-    const decision = policy.decide(buildSnapshot({
-      market: {
-        price: 60_000,
-        vwap: 60_100,
-        spreadPct: 0.03,
-        delta1s: -40,
-        delta5s: -120,
-        deltaZ: -2.1,
-        cvdSlope: -22_000,
-        obiWeighted: -0.55,
-        obiDeep: -0.5,
-        obiDivergence: -0.3,
-      },
-      trades: {
-        printsPerSecond: 8,
-        tradeCount: 30,
-        aggressiveBuyVolume: 80,
-        aggressiveSellVolume: 210,
-        burstCount: 6,
-        burstSide: 'sell',
-      },
-      openInterest: { oiChangePct: -0.8 },
-      absorption: { value: 1, side: 'sell' },
-      position: {
-        side: 'LONG',
-        qty: 0.5,
-        entryPrice: 60_100,
-        unrealizedPnlPct: -0.009,
-        addsUsed: 1,
-      },
-    }));
-    assert(decision.action.action === 'EXIT', 'strong opposite signal on losing long should EXIT');
+    const controller = getController();
+    const applyGuardrails = (controller as any).applyGuardrails.bind(controller);
+    const blocked = applyGuardrails(
+      buildSnapshot(),
+      buildPlan({ intent: 'ENTER', side: 'LONG' }),
+      {
+        blockedReasons: ['SPREAD_TOO_WIDE'],
+        blockEntry: true,
+        blockAdd: false,
+        blockFlip: false,
+        forcedAction: null,
+      }
+    );
+    assert(blocked.intent === 'HOLD', 'blocked entry should downgrade to HOLD');
   }
 
   {
-    const decision = policy.decide(buildSnapshot({
-      market: {
-        price: 60_000,
-        vwap: 60_010,
-        spreadPct: 0.02,
-        delta1s: 8,
-        delta5s: 18,
-        deltaZ: 0.4,
-        cvdSlope: 4_000,
-        obiWeighted: 0.2,
-        obiDeep: 0.18,
-        obiDivergence: 0.05,
-      },
-      trades: {
-        printsPerSecond: 2,
-        tradeCount: 8,
-        aggressiveBuyVolume: 90,
-        aggressiveSellVolume: 88,
-        burstCount: 1,
-        burstSide: null,
-      },
-      absorption: { value: 0, side: null },
-    }));
-    assert(decision.action.action === 'HOLD', 'weak signal should HOLD');
+    const controller = getController();
+    const applyGuardrails = (controller as any).applyGuardrails.bind(controller);
+    const forced = applyGuardrails(
+      buildSnapshot({
+        position: {
+          side: 'LONG',
+          qty: 0.3,
+          entryPrice: 60_000,
+          unrealizedPnlPct: -0.02,
+          addsUsed: 1,
+          timeInPositionMs: 15_000,
+        },
+      }),
+      buildPlan({ intent: 'HOLD' }),
+      {
+        blockedReasons: ['RISK_LOCK'],
+        blockEntry: false,
+        blockAdd: false,
+        blockFlip: false,
+        forcedAction: { intent: 'EXIT', reason: 'RISK_LOCK' },
+      }
+    );
+    assert(forced.intent === 'EXIT', 'forced action should enforce EXIT');
+  }
+
+  {
+    const controller = getController();
+    const shouldAllowAdd = (controller as any).shouldAllowAdd.bind(controller);
+    const positive = shouldAllowAdd(
+      buildSnapshot({
+        decision: { gatePassed: true },
+        position: {
+          side: 'LONG',
+          qty: 0.4,
+          entryPrice: 60_000,
+          unrealizedPnlPct: 0.004,
+          addsUsed: 1,
+          timeInPositionMs: 30_000,
+        },
+        market: { obiDeep: 0.4, delta1s: 15, delta5s: 45 },
+      }),
+      buildPlan({
+        intent: 'MANAGE',
+        addRule: 'WINNER_ONLY',
+        maxAdds: 4,
+        addTrigger: {
+          minUnrealizedPnlPct: 0.0015,
+          trendIntact: true,
+          obiSupportMin: 0.1,
+          deltaConfirm: true,
+        },
+      })
+    );
+    assert(positive === true, 'winner scaling should allow add with pnl+trend+gate');
+
+    const negative = shouldAllowAdd(
+      buildSnapshot({
+        decision: { gatePassed: true },
+        position: {
+          side: 'LONG',
+          qty: 0.4,
+          entryPrice: 60_000,
+          unrealizedPnlPct: 0.0003,
+          addsUsed: 1,
+          timeInPositionMs: 30_000,
+        },
+        market: { obiDeep: 0.4, delta1s: 15, delta5s: 45 },
+      }),
+      buildPlan({
+        intent: 'MANAGE',
+        addRule: 'WINNER_ONLY',
+        addTrigger: {
+          minUnrealizedPnlPct: 0.0015,
+          trendIntact: true,
+          obiSupportMin: 0.1,
+          deltaConfirm: true,
+        },
+      })
+    );
+    assert(negative === false, 'winner scaling should not add if pnl threshold not met');
+  }
+
+  {
+    const controller = getController();
+    const applyGuardrails = (controller as any).applyGuardrails.bind(controller);
+    const out = applyGuardrails(
+      buildSnapshot({
+        position: {
+          side: 'LONG',
+          qty: 0.25,
+          entryPrice: 60_000,
+          unrealizedPnlPct: 0.001,
+          addsUsed: 0,
+          timeInPositionMs: 5_000,
+        },
+      }),
+      buildPlan({ intent: 'ENTER', side: 'SHORT' }),
+      {
+        blockedReasons: ['FLIP_COOLDOWN_ACTIVE'],
+        blockEntry: false,
+        blockAdd: false,
+        blockFlip: true,
+        forcedAction: null,
+      }
+    );
+    assert(out.intent === 'HOLD', 'flip cooldown should prevent reversal entry');
   }
 }

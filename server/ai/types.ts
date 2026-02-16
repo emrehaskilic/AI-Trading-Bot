@@ -1,5 +1,43 @@
 import { StrategyRegime, StrategySide } from '../types/strategy';
 
+export type AIDecisionIntent = 'HOLD' | 'ENTER' | 'MANAGE' | 'EXIT';
+export type AIDecisionSide = 'LONG' | 'SHORT';
+export type AIUrgency = 'LOW' | 'MED' | 'HIGH';
+export type AIEntryStyle = 'LIMIT' | 'MARKET_SMALL' | 'HYBRID';
+export type AIAddRule = 'WINNER_ONLY' | 'TREND_INTACT' | 'NEVER';
+export type AIInvalidationHint = 'VWAP' | 'ATR' | 'OBI_FLIP' | 'ABSORPTION_BREAK' | 'NONE';
+export type AIExplanationTag =
+  | 'OBI_UP'
+  | 'OBI_DOWN'
+  | 'DELTA_BURST'
+  | 'CVD_TREND_UP'
+  | 'CVD_TREND_DOWN'
+  | 'VWAP_RECLAIM'
+  | 'VWAP_REJECT'
+  | 'OI_EXPANSION'
+  | 'OI_CONTRACTION'
+  | 'ABSORPTION_BUY'
+  | 'ABSORPTION_SELL'
+  | 'SPREAD_WIDE'
+  | 'ACTIVITY_WEAK'
+  | 'RISK_LOCK'
+  | 'COOLDOWN_ACTIVE'
+  | 'INTEGRITY_FAIL'
+  | 'TREND_INTACT'
+  | 'TREND_BROKEN';
+
+export type GuardrailReason =
+  | 'SPREAD_TOO_WIDE'
+  | 'ACTIVITY_WEAK'
+  | 'INTEGRITY_FAIL'
+  | 'COOLDOWN_ACTIVE'
+  | 'ADD_GAP_ACTIVE'
+  | 'FLIP_COOLDOWN_ACTIVE'
+  | 'MIN_HOLD_ACTIVE'
+  | 'RISK_LOCK'
+  | 'MARGIN_CAP'
+  | 'GATE_NOT_PASSED';
+
 export type AIDryRunConfig = {
   apiKey?: string;
   model?: string;
@@ -7,6 +45,20 @@ export type AIDryRunConfig = {
   temperature: number;
   maxOutputTokens: number;
   localOnly?: boolean;
+  minHoldMs: number;
+  flipCooldownMs: number;
+  minAddGapMs: number;
+};
+
+export type AIDecisionTelemetry = {
+  invalidLLMResponses: number;
+  repairCalls: number;
+  guardrailBlocks: number;
+  forcedExits: number;
+  flipsCount: number;
+  addsCount: number;
+  avgHoldTimeMs: number;
+  feePct: number | null;
 };
 
 export type AIDryRunStatus = {
@@ -19,6 +71,7 @@ export type AIDryRunStatus = {
   localOnly: boolean;
   lastError: string | null;
   symbols: string[];
+  telemetry: AIDecisionTelemetry;
 };
 
 export type AIMetricsSnapshot = {
@@ -36,6 +89,22 @@ export type AIMetricsSnapshot = {
       shortEntry: number;
       shortBreak: number;
     };
+  };
+  blockedReasons: string[];
+  riskState: {
+    equity: number;
+    leverage: number;
+    startingMarginUser: number;
+    marginInUse: number;
+    drawdownPct: number;
+    dailyLossLock: boolean;
+    cooldownMsRemaining: number;
+  };
+  executionState: {
+    lastAction: AIDecisionIntent | 'NONE';
+    holdStreak: number;
+    lastAddMsAgo: number | null;
+    lastFlipMsAgo: number | null;
   };
   market: {
     price: number;
@@ -71,13 +140,36 @@ export type AIMetricsSnapshot = {
     entryPrice: number;
     unrealizedPnlPct: number;
     addsUsed: number;
+    timeInPositionMs: number;
   } | null;
 };
 
-export type AIAction = {
-  action: 'HOLD' | 'ENTRY' | 'EXIT' | 'REDUCE' | 'ADD';
-  side?: 'LONG' | 'SHORT';
+export type AIAddTrigger = {
+  minUnrealizedPnlPct: number;
+  trendIntact: boolean;
+  obiSupportMin: number;
+  deltaConfirm: boolean;
+};
+
+export type AIDecisionPlan = {
+  version: 1;
+  nonce: string;
+  intent: AIDecisionIntent;
+  side: AIDecisionSide | null;
+  urgency: AIUrgency;
+  entryStyle: AIEntryStyle;
   sizeMultiplier?: number;
+  maxAdds: number;
+  addRule: AIAddRule;
+  addTrigger: AIAddTrigger;
+  reducePct: number | null;
+  invalidationHint: AIInvalidationHint;
+  explanationTags: AIExplanationTag[];
+  confidence: number;
+};
+
+export type AIForcedAction = {
+  intent: 'HOLD' | 'EXIT' | 'MANAGE';
   reducePct?: number;
-  reason?: string;
+  reason: GuardrailReason | 'INVALID_AI_RESPONSE';
 };

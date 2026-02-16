@@ -999,16 +999,17 @@ export class Orchestrator {
         continue;
       }
 
-      const riskCheck = risk.check(symbol, side, price, sizingQty, {
-        maxPositionNotionalUsdt: marginBudget > 0 ? marginBudget * leverage * 1.02 : undefined,
-      });
-      if (!riskCheck.ok) {
+      const maxPositionNotionalUsdt = marginBudget > 0 ? marginBudget * leverage * 1.02 : 0;
+      const blockedByNotional = maxPositionNotionalUsdt > 0
+        && price > 0
+        && (sizingQty * price) > maxPositionNotionalUsdt;
+      if (blockedByNotional) {
         this.logOrderAttemptAudit({
           ...auditBase,
           qty: sizingQty,
           notional: sizingNotional,
           reasonCode: 'RISK_BLOCK',
-          error: riskCheck.reason || 'risk_blocked',
+          error: 'max_position_notional',
         });
         continue;
       }

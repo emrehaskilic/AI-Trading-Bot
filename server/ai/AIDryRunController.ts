@@ -1,11 +1,33 @@
+import { createHash } from 'crypto';
 import { DecisionLog } from '../telemetry/DecisionLog';
 import { StrategyAction, StrategyActionType, StrategyDecision, StrategyDecisionLog, StrategySide } from '../types/strategy';
 import { DryRunSessionService } from '../dryrun/DryRunSessionService';
 import { generateContent } from './GoogleAIClient';
-import { AutonomousMetricsPolicy, AutonomousPolicyDecision } from './AutonomousMetricsPolicy';
-import { AIAction, AIDryRunConfig, AIDryRunStatus, AIMetricsSnapshot } from './types';
+import { GuardrailRuntimeContext, SafetyGuardrails, clampPlanNumber } from './SafetyGuardrails';
+import {
+  AIAddRule,
+  AIDecisionIntent,
+  AIDecisionPlan,
+  AIEntryStyle,
+  AIExplanationTag,
+  AIForcedAction,
+  AIDryRunConfig,
+  AIDryRunStatus,
+  AIMetricsSnapshot,
+  AIUrgency,
+  GuardrailReason,
+} from './types';
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+
+const DEFAULT_MIN_HOLD_MS = Math.max(5_000, Number(process.env.AI_MIN_HOLD_MS || 60_000));
+const DEFAULT_FLIP_COOLDOWN_MS = Math.max(2_000, Number(process.env.AI_FLIP_COOLDOWN_MS || 45_000));
+const DEFAULT_MIN_ADD_GAP_MS = Math.max(1_000, Number(process.env.AI_MIN_ADD_GAP_MS || 20_000));
+const DEFAULT_MAX_DECISION_INTERVAL_MS = 2_500;
+const DEFAULT_MIN_DECISION_INTERVAL_MS = 500;
+const DEFAULT_ADD_MARGIN_USAGE_CAP = clamp(Number(process.env.AI_ADD_MARGIN_USAGE_CAP || 0.85), 0.3, 0.98);
+const DEFAULT_ADD_MIN_UPNL_PCT = clamp(Number(process.env.AI_ADD_MIN_UPNL_PCT || 0.0015), 0, 0.05);
+const PLAN_VERSION = 1 as const;
 
 const normalizeSide = (raw?: string | null): StrategySide | null => {
   const value = String(raw || '').trim().toUpperCase();
@@ -15,16 +37,48 @@ const normalizeSide = (raw?: string | null): StrategySide | null => {
   return null;
 };
 
-const parseFloatSafe = (value: unknown): number | undefined => {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : undefined;
-};
 const normalizeJsonCandidate = (value: string): string => {
   return String(value || '')
     .replace(/[“”]/g, '"')
     .replace(/[‘’]/g, '"')
     .replace(/,\s*([}\]])/g, '$1')
     .trim();
+};
+
+const ALLOWED_TAGS: ReadonlySet<AIExplanationTag> = new Set([
+  'OBI_UP',
+  'OBI_DOWN',
+  'DELTA_BURST',
+  'CVD_TREND_UP',
+  'CVD_TREND_DOWN',
+  'VWAP_RECLAIM',
+  'VWAP_REJECT',
+  'OI_EXPANSION',
+  'OI_CONTRACTION',
+  'ABSORPTION_BUY',
+  'ABSORPTION_SELL',
+  'SPREAD_WIDE',
+  'ACTIVITY_WEAK',
+  'RISK_LOCK',
+  'COOLDOWN_ACTIVE',
+  'INTEGRITY_FAIL',
+  'TREND_INTACT',
+  'TREND_BROKEN',
+]);
+
+type RuntimeState = {
+  lastAction: AIDecisionIntent | 'NONE';
+  lastActionSide: StrategySide | null;
+  lastEntryTs: number;
+  lastAddTs: number;
+  lastFlipTs: number;
+  lastExitSide: StrategySide | null;
+  holdStartTs: number;
+};
+
+const toTag = (raw: unknown): AIExplanationTag | null => {
+  const value = String(raw || '').trim().toUpperCase() as AIExplanationTag;
+  return ALLOWED_TAGS.has(value) ? value : null;
 };
 
 export class AIDryRunController {
@@ -34,7 +88,21 @@ export class AIDryRunController {
   private readonly lastDecisionTs = new Map<string, number>();
   private readonly pending = new Set<string>();
   private readonly holdStreak = new Map<string, number>();
-  private readonly policy = new AutonomousMetricsPolicy();
+  private readonly runtime = new Map<string, RuntimeState>();
+  private readonly guardrails = new SafetyGuardrails();
+  private nonceSeq = 0;
+  private holdDurationTotalMs = 0;
+  private holdDurationSamples = 0;
+  private readonly telemetry = {
+    invalidLLMResponses: 0,
+    repairCalls: 0,
+    guardrailBlocks: 0,
+    forcedExits: 0,
+    flipsCount: 0,
+    addsCount: 0,
+    avgHoldTimeMs: 0,
+    feePct: null as number | null,
+  };
   private lastError: string | null = null;
 
   constructor(
@@ -60,14 +128,31 @@ export class AIDryRunController {
     this.config = {
       apiKey,
       model,
-      decisionIntervalMs: Math.max(500, Number(input.decisionIntervalMs ?? 2000)),
-      temperature: Number.isFinite(input.temperature as number) ? Number(input.temperature) : 0.3,
-      maxOutputTokens: Math.max(64, Number(input.maxOutputTokens ?? 256)),
+      decisionIntervalMs: clamp(Number(input.decisionIntervalMs ?? 1000), DEFAULT_MIN_DECISION_INTERVAL_MS, DEFAULT_MAX_DECISION_INTERVAL_MS),
+      temperature: Number.isFinite(input.temperature as number) ? Number(input.temperature) : 0.1,
+      maxOutputTokens: Math.max(128, Number(input.maxOutputTokens ?? 512)),
       localOnly,
+      minHoldMs: DEFAULT_MIN_HOLD_MS,
+      flipCooldownMs: DEFAULT_FLIP_COOLDOWN_MS,
+      minAddGapMs: DEFAULT_MIN_ADD_GAP_MS,
     };
     this.active = true;
     this.lastError = null;
+    this.pending.clear();
+    this.lastDecisionTs.clear();
+    this.runtime.clear();
     this.holdStreak.clear();
+    this.nonceSeq = 0;
+    this.holdDurationTotalMs = 0;
+    this.holdDurationSamples = 0;
+    this.telemetry.invalidLLMResponses = 0;
+    this.telemetry.repairCalls = 0;
+    this.telemetry.guardrailBlocks = 0;
+    this.telemetry.forcedExits = 0;
+    this.telemetry.flipsCount = 0;
+    this.telemetry.addsCount = 0;
+    this.telemetry.avgHoldTimeMs = 0;
+    this.telemetry.feePct = null;
     this.log?.('AI_DRY_RUN_START', { symbols, model: this.config.model || null, localOnly });
   }
 
@@ -76,6 +161,7 @@ export class AIDryRunController {
     this.symbols.clear();
     this.pending.clear();
     this.holdStreak.clear();
+    this.runtime.clear();
     this.log?.('AI_DRY_RUN_STOP', {});
   }
 
@@ -88,6 +174,9 @@ export class AIDryRunController {
   }
 
   getStatus(): AIDryRunStatus {
+    this.telemetry.avgHoldTimeMs = this.holdDurationSamples > 0
+      ? Number((this.holdDurationTotalMs / this.holdDurationSamples).toFixed(2))
+      : 0;
     return {
       active: this.isActive(),
       model: this.config?.model ? this.config.model : null,
@@ -98,6 +187,7 @@ export class AIDryRunController {
       localOnly: Boolean(this.config?.localOnly),
       lastError: this.lastError,
       symbols: [...this.symbols],
+      telemetry: { ...this.telemetry },
     };
   }
 
@@ -105,526 +195,749 @@ export class AIDryRunController {
     if (!this.isActive() || !this.config) return;
     if (!this.isTrackingSymbol(snapshot.symbol)) return;
 
-    const nowMs = snapshot.timestampMs;
+    const nowMs = Number(snapshot.timestampMs || Date.now());
+    const intervalMs = this.computeAdaptiveDecisionInterval(snapshot);
     const lastTs = this.lastDecisionTs.get(snapshot.symbol) || 0;
-    if (nowMs - lastTs < this.config.decisionIntervalMs) return;
+    if (nowMs - lastTs < intervalMs) return;
     if (this.pending.has(snapshot.symbol)) return;
 
-    this.log?.('AI_DECISION_START', { symbol: snapshot.symbol, gatePassed: snapshot.decision.gatePassed, nowMs, lastTs, interval: this.config.decisionIntervalMs });
+    const runtime = this.getRuntimeState(snapshot.symbol);
+    const runtimeContext = this.buildRuntimeContext(snapshot, runtime, nowMs);
+    const preGuard = this.guardrails.evaluate(snapshot, runtimeContext, null);
+    const blockedReasons = [...new Set([...(snapshot.blockedReasons || []), ...preGuard.blockedReasons])];
+    const enrichedSnapshot = this.enrichSnapshot(snapshot, runtime, blockedReasons, runtimeContext);
+    const promptNonce = this.generatePromptNonce(snapshot.symbol, nowMs);
+    const snapshotHash = this.hashSnapshot(enrichedSnapshot, promptNonce);
+
+    this.log?.('AI_DECISION_START', {
+      symbol: snapshot.symbol,
+      gatePassed: snapshot.decision.gatePassed,
+      nowMs,
+      lastTs,
+      interval: intervalMs,
+      promptNonce,
+      blockedReasons,
+      snapshotHash,
+    });
 
     this.pending.add(snapshot.symbol);
     try {
-      const policyDecision = this.policy.decide(snapshot);
+      let proposedPlan: AIDecisionPlan;
       if (this.config.localOnly || !this.config.apiKey || !this.config.model) {
-        this.applyResolvedAction(snapshot, policyDecision.action, {
-          source: 'policy_local_only',
-          policy: policyDecision,
-        });
-        this.lastDecisionTs.set(snapshot.symbol, nowMs);
-        this.lastError = null;
-        return;
+        proposedPlan = this.buildSafeHoldPlan(promptNonce, 'LOCAL_ONLY');
+      } else {
+        const prompt = this.buildPrompt(enrichedSnapshot, promptNonce);
+        this.log?.('AI_CALLING_GEMINI', { symbol: snapshot.symbol, promptLen: prompt.length, promptNonce });
+        const response = await generateContent({
+          apiKey: this.config.apiKey,
+          model: this.config.model,
+          temperature: this.config.temperature,
+          maxOutputTokens: this.config.maxOutputTokens,
+          responseSchema: this.buildResponseSchema(),
+        }, prompt);
+
+        let plan = this.parsePlan(response.text, promptNonce);
+        if (!plan && response.text) {
+          plan = await this.retryParsePlan(promptNonce, response.text);
+        }
+        if (!plan) {
+          this.telemetry.invalidLLMResponses += 1;
+          this.lastError = 'ai_invalid_or_unparseable_response';
+          proposedPlan = this.buildSafeHoldPlan(promptNonce, 'INVALID_AI_RESPONSE');
+        } else {
+          proposedPlan = plan;
+          this.lastError = null;
+        }
       }
 
-      const prompt = this.buildPrompt(snapshot);
-      this.log?.('AI_CALLING_GEMINI', { symbol: snapshot.symbol, promptLen: prompt.length });
-      const aiConfig = {
-        apiKey: this.config.apiKey,
-        model: this.config.model,
-        temperature: this.config.temperature,
-        maxOutputTokens: this.config.maxOutputTokens,
-      };
-
-      const response = await generateContent(aiConfig, prompt);
-      this.log?.('AI_GEMINI_RESPONSE', {
-        symbol: snapshot.symbol,
-        text: response.text?.slice(0, 300) || null,
-        finishReason: response.meta?.finishReason || null,
-        blockReason: response.meta?.blockReason || null,
+      const postGuard = this.guardrails.evaluate(enrichedSnapshot, runtimeContext, proposedPlan);
+      const resolvedPlan = this.applyGuardrails(enrichedSnapshot, proposedPlan, postGuard);
+      const decision = this.buildDecision(enrichedSnapshot, resolvedPlan, {
+        promptNonce,
+        blockedReasons: postGuard.blockedReasons,
+        forcedAction: postGuard.forcedAction,
+        snapshotHash,
       });
 
-      if (!response.text) {
-        const blockReason = response.meta?.blockReason || 'none';
-        const finishReason = response.meta?.finishReason || 'none';
-        this.lastError = `ai_empty_response:block=${blockReason};finish=${finishReason}`;
-        this.log?.('AI_DRY_RUN_ERROR', {
-          symbol: snapshot.symbol,
-          error: this.lastError,
-          meta: response.meta || null,
-        });
-        this.submitFallbackPolicy(snapshot, 'empty_response', policyDecision);
-        return;
-      }
-
-      let action = this.parseAction(response.text);
-      this.log?.('AI_PARSED_ACTION', { symbol: snapshot.symbol, action });
-
-      if (!action) {
-        this.log?.('AI_PARSE_RETRY', { symbol: snapshot.symbol });
-        action = await this.retryParseAction(snapshot, response.text);
-      }
-
-      if (!action) {
-        this.lastError = 'ai_parse_failed';
-        this.log?.('AI_DRY_RUN_ERROR', {
-          symbol: snapshot.symbol,
-          error: this.lastError,
-          text: response.text.slice(0, 500),
-        });
-        this.submitFallbackPolicy(snapshot, 'parse_failed', policyDecision);
-        return;
-      }
-
-      if (action.action === 'ENTRY' && !action.side) {
-        this.lastError = 'ai_invalid_side';
-        this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError, action });
-        this.submitFallbackPolicy(snapshot, 'invalid_side', policyDecision);
-        return;
-      }
-
-      const resolved = this.applyPolicyGuardrails(snapshot, action, policyDecision);
-      this.applyResolvedAction(snapshot, resolved.action, {
-        source: resolved.source,
-        policy: policyDecision,
-      });
+      const positionBefore = enrichedSnapshot.position ? { ...enrichedSnapshot.position } : null;
+      const orders = this.dryRunSession.submitStrategyDecision(snapshot.symbol, decision, snapshot.timestampMs);
+      const positionAfter = this.dryRunSession.getStrategyPosition(snapshot.symbol);
+      const orderDetails = Array.isArray(orders)
+        ? orders.map((order: any) => ({
+          type: String(order?.type || ''),
+          side: String(order?.side || ''),
+          qty: Number(order?.qty || 0),
+          price: Number.isFinite(Number(order?.price)) ? Number(order?.price) : null,
+          reduceOnly: Boolean(order?.reduceOnly),
+          postOnly: Boolean(order?.postOnly),
+        }))
+        : [];
+      this.updateRuntime(enrichedSnapshot, runtime, resolvedPlan, nowMs, postGuard.forcedAction);
       this.lastDecisionTs.set(snapshot.symbol, nowMs);
-      this.lastError = null;
+
+      this.log?.('AI_DECISION_RESULT', {
+        symbol: snapshot.symbol,
+        promptNonce,
+        intent: resolvedPlan.intent,
+        confidence: resolvedPlan.confidence,
+        tags: resolvedPlan.explanationTags,
+        blockedReasons: postGuard.blockedReasons,
+        forcedAction: postGuard.forcedAction,
+        ordersCreated: orderDetails.length,
+        orders: orderDetails,
+        positionBefore,
+        positionAfter,
+        snapshotHash,
+      });
     } catch (error: any) {
       this.lastError = error?.message || 'ai_decision_failed';
+      this.telemetry.invalidLLMResponses += 1;
       this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError });
-      this.submitFallbackPolicy(
-        snapshot,
-        'runtime_error',
-        this.policy.decide(snapshot),
-        { error: this.lastError }
-      );
+      const forced = this.guardrails.evaluate(enrichedSnapshot, runtimeContext, null).forcedAction;
+      const safePlan = forced
+        ? this.planFromForcedAction(promptNonce, forced)
+        : this.buildSafeHoldPlan(promptNonce, 'INVALID_AI_RESPONSE');
+      const safeDecision = this.buildDecision(enrichedSnapshot, safePlan, {
+        promptNonce,
+        blockedReasons: forced ? ['RISK_LOCK'] : ['COOLDOWN_ACTIVE'],
+        forcedAction: forced,
+        snapshotHash,
+      });
+      this.dryRunSession.submitStrategyDecision(snapshot.symbol, safeDecision, snapshot.timestampMs);
+      this.lastDecisionTs.set(snapshot.symbol, nowMs);
     } finally {
       this.pending.delete(snapshot.symbol);
     }
   }
 
-  private buildPrompt(snapshot: AIMetricsSnapshot): string {
-    const pos = snapshot.position;
+  private buildPrompt(snapshot: AIMetricsSnapshot, nonce: string): string {
     const payload = {
+      nonce,
       symbol: snapshot.symbol,
       timestampMs: snapshot.timestampMs,
+      regime: snapshot.decision.regime,
+      gatePassed: snapshot.decision.gatePassed,
+      blockedReasons: snapshot.blockedReasons,
+      riskState: snapshot.riskState,
+      executionState: snapshot.executionState,
       market: snapshot.market,
       trades: snapshot.trades,
       openInterest: snapshot.openInterest,
       absorption: snapshot.absorption,
       volatility: snapshot.volatility,
-      position: pos
-        ? {
-            side: pos.side,
-            qty: pos.qty,
-            entryPrice: pos.entryPrice,
-            unrealizedPnlPct: pos.unrealizedPnlPct,
-            addsUsed: pos.addsUsed,
-        }
-        : null,
+      position: snapshot.position,
     };
 
     return [
-      'You are an AI decision engine for a futures paper-trading simulation.',
-      'Use only the provided metrics and current position.',
+      'You are the autonomous decision authority for a futures paper-trading system.',
+      'Return exactly one JSON object and no markdown.',
       '',
-      'Goal: maximize simulated risk-adjusted returns.',
+      'Hard rules:',
+      '- Echo the nonce exactly.',
+      '- version must be 1.',
+      '- intent must be one of HOLD, ENTER, MANAGE, EXIT.',
+      '- ENTER requires side LONG or SHORT.',
+      '- side must be null when intent is HOLD unless explicitly needed for context.',
+      '- sizeMultiplier must stay in [0.1, 2.0].',
+      '- maxAdds must stay in [0, 5].',
+      '- reducePct is null or in [0.1, 1.0].',
+      '- explanationTags max length is 5.',
       '',
-      'Return exactly ONE JSON object. No markdown. No extra text.',
-      'Allowed actions: HOLD, ENTRY, ADD, REDUCE, EXIT.',
+      'You should manage full lifecycle: entry, add, reduce, exit.',
+      'Prefer add-on only when winner conditions and trend integrity hold.',
       '',
-      'Rules:',
-      '- ENTRY requires side LONG or SHORT.',
-      '- ADD uses current position direction.',
-      '- sizeMultiplier range: 0.1 to 2.0.',
-      '- reducePct range: 0.1 to 1.0.',
-      '- If signal quality is weak, choose HOLD.',
-      '- Avoid repeated HOLD when flat and directional evidence is strong.',
-      '',
-      'Available metrics:',
-      '- market.price, vwap: Price level',
-      '- market.delta1s, delta5s, deltaZ: Momentum',
-      '- market.cvdSlope, obiWeighted, obiDeep, obiDivergence: Order flow',
-      '- trades.printsPerSecond, burstCount, burstSide: Activity',
-      '- openInterest.oiChangePct: Market positioning',
-      '- absorption.value, side: Large order absorption',
-      '- volatility: Risk level',
-      '',
-      'Current position:',
-      pos
-        ? `You have a ${pos.side} position: qty=${pos.qty}, entry=${pos.entryPrice}, PnL=${pos.unrealizedPnlPct.toFixed(4)}%`
-        : 'No open position.',
-      '',
-      'Output examples:',
-      '{"action":"HOLD"}',
-      '{"action":"ENTRY","side":"LONG","sizeMultiplier":0.5,"reason":"..."}',
-      '{"action":"ENTRY","side":"SHORT","sizeMultiplier":0.5,"reason":"..."}',
-      '{"action":"ADD","sizeMultiplier":0.3,"reason":"..."}',
-      '{"action":"REDUCE","reducePct":0.5,"reason":"..."}',
-      '{"action":"EXIT","reason":"..."}',
+      'JSON schema fields:',
+      '{"version":1,"nonce":"...","intent":"HOLD|ENTER|MANAGE|EXIT","side":"LONG|SHORT|null","urgency":"LOW|MED|HIGH","entryStyle":"LIMIT|MARKET_SMALL|HYBRID","sizeMultiplier":0.1,"maxAdds":0,"addRule":"WINNER_ONLY|TREND_INTACT|NEVER","addTrigger":{"minUnrealizedPnlPct":0.0015,"trendIntact":true,"obiSupportMin":0.1,"deltaConfirm":true},"reducePct":null,"invalidationHint":"VWAP|ATR|OBI_FLIP|ABSORPTION_BREAK|NONE","explanationTags":["TREND_INTACT"],"confidence":0.0}',
       '',
       'Snapshot:',
       JSON.stringify(payload),
     ].join('\n');
   }
 
-  private parseAction(text: string): AIAction | null {
-    const trimmed = String(text || '').trim();
-    if (!trimmed) return null;
-
-    const toAction = (raw: unknown): AIAction | null => {
-      if (!raw || typeof raw !== 'object') return null;
-      const parsed = raw as Record<string, unknown>;
-      const rawActionValue =
-        (typeof parsed.action === 'string' && parsed.action) ||
-        (typeof parsed.decision === 'string' && parsed.decision) ||
-        (typeof parsed.tradeAction === 'string' && parsed.tradeAction) ||
-        (typeof parsed.type === 'string' && parsed.type) ||
-        null;
-      if (!rawActionValue) return null;
-
-      const rawAction = rawActionValue.trim().toUpperCase();
-      let action: AIAction['action'] | null = null;
-      let side = normalizeSide(
-        (parsed.side as string | undefined) ||
-        (parsed.direction as string | undefined) ||
-        (parsed.positionSide as string | undefined)
-      );
-
-      if (['HOLD', 'ENTRY', 'EXIT', 'REDUCE', 'ADD'].includes(rawAction)) {
-        action = rawAction as AIAction['action'];
-      } else if (rawAction === 'ENTRY_LONG' || rawAction === 'LONG_ENTRY' || rawAction === 'OPEN_LONG') {
-        action = 'ENTRY';
-        side = side ?? 'LONG';
-      } else if (rawAction === 'ENTRY_SHORT' || rawAction === 'SHORT_ENTRY' || rawAction === 'OPEN_SHORT') {
-        action = 'ENTRY';
-        side = side ?? 'SHORT';
-      } else if (rawAction === 'BUY' || rawAction === 'LONG') {
-        action = 'ENTRY';
-        side = side ?? 'LONG';
-      } else if (rawAction === 'SELL' || rawAction === 'SHORT') {
-        action = 'ENTRY';
-        side = side ?? 'SHORT';
-      } else if (rawAction === 'NOOP' || rawAction === 'WAIT') {
-        action = 'HOLD';
-      } else {
-        return null;
-      }
-
-      return {
-        action,
-        side: side ?? undefined,
-        sizeMultiplier: parseFloatSafe(parsed.sizeMultiplier),
-        reducePct: parseFloatSafe(parsed.reducePct),
-        reason: typeof parsed.reason === 'string' ? parsed.reason : undefined,
-      };
+  private buildResponseSchema(): Record<string, unknown> {
+    return {
+      type: 'OBJECT',
+      required: ['version', 'nonce', 'intent', 'urgency', 'entryStyle', 'maxAdds', 'addRule', 'addTrigger', 'reducePct', 'invalidationHint', 'explanationTags', 'confidence'],
+      properties: {
+        version: { type: 'NUMBER', enum: [1] },
+        nonce: { type: 'STRING' },
+        intent: { type: 'STRING', enum: ['HOLD', 'ENTER', 'MANAGE', 'EXIT'] },
+        side: { type: 'STRING', enum: ['LONG', 'SHORT'] },
+        urgency: { type: 'STRING', enum: ['LOW', 'MED', 'HIGH'] },
+        entryStyle: { type: 'STRING', enum: ['LIMIT', 'MARKET_SMALL', 'HYBRID'] },
+        sizeMultiplier: { type: 'NUMBER' },
+        maxAdds: { type: 'NUMBER' },
+        addRule: { type: 'STRING', enum: ['WINNER_ONLY', 'TREND_INTACT', 'NEVER'] },
+        addTrigger: {
+          type: 'OBJECT',
+          required: ['minUnrealizedPnlPct', 'trendIntact', 'obiSupportMin', 'deltaConfirm'],
+          properties: {
+            minUnrealizedPnlPct: { type: 'NUMBER' },
+            trendIntact: { type: 'BOOLEAN' },
+            obiSupportMin: { type: 'NUMBER' },
+            deltaConfirm: { type: 'BOOLEAN' },
+          },
+        },
+        reducePct: { type: 'NUMBER' },
+        invalidationHint: { type: 'STRING', enum: ['VWAP', 'ATR', 'OBI_FLIP', 'ABSORPTION_BREAK', 'NONE'] },
+        explanationTags: { type: 'ARRAY', items: { type: 'STRING' } },
+        confidence: { type: 'NUMBER' },
+      },
     };
-
-    const extractFromParsed = (parsed: unknown): AIAction | null => {
-      const stack: unknown[] = [parsed];
-      const seen = new Set<unknown>();
-      while (stack.length > 0) {
-        const current = stack.pop();
-        if (!current || typeof current !== 'object') continue;
-        if (seen.has(current)) continue;
-        seen.add(current);
-
-        const direct = toAction(current);
-        if (direct) return direct;
-
-        if (Array.isArray(current)) {
-          for (let i = current.length - 1; i >= 0; i -= 1) {
-            stack.push(current[i]);
-          }
-          continue;
-        }
-
-        for (const value of Object.values(current as Record<string, unknown>)) {
-          if (value && typeof value === 'object') {
-            stack.push(value);
-          }
-        }
-      }
-      return null;
-    };
-
-    const candidates: string[] = [];
-    const seen = new Set<string>();
-    const pushCandidate = (value: string) => {
-      const raw = value.trim();
-      if (!raw) return;
-      const normalized = normalizeJsonCandidate(raw);
-      for (const candidate of [raw, normalized]) {
-        if (!candidate || seen.has(candidate)) continue;
-        seen.add(candidate);
-        candidates.push(candidate);
-      }
-    };
-
-    pushCandidate(trimmed);
-
-    const fenceMatches = [...trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)];
-    for (const match of fenceMatches) {
-      if (match[1]) pushCandidate(match[1]);
-    }
-
-    const start = trimmed.indexOf('{');
-    const end = trimmed.lastIndexOf('}');
-    if (start >= 0 && end > start) {
-      pushCandidate(trimmed.slice(start, end + 1));
-    }
-
-    const objectMatches = trimmed.match(/\{[\s\S]*?\}/g);
-    if (objectMatches) {
-      for (const m of objectMatches) {
-        pushCandidate(m);
-      }
-    }
-
-    for (const candidate of candidates) {
-      try {
-        const parsed = JSON.parse(candidate);
-        const action = extractFromParsed(parsed);
-        if (action) return action;
-      } catch {
-        continue;
-      }
-    }
-
-    if (/^\s*(HOLD|WAIT|NOOP)\s*$/i.test(trimmed)) {
-      return { action: 'HOLD' };
-    }
-    if (/\b(BUY|LONG)\b/i.test(trimmed)) {
-      return { action: 'ENTRY', side: 'LONG' };
-    }
-    if (/\b(SELL|SHORT)\b/i.test(trimmed)) {
-      return { action: 'ENTRY', side: 'SHORT' };
-    }
-
-    return null;
   }
 
-  private buildRepairPrompt(rawText: string): string {
-    return [
-      'Convert the following content into ONE valid JSON action object only.',
-      'Allowed action values: HOLD, ENTRY, ADD, REDUCE, EXIT.',
-      'For ENTRY include side LONG or SHORT.',
-      'Return only JSON with no markdown and no explanation.',
+  private parsePlan(text: string | null, expectedNonce: string): AIDecisionPlan | null {
+    const raw = this.extractJsonObject(text);
+    if (!raw) return null;
+
+    let parsed: Record<string, unknown>;
+    try {
+      const json = JSON.parse(raw);
+      if (!json || typeof json !== 'object' || Array.isArray(json)) return null;
+      parsed = json as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+
+    const version = Number(parsed.version);
+    const nonce = String(parsed.nonce || '');
+    if (version !== PLAN_VERSION || nonce !== expectedNonce) return null;
+
+    const intent = this.parseIntent(parsed.intent);
+    if (!intent) return null;
+
+    const side = normalizeSide(String(parsed.side || '')) as 'LONG' | 'SHORT' | null;
+    if (intent === 'ENTER' && !side) return null;
+
+    const urgency = this.parseUrgency(parsed.urgency);
+    const entryStyle = this.parseEntryStyle(parsed.entryStyle);
+    const addRule = this.parseAddRule(parsed.addRule);
+    const invalidationHint = this.parseInvalidationHint(parsed.invalidationHint);
+    const confidence = clampPlanNumber(Number(parsed.confidence), 0, 1);
+    const sizeMultiplier = clampPlanNumber(Number(parsed.sizeMultiplier ?? 1), 0.1, 2);
+    const maxAdds = clamp(Math.trunc(Number(parsed.maxAdds ?? 0)), 0, 5);
+
+    const addTriggerInput = parsed.addTrigger && typeof parsed.addTrigger === 'object'
+      ? parsed.addTrigger as Record<string, unknown>
+      : {};
+    const addTrigger = {
+      minUnrealizedPnlPct: clampPlanNumber(Number(addTriggerInput.minUnrealizedPnlPct ?? DEFAULT_ADD_MIN_UPNL_PCT), 0, 0.05),
+      trendIntact: Boolean(addTriggerInput.trendIntact),
+      obiSupportMin: clampPlanNumber(Number(addTriggerInput.obiSupportMin ?? 0.1), -1, 1),
+      deltaConfirm: Boolean(addTriggerInput.deltaConfirm),
+    };
+
+    const reduceRaw = parsed.reducePct;
+    const reducePct = reduceRaw == null
+      ? null
+      : clampPlanNumber(Number(reduceRaw), 0.1, 1);
+
+    const explanationTags = Array.isArray(parsed.explanationTags)
+      ? parsed.explanationTags.map(toTag).filter((v): v is AIExplanationTag => Boolean(v)).slice(0, 5)
+      : [];
+
+    return {
+      version: PLAN_VERSION,
+      nonce,
+      intent,
+      side: side ?? null,
+      urgency,
+      entryStyle,
+      sizeMultiplier,
+      maxAdds,
+      addRule,
+      addTrigger,
+      reducePct,
+      invalidationHint,
+      explanationTags,
+      confidence,
+    };
+  }
+
+  private extractJsonObject(text: string | null): string | null {
+    const trimmed = normalizeJsonCandidate(String(text || '').trim());
+    if (!trimmed) return null;
+    const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const candidate = fenced && fenced[1] ? normalizeJsonCandidate(fenced[1]) : trimmed;
+    if (!candidate.startsWith('{') || !candidate.endsWith('}')) return null;
+    return candidate;
+  }
+
+  private async retryParsePlan(expectedNonce: string, rawText: string): Promise<AIDecisionPlan | null> {
+    if (!this.config || !this.config.apiKey || !this.config.model) return null;
+    this.telemetry.repairCalls += 1;
+    const retryPrompt = [
+      'Return one valid JSON object only.',
+      'Do not include markdown or explanation.',
+      `Nonce must be exactly: ${expectedNonce}`,
+      'version must be 1.',
+      'intent must be HOLD, ENTER, MANAGE, or EXIT.',
       'Input:',
       rawText.slice(0, 4000),
     ].join('\n');
-  }
-
-  private async retryParseAction(snapshot: AIMetricsSnapshot, rawText: string): Promise<AIAction | null> {
-    if (!this.config || !this.config.apiKey || !this.config.model) return null;
     try {
-      const retryPrompt = this.buildRepairPrompt(rawText);
       const retryResponse = await generateContent({
         apiKey: this.config.apiKey,
         model: this.config.model,
-        temperature: this.config.temperature,
+        temperature: 0,
         maxOutputTokens: this.config.maxOutputTokens,
+        responseSchema: this.buildResponseSchema(),
       }, retryPrompt);
-      this.log?.('AI_GEMINI_RESPONSE', {
-        symbol: snapshot.symbol,
-        text: retryResponse.text?.slice(0, 300) || null,
-        finishReason: retryResponse.meta?.finishReason || null,
-        blockReason: retryResponse.meta?.blockReason || null,
-        retry: true,
-      });
-      if (!retryResponse.text) return null;
-      return this.parseAction(retryResponse.text);
+      return this.parsePlan(retryResponse.text, expectedNonce);
     } catch {
       return null;
     }
   }
 
-  private submitFallbackPolicy(
+  private applyGuardrails(
     snapshot: AIMetricsSnapshot,
-    fallback: 'empty_response' | 'parse_failed' | 'invalid_side' | 'runtime_error',
-    policy: AutonomousPolicyDecision,
-    details?: Record<string, unknown>
-  ): void {
-    const action = policy.action;
-    const source = action.action === 'HOLD' ? 'policy_fallback_hold' : 'policy_fallback_trade';
-    this.applyResolvedAction(snapshot, action, {
-      source,
-      fallback,
-      policy,
-      extraMeta: details,
-    });
-    this.lastDecisionTs.set(snapshot.symbol, snapshot.timestampMs);
-    this.log?.('AI_FALLBACK_POLICY', {
-      symbol: snapshot.symbol,
-      fallback,
-      action: action.action,
-      side: action.side || null,
-      confidence: policy.confidence,
-    });
-  }
-
-  private applyPolicyGuardrails(
-    snapshot: AIMetricsSnapshot,
-    aiAction: AIAction,
-    policy: AutonomousPolicyDecision
-  ): { action: AIAction; source: string } {
-    if (!snapshot.position && (aiAction.action === 'ADD' || aiAction.action === 'REDUCE' || aiAction.action === 'EXIT')) {
-      return { action: policy.action, source: 'policy_flat_state_override' };
+    plan: AIDecisionPlan,
+    guardrails: ReturnType<SafetyGuardrails['evaluate']>
+  ): AIDecisionPlan {
+    if (guardrails.forcedAction) {
+      this.telemetry.forcedExits += 1;
+      return this.planFromForcedAction(plan.nonce, guardrails.forcedAction);
     }
 
-    if (aiAction.action === 'HOLD') {
-      const nextHoldStreak = (this.holdStreak.get(snapshot.symbol) || 0) + 1;
-      const allowOverride = policy.action.action !== 'HOLD'
-        && policy.confidence >= 0.78
-        && (nextHoldStreak >= 2 || !snapshot.position);
-      if (allowOverride) {
-        return { action: policy.action, source: 'policy_override_ai_hold' };
+    if (plan.intent === 'ENTER') {
+      if (guardrails.blockEntry) {
+        this.telemetry.guardrailBlocks += 1;
+        return this.buildSafeHoldPlan(plan.nonce, 'RISK_LOCK');
       }
-      return { action: aiAction, source: 'ai' };
-    }
-    return { action: aiAction, source: 'ai' };
-  }
-
-  private applyResolvedAction(
-    snapshot: AIMetricsSnapshot,
-    action: AIAction,
-    context: {
-      source: string;
-      fallback?: string;
-      policy?: AutonomousPolicyDecision;
-      extraMeta?: Record<string, unknown>;
-    }
-  ): void {
-    if (action.action === 'HOLD') {
-      this.holdStreak.set(snapshot.symbol, (this.holdStreak.get(snapshot.symbol) || 0) + 1);
-    } else {
-      this.holdStreak.set(snapshot.symbol, 0);
-    }
-
-    const decision = this.buildDecision(snapshot, action, {
-      source: context.source,
-      fallback: context.fallback,
-      policyConfidence: context.policy?.confidence,
-      policyDiagnostics: context.policy?.diagnostics,
-      ...(context.extraMeta || {}),
-    });
-    if (decision.actions.length > 0 || decision.reasons.includes('NOOP')) {
-      if (decision.actions.length > 0) {
-        this.log?.('AI_SUBMITTING_DECISION', {
-          symbol: snapshot.symbol,
-          source: context.source,
-          actions: decision.actions.map((a) => ({ type: a.type, side: (a as any).side, reason: a.reason })),
-          policyConfidence: context.policy?.confidence ?? null,
-        });
+      if (snapshot.position && plan.side && snapshot.position.side !== plan.side && guardrails.blockFlip) {
+        this.telemetry.guardrailBlocks += 1;
+        return this.buildSafeHoldPlan(plan.nonce, 'FLIP_COOLDOWN_ACTIVE');
       }
-      this.dryRunSession.submitStrategyDecision(snapshot.symbol, decision, snapshot.timestampMs);
     }
-    this.recordDecisionLog(snapshot, decision, action);
+
+    if (plan.intent === 'MANAGE') {
+      const isAddIntent = this.planImpliesAdd(plan);
+      if (isAddIntent && guardrails.blockAdd) {
+        this.telemetry.guardrailBlocks += 1;
+        return this.buildSafeHoldPlan(plan.nonce, 'ADD_GAP_ACTIVE');
+      }
+    }
+
+    if (plan.intent === 'EXIT' && guardrails.blockFlip) {
+      this.telemetry.guardrailBlocks += 1;
+      return this.buildSafeHoldPlan(plan.nonce, 'MIN_HOLD_ACTIVE');
+    }
+
+    return plan;
   }
 
   private buildDecision(
     snapshot: AIMetricsSnapshot,
-    aiAction: AIAction,
-    contextMeta?: Record<string, unknown>
+    plan: AIDecisionPlan,
+    context: {
+      promptNonce: string;
+      blockedReasons: GuardrailReason[];
+      forcedAction: AIForcedAction | null;
+      snapshotHash: string;
+    }
   ): StrategyDecision {
     const actions: StrategyAction[] = [];
-    const nowMs = snapshot.timestampMs;
-    const regime = snapshot.decision.regime;
+    const side = plan.side ? (plan.side as StrategySide) : null;
 
-    if (aiAction.action === 'HOLD') {
+    if (plan.intent === 'HOLD') {
       actions.push({
         type: StrategyActionType.NOOP,
         reason: 'NOOP',
-        metadata: {
-          ai: true,
-          note: aiAction.reason || null,
-          ...(contextMeta || {}),
-        },
+        metadata: { ai: true, plan, context },
       });
-    }
-
-    if (aiAction.action === 'ENTRY' && aiAction.side) {
+    } else if (plan.intent === 'ENTER' && side) {
       actions.push({
         type: StrategyActionType.ENTRY,
-        side: aiAction.side as StrategySide,
+        side,
         reason: 'ENTRY_TR',
         expectedPrice: snapshot.market.price,
-        sizeMultiplier: clamp(Number(aiAction.sizeMultiplier ?? 1), 0.1, 2),
-        metadata: { ai: true, note: aiAction.reason || null, ...(contextMeta || {}) },
+        sizeMultiplier: clampPlanNumber(Number(plan.sizeMultiplier ?? 1), 0.1, 2),
+        metadata: { ai: true, plan, context },
       });
+    } else if (plan.intent === 'MANAGE') {
+      if (plan.reducePct != null) {
+        actions.push({
+          type: StrategyActionType.REDUCE,
+          reason: 'REDUCE_SOFT',
+          reducePct: clampPlanNumber(plan.reducePct, 0.1, 1),
+          metadata: { ai: true, plan, context },
+        });
+      } else if (this.shouldAllowAdd(snapshot, plan)) {
+        actions.push({
+          type: StrategyActionType.ADD,
+          side: snapshot.position?.side,
+          reason: 'AI_ADD',
+          expectedPrice: snapshot.market.price,
+          sizeMultiplier: clampPlanNumber(Number(plan.sizeMultiplier ?? 0.5), 0.1, 2),
+          metadata: {
+            ai: true,
+            plan,
+            context,
+            incrementalRiskCapPct: 0.25,
+          },
+        });
+      } else {
+        actions.push({
+          type: StrategyActionType.NOOP,
+          reason: 'NOOP',
+          metadata: { ai: true, plan, context, note: 'manage_add_conditions_not_met' },
+        });
+      }
+    } else if (plan.intent === 'EXIT') {
+      if (plan.reducePct != null && plan.reducePct < 1) {
+        actions.push({
+          type: StrategyActionType.REDUCE,
+          reason: 'REDUCE_SOFT',
+          reducePct: clampPlanNumber(plan.reducePct, 0.1, 1),
+          metadata: { ai: true, plan, context },
+        });
+      } else {
+        actions.push({
+          type: StrategyActionType.EXIT,
+          reason: 'EXIT_HARD',
+          metadata: { ai: true, plan, context },
+        });
+      }
     }
 
-    if (aiAction.action === 'ADD') {
+    if (actions.length === 0) {
       actions.push({
-        type: StrategyActionType.ADD,
-        side: undefined,
-        reason: 'AI_ADD',
-        expectedPrice: snapshot.market.price,
-        sizeMultiplier: clamp(Number(aiAction.sizeMultiplier ?? 0.5), 0.1, 2),
-        metadata: { ai: true, note: aiAction.reason || null, ...(contextMeta || {}) },
+        type: StrategyActionType.NOOP,
+        reason: 'NOOP',
+        metadata: { ai: true, plan, context, note: 'empty_action_fallback' },
       });
     }
 
-    if (aiAction.action === 'REDUCE') {
-      actions.push({
-        type: StrategyActionType.REDUCE,
-        reason: 'REDUCE_SOFT',
-        reducePct: clamp(Number(aiAction.reducePct ?? 0.5), 0.1, 1),
-        metadata: { ai: true, note: aiAction.reason || null, ...(contextMeta || {}) },
-      });
-    }
-
-    if (aiAction.action === 'EXIT') {
-      actions.push({
-        type: StrategyActionType.EXIT,
-        reason: 'EXIT_HARD',
-        metadata: { ai: true, note: aiAction.reason || null, ...(contextMeta || {}) },
-      });
-    }
-
-    if (actions.length === 0 && aiAction.action !== 'HOLD') {
-      actions.push({ type: StrategyActionType.NOOP, reason: 'NOOP', metadata: { ai: true, note: 'invalid_action_fallback' } });
-    }
-
+    const reasons = actions.map((a) => a.reason);
     const log: StrategyDecisionLog = {
-      timestampMs: nowMs,
+      timestampMs: snapshot.timestampMs,
       symbol: snapshot.symbol,
-      regime,
-      gate: { passed: snapshot.decision.gatePassed, reason: null, details: { ai: true } },
+      regime: snapshot.decision.regime,
+      gate: {
+        passed: snapshot.decision.gatePassed,
+        reason: null,
+        details: {
+          ai: true,
+          promptNonce: context.promptNonce,
+          blockedReasons: context.blockedReasons,
+          forcedAction: context.forcedAction,
+          snapshotHash: context.snapshotHash,
+        },
+      },
       dfs: snapshot.decision.dfs,
       dfsPercentile: snapshot.decision.dfsPercentile,
       volLevel: snapshot.decision.volLevel,
       thresholds: snapshot.decision.thresholds,
-      reasons: actions.map((a) => a.reason),
+      reasons,
       actions,
       stats: {
         aiDecision: 1,
-        policyConfidence: Number(contextMeta?.policyConfidence ?? 0) || null,
+        aiConfidence: plan.confidence,
       },
     };
 
-    return {
+    const decision: StrategyDecision = {
       symbol: snapshot.symbol,
-      timestampMs: nowMs,
-      regime,
+      timestampMs: snapshot.timestampMs,
+      regime: snapshot.decision.regime,
       dfs: snapshot.decision.dfs,
       dfsPercentile: snapshot.decision.dfsPercentile,
       volLevel: snapshot.decision.volLevel,
       gatePassed: snapshot.decision.gatePassed,
-      reasons: actions.map((a) => a.reason),
       actions,
+      reasons,
       log,
+    };
+
+    this.recordDecisionLog(decision, plan.intent);
+    return decision;
+  }
+
+  private shouldAllowAdd(snapshot: AIMetricsSnapshot, plan: AIDecisionPlan): boolean {
+    const position = snapshot.position;
+    if (!position) return false;
+    if (plan.addRule === 'NEVER') return false;
+    if (position.addsUsed >= plan.maxAdds) return false;
+    if (!snapshot.decision.gatePassed) return false;
+
+    const marginUsage = snapshot.riskState.equity > 0
+      ? snapshot.riskState.marginInUse / snapshot.riskState.equity
+      : 0;
+    if (marginUsage >= DEFAULT_ADD_MARGIN_USAGE_CAP) return false;
+
+    const minUpnl = clampPlanNumber(plan.addTrigger.minUnrealizedPnlPct, 0, 0.05);
+    const upnl = Number(position.unrealizedPnlPct || 0);
+    const sideSign = position.side === 'LONG' ? 1 : -1;
+
+    const deltaAligned = plan.addTrigger.deltaConfirm
+      ? sideSign * (snapshot.market.delta5s + snapshot.market.delta1s) > 0
+      : true;
+
+    const obiSupport = sideSign > 0
+      ? snapshot.market.obiDeep >= plan.addTrigger.obiSupportMin
+      : snapshot.market.obiDeep <= -Math.abs(plan.addTrigger.obiSupportMin);
+
+    if (!deltaAligned || !obiSupport) return false;
+
+    if (plan.addRule === 'WINNER_ONLY') {
+      return upnl >= Math.max(minUpnl, DEFAULT_ADD_MIN_UPNL_PCT) && Boolean(plan.addTrigger.trendIntact);
+    }
+
+    if (plan.addRule === 'TREND_INTACT') {
+      return Boolean(plan.addTrigger.trendIntact) && upnl >= 0;
+    }
+
+    return false;
+  }
+
+  private updateRuntime(
+    snapshot: AIMetricsSnapshot,
+    runtime: RuntimeState,
+    plan: AIDecisionPlan,
+    nowMs: number,
+    forcedAction: AIForcedAction | null
+  ): void {
+    const previousAction = runtime.lastAction;
+    if (plan.intent === 'HOLD') {
+      this.holdStreak.set(snapshot.symbol, (this.holdStreak.get(snapshot.symbol) || 0) + 1);
+      if (runtime.holdStartTs <= 0) {
+        runtime.holdStartTs = nowMs;
+      }
+    } else {
+      this.holdStreak.set(snapshot.symbol, 0);
+      if (runtime.holdStartTs > 0) {
+        const holdDuration = Math.max(0, nowMs - runtime.holdStartTs);
+        this.holdDurationTotalMs += holdDuration;
+        this.holdDurationSamples += 1;
+        runtime.holdStartTs = 0;
+      }
+    }
+
+    if (plan.intent === 'ENTER' && plan.side) {
+      const targetSide = plan.side as StrategySide;
+      if (snapshot.position && snapshot.position.side !== targetSide) {
+        runtime.lastFlipTs = nowMs;
+        runtime.lastExitSide = snapshot.position.side;
+        this.telemetry.flipsCount += 1;
+      }
+      runtime.lastEntryTs = nowMs;
+      runtime.lastActionSide = targetSide;
+    }
+
+    if (plan.intent === 'MANAGE' && this.planImpliesAdd(plan) && this.shouldAllowAdd(snapshot, plan)) {
+      runtime.lastAddTs = nowMs;
+      this.telemetry.addsCount += 1;
+    }
+
+    if (plan.intent === 'EXIT' && snapshot.position) {
+      runtime.lastFlipTs = nowMs;
+      runtime.lastExitSide = snapshot.position.side;
+    }
+
+    if (forcedAction && forcedAction.intent === 'EXIT') {
+      runtime.lastFlipTs = nowMs;
+      if (snapshot.position) {
+        runtime.lastExitSide = snapshot.position.side;
+      }
+    }
+
+    runtime.lastAction = plan.intent;
+    if (previousAction === 'HOLD' && plan.intent !== 'HOLD' && runtime.holdStartTs > 0) {
+      const holdDuration = Math.max(0, nowMs - runtime.holdStartTs);
+      this.holdDurationTotalMs += holdDuration;
+      this.holdDurationSamples += 1;
+      runtime.holdStartTs = 0;
+    }
+  }
+
+  private buildSafeHoldPlan(nonce: string, tag: GuardrailReason | 'LOCAL_ONLY' | 'INVALID_AI_RESPONSE'): AIDecisionPlan {
+    return {
+      version: PLAN_VERSION,
+      nonce,
+      intent: 'HOLD',
+      side: null,
+      urgency: 'LOW',
+      entryStyle: 'LIMIT',
+      sizeMultiplier: 0.1,
+      maxAdds: 0,
+      addRule: 'NEVER',
+      addTrigger: {
+        minUnrealizedPnlPct: DEFAULT_ADD_MIN_UPNL_PCT,
+        trendIntact: false,
+        obiSupportMin: 0,
+        deltaConfirm: false,
+      },
+      reducePct: null,
+      invalidationHint: 'NONE',
+      explanationTags: [tag === 'INVALID_AI_RESPONSE' ? 'RISK_LOCK' : 'COOLDOWN_ACTIVE'],
+      confidence: 0,
     };
   }
 
-  private recordDecisionLog(snapshot: AIMetricsSnapshot, decision: StrategyDecision, action: AIAction): void {
+  private planFromForcedAction(nonce: string, forced: AIForcedAction): AIDecisionPlan {
+    if (forced.intent === 'EXIT') {
+      return {
+        ...this.buildSafeHoldPlan(nonce, forced.reason),
+        intent: 'EXIT',
+        confidence: 1,
+      };
+    }
+    if (forced.intent === 'MANAGE') {
+      return {
+        ...this.buildSafeHoldPlan(nonce, forced.reason),
+        intent: 'MANAGE',
+        reducePct: clampPlanNumber(Number(forced.reducePct ?? 0.5), 0.1, 1),
+        confidence: 1,
+      };
+    }
+    return this.buildSafeHoldPlan(nonce, forced.reason);
+  }
+
+  private planImpliesAdd(plan: AIDecisionPlan): boolean {
+    return plan.intent === 'MANAGE' && plan.reducePct == null && plan.addRule !== 'NEVER';
+  }
+
+  private parseIntent(raw: unknown): AIDecisionIntent | null {
+    const value = String(raw || '').trim().toUpperCase();
+    return value === 'HOLD' || value === 'ENTER' || value === 'MANAGE' || value === 'EXIT'
+      ? value
+      : null;
+  }
+
+  private parseUrgency(raw: unknown): AIUrgency {
+    const value = String(raw || '').trim().toUpperCase();
+    if (value === 'LOW' || value === 'MED' || value === 'HIGH') return value;
+    return 'MED';
+  }
+
+  private parseEntryStyle(raw: unknown): AIEntryStyle {
+    const value = String(raw || '').trim().toUpperCase();
+    if (value === 'LIMIT' || value === 'MARKET_SMALL' || value === 'HYBRID') return value;
+    return 'HYBRID';
+  }
+
+  private parseAddRule(raw: unknown): AIAddRule {
+    const value = String(raw || '').trim().toUpperCase();
+    if (value === 'WINNER_ONLY' || value === 'TREND_INTACT' || value === 'NEVER') return value;
+    return 'WINNER_ONLY';
+  }
+
+  private parseInvalidationHint(raw: unknown): AIDecisionPlan['invalidationHint'] {
+    const value = String(raw || '').trim().toUpperCase();
+    if (value === 'VWAP' || value === 'ATR' || value === 'OBI_FLIP' || value === 'ABSORPTION_BREAK' || value === 'NONE') {
+      return value;
+    }
+    return 'NONE';
+  }
+
+  private getRuntimeState(symbol: string): RuntimeState {
+    let state = this.runtime.get(symbol);
+    if (!state) {
+      state = {
+        lastAction: 'NONE',
+        lastActionSide: null,
+        lastEntryTs: 0,
+        lastAddTs: 0,
+        lastFlipTs: 0,
+        lastExitSide: null,
+        holdStartTs: 0,
+      };
+      this.runtime.set(symbol, state);
+    }
+    return state;
+  }
+
+  private computeAdaptiveDecisionInterval(snapshot: AIMetricsSnapshot): number {
+    if (!this.config) return 1000;
+    const base = clamp(this.config.decisionIntervalMs, DEFAULT_MIN_DECISION_INTERVAL_MS, DEFAULT_MAX_DECISION_INTERVAL_MS);
+    const prints = snapshot.trades.printsPerSecond;
+    const burst = snapshot.trades.burstCount;
+    const tradeCount = snapshot.trades.tradeCount;
+
+    let factor = 1;
+    if (prints >= 8 || burst >= 6 || tradeCount >= 40) {
+      factor = 0.6;
+    } else if (prints <= 1 || tradeCount <= 6) {
+      factor = 1.8;
+    } else if (prints >= 4 || burst >= 3) {
+      factor = 0.8;
+    }
+
+    return clamp(Math.round(base * factor), DEFAULT_MIN_DECISION_INTERVAL_MS, DEFAULT_MAX_DECISION_INTERVAL_MS);
+  }
+
+  private buildRuntimeContext(snapshot: AIMetricsSnapshot, runtime: RuntimeState, nowMs: number): GuardrailRuntimeContext {
+    if (!this.config) {
+      return { nowMs, minHoldMsRemaining: 0, flipCooldownMsRemaining: 0, addGapMsRemaining: 0 };
+    }
+    const minHoldMsRemaining = runtime.lastEntryTs > 0
+      ? Math.max(0, this.config.minHoldMs - Math.max(0, nowMs - runtime.lastEntryTs))
+      : Math.max(0, Number(snapshot.riskState.cooldownMsRemaining || 0));
+    const flipCooldownMsRemaining = runtime.lastFlipTs > 0
+      ? Math.max(0, this.config.flipCooldownMs - Math.max(0, nowMs - runtime.lastFlipTs))
+      : 0;
+    const addGapMsRemaining = runtime.lastAddTs > 0
+      ? Math.max(0, this.config.minAddGapMs - Math.max(0, nowMs - runtime.lastAddTs))
+      : 0;
+    return { nowMs, minHoldMsRemaining, flipCooldownMsRemaining, addGapMsRemaining };
+  }
+
+  private enrichSnapshot(
+    snapshot: AIMetricsSnapshot,
+    runtime: RuntimeState,
+    blockedReasons: string[],
+    runtimeContext: GuardrailRuntimeContext
+  ): AIMetricsSnapshot {
+    const nowMs = Number(snapshot.timestampMs || Date.now());
+    const holdStreak = this.holdStreak.get(snapshot.symbol) || 0;
+    return {
+      ...snapshot,
+      blockedReasons,
+      riskState: {
+        ...snapshot.riskState,
+        cooldownMsRemaining: Math.max(
+          Number(snapshot.riskState.cooldownMsRemaining || 0),
+          runtimeContext.minHoldMsRemaining,
+          runtimeContext.flipCooldownMsRemaining
+        ),
+      },
+      executionState: {
+        lastAction: runtime.lastAction,
+        holdStreak,
+        lastAddMsAgo: runtime.lastAddTs > 0 ? Math.max(0, nowMs - runtime.lastAddTs) : null,
+        lastFlipMsAgo: runtime.lastFlipTs > 0 ? Math.max(0, nowMs - runtime.lastFlipTs) : null,
+      },
+      position: snapshot.position
+        ? {
+          ...snapshot.position,
+          timeInPositionMs: Math.max(0, Number(snapshot.position.timeInPositionMs || 0)),
+        }
+        : null,
+    };
+  }
+
+  private generatePromptNonce(symbol: string, nowMs: number): string {
+    this.nonceSeq += 1;
+    return `${symbol}-${nowMs}-${this.nonceSeq}`;
+  }
+
+  private hashSnapshot(snapshot: AIMetricsSnapshot, nonce: string): string {
+    return createHash('sha256')
+      .update(JSON.stringify({ nonce, snapshot }))
+      .digest('hex')
+      .slice(0, 16);
+  }
+
+  private recordDecisionLog(decision: StrategyDecision, intent: AIDecisionIntent): void {
     if (!this.decisionLog) return;
     const payload: StrategyDecisionLog = {
       ...decision.log,
       stats: {
         ...decision.log.stats,
-        aiAction: ['HOLD', 'ENTRY', 'EXIT', 'REDUCE', 'ADD'].indexOf(action.action),
+        aiIntent: ['HOLD', 'ENTER', 'MANAGE', 'EXIT'].indexOf(intent),
       },
     };
     this.decisionLog.record(payload);
   }
 }
+

@@ -104,6 +104,7 @@ export interface StrategyPositionState {
   entryPrice: number;
   unrealizedPnlPct: number;
   addsUsed: number;
+  timeInPositionMs?: number;
   peakPnlPct?: number;
 }
 
