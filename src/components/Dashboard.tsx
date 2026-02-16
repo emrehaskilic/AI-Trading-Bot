@@ -1,11 +1,14 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import LiveTelemetryDashboard from './LiveTelemetryDashboard';
 import DryRunDashboard from './DryRunDashboard';
+import AIDryRunDashboard from './AIDryRunDashboard';
 
-type AppTab = 'telemetry' | 'dry-run';
+type AppTab = 'telemetry' | 'dry-run' | 'ai-dry-run';
 
 function tabFromHash(hash: string): AppTab {
-  return hash === '#dry-run' ? 'dry-run' : 'telemetry';
+  if (hash === '#dry-run') return 'dry-run';
+  if (hash === '#ai-dry-run') return 'ai-dry-run';
+  return 'telemetry';
 }
 
 const Dashboard: React.FC = () => {
@@ -22,11 +25,16 @@ const Dashboard: React.FC = () => {
   const tabs = useMemo<Array<{ id: AppTab; label: string }>>(() => ([
     { id: 'telemetry', label: 'Live Telemetry' },
     { id: 'dry-run', label: 'Dry Run' },
+    { id: 'ai-dry-run', label: 'AI Dry Run' },
   ]), []);
 
   const setTab = (tab: AppTab) => {
     setActiveTab(tab);
-    const hash = tab === 'dry-run' ? '#dry-run' : '#telemetry';
+    const hash = tab === 'dry-run'
+      ? '#dry-run'
+      : tab === 'ai-dry-run'
+        ? '#ai-dry-run'
+        : '#telemetry';
     if (window.location.hash !== hash) {
       window.history.replaceState(null, '', hash);
     }
@@ -55,7 +63,11 @@ const Dashboard: React.FC = () => {
         </div>
       </div>
 
-      {activeTab === 'dry-run' ? <DryRunDashboard /> : <LiveTelemetryDashboard />}
+      {activeTab === 'dry-run'
+        ? <DryRunDashboard />
+        : activeTab === 'ai-dry-run'
+          ? <AIDryRunDashboard />
+          : <LiveTelemetryDashboard />}
     </div>
   );
 };

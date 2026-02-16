@@ -51,6 +51,7 @@ import { SnapshotTracker } from './telemetry/Snapshot';
 import { apiKeyMiddleware, validateWebSocketApiKey } from './auth/apiKey';
 import { NewStrategyV11 } from './strategy/NewStrategyV11';
 import { DecisionLog } from './telemetry/DecisionLog';
+import { AIDryRunController } from './ai/AIDryRunController';
 import { DryRunConfig, DryRunEngine, DryRunEventInput, DryRunSessionService, isUpstreamGuardError } from './dryrun';
 import { logger, requestLogger, serializeError } from './utils/logger';
 import { WebSocketManager } from './ws/WebSocketManager';
@@ -243,6 +244,7 @@ const alertService = new AlertService(alertConfig);
 const notificationService = new NotificationService(alertConfig);
 const orchestrator = createOrchestratorFromEnv(alertService);
 const dryRunSession = new DryRunSessionService(alertService);
+const aiDryRun = new AIDryRunController(dryRunSession, decisionLog, log);
 const abTestManager = new ABTestManager(alertService);
 const marketArchive = new MarketDataArchive();
 const signalReplay = new SignalReplay(marketArchive);
@@ -1041,7 +1043,45 @@ async function processSymbolEvent(s: string, d: any) {
 
         // [DRY RUN INTEGRATION]
         const isDryRunTracked = dryRunSession.isTrackingSymbol(s);
-        if (isDryRunTracked) {
+        const aiActive = aiDryRun.isActive() && aiDryRun.isTrackingSymbol(s);
+        if (aiActive) {
+            void aiDryRun.onMetrics({
+                symbol: s,
+                timestampMs: Number(t || now),
+                decision: {
+                    regime: decision.regime,
+                    dfs: decision.dfs,
+                    dfsPercentile: decision.dfsPercentile,
+                    volLevel: decision.volLevel,
+                    gatePassed: decision.gatePassed,
+                    thresholds: decision.log.thresholds,
+                },
+                market: {
+                    price: p,
+                    vwap: legMetrics?.vwap || mid || p,
+                    spreadPct,
+                    delta1s: legMetrics?.delta1s || 0,
+                    delta5s: legMetrics?.delta5s || 0,
+                    deltaZ: legMetrics?.deltaZ || 0,
+                    cvdSlope: legMetrics?.cvdSlope || 0,
+                    obiWeighted: legMetrics?.obiWeighted || 0,
+                    obiDeep: legMetrics?.obiDeep || 0,
+                    obiDivergence: legMetrics?.obiDivergence || 0,
+                },
+                trades: {
+                    printsPerSecond: tasMetrics.printsPerSecond,
+                    tradeCount: tasMetrics.tradeCount,
+                    aggressiveBuyVolume: tasMetrics.aggressiveBuyVolume,
+                    aggressiveSellVolume: tasMetrics.aggressiveSellVolume,
+                    burstCount: tasMetrics.consecutiveBurst.count,
+                    burstSide: tasMetrics.consecutiveBurst.side,
+                },
+                openInterest: { oiChangePct: oiMetrics ? oiMetrics.oiChangePct : null },
+                absorption: { value: absVal, side: absVal ? side : null },
+                volatility: backfill.getState().atr || 0,
+                position: dryRunSession.getStrategyPosition(s),
+            });
+        } else if (isDryRunTracked) {
             if (Math.random() < 0.05) {
                 log('DRY_RUN_STRATEGY_CHECK', {
                     symbol: s,
@@ -1524,6 +1564,118 @@ app.get('/api/dry-run/status', (req, res) => {
     res.json({ ok: true, status: dryRunSession.getStatus() });
 });
 
+app.get('/api/ai-dry-run/status', (req, res) => {
+    res.json({ ok: true, status: dryRunSession.getStatus(), ai: aiDryRun.getStatus() });
+});
+
+app.post('/api/ai-dry-run/start', async (req, res) => {
+    try {
+        const rawSymbols = Array.isArray(req.body?.symbols)
+            ? req.body.symbols.map((s: any) => String(s || '').toUpperCase())
+            : [];
+        const fallbackSymbol = String(req.body?.symbol || '').toUpperCase();
+        const symbolsRequested = rawSymbols.length > 0
+            ? rawSymbols.filter((s: string, idx: number, arr: string[]) => Boolean(s) && arr.indexOf(s) === idx)
+            : (fallbackSymbol ? [fallbackSymbol] : []);
+
+        if (symbolsRequested.length === 0) {
+            res.status(400).json({ ok: false, error: 'symbols_required' });
+            return;
+        }
+
+        const apiKey = String(req.body?.apiKey || '').trim();
+        const model = String(req.body?.model || '').trim();
+        if (!apiKey || !model) {
+            res.status(400).json({ ok: false, error: 'ai_config_required' });
+            return;
+        }
+
+        const info = await fetchExchangeInfo();
+        const symbols = Array.isArray(info?.symbols) ? info.symbols : [];
+        const unsupported = symbolsRequested.filter((s: string) => !symbols.includes(s));
+        if (unsupported.length > 0) {
+            res.status(400).json({ ok: false, error: 'symbol_not_supported', unsupported });
+            return;
+        }
+
+        const fundingRates: Record<string, number> = {};
+        for (const symbol of symbolsRequested) {
+            fundingRates[symbol] = lastFunding.get(symbol)?.rate ?? Number(req.body?.fundingRate ?? 0);
+        }
+
+        const status = dryRunSession.start({
+            symbols: symbolsRequested,
+            runId: req.body?.runId ? String(req.body.runId) : `ai-${Date.now()}`,
+            walletBalanceStartUsdt: Number(req.body?.walletBalanceStartUsdt ?? 5000),
+            initialMarginUsdt: Number(req.body?.initialMarginUsdt ?? 200),
+            leverage: Number(req.body?.leverage ?? 10),
+            makerFeeRate: req.body?.makerFeeRate != null ? Number(req.body.makerFeeRate) : undefined,
+            takerFeeRate: req.body?.takerFeeRate != null ? Number(req.body.takerFeeRate) : undefined,
+            maintenanceMarginRate: Number(req.body?.maintenanceMarginRate ?? 0.005),
+            fundingRates,
+            fundingIntervalMs: Number(req.body?.fundingIntervalMs ?? (8 * 60 * 60 * 1000)),
+            heartbeatIntervalMs: Number(req.body?.heartbeatIntervalMs ?? 10_000),
+            debugAggressiveEntry: false,
+        });
+
+        aiDryRun.start({
+            symbols: symbolsRequested,
+            apiKey,
+            model,
+            decisionIntervalMs: Number(req.body?.decisionIntervalMs ?? 1000),
+            temperature: Number(req.body?.temperature ?? 0),
+            maxOutputTokens: Number(req.body?.maxOutputTokens ?? 256),
+        });
+
+        updateDryRunHealthFlag();
+        dryRunForcedSymbols.clear();
+        for (const symbol of symbolsRequested) {
+            dryRunForcedSymbols.add(symbol);
+        }
+        updateStreams();
+
+        for (const symbol of symbolsRequested) {
+            const ob = getOrderbook(symbol);
+            if (ob.lastUpdateId === 0 || ob.uiState === 'INIT') {
+                transitionOrderbookState(symbol, 'SNAPSHOT_PENDING', 'ai_dry_run_start');
+                fetchSnapshot(symbol, 'ai_dry_run_start', true).catch((e) => {
+                    log('AI_DRY_RUN_SNAPSHOT_ERROR', { symbol, error: e?.message || 'ai_dry_run_snapshot_failed' });
+                });
+            }
+        }
+
+        res.json({ ok: true, status, ai: aiDryRun.getStatus() });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'ai_dry_run_start_failed' });
+    }
+});
+
+app.post('/api/ai-dry-run/stop', (req, res) => {
+    try {
+        aiDryRun.stop();
+        const status = dryRunSession.stop();
+        updateDryRunHealthFlag();
+        dryRunForcedSymbols.clear();
+        updateStreams();
+        res.json({ ok: true, status, ai: aiDryRun.getStatus() });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'ai_dry_run_stop_failed' });
+    }
+});
+
+app.post('/api/ai-dry-run/reset', (req, res) => {
+    try {
+        aiDryRun.stop();
+        const status = dryRunSession.reset();
+        updateDryRunHealthFlag();
+        dryRunForcedSymbols.clear();
+        updateStreams();
+        res.json({ ok: true, status, ai: aiDryRun.getStatus() });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'ai_dry_run_reset_failed' });
+    }
+});
+
 app.get('/api/dry-run/sessions', async (_req, res) => {
     try {
         const sessions = await dryRunSession.listSessions();
@@ -1626,6 +1778,7 @@ app.post('/api/dry-run/start', async (req, res) => {
 
 app.post('/api/dry-run/stop', (req, res) => {
     try {
+        aiDryRun.stop();
         const status = dryRunSession.stop();
         updateDryRunHealthFlag();
         dryRunForcedSymbols.clear();
@@ -1638,6 +1791,7 @@ app.post('/api/dry-run/stop', (req, res) => {
 
 app.post('/api/dry-run/reset', (req, res) => {
     try {
+        aiDryRun.stop();
         const status = dryRunSession.reset();
         updateDryRunHealthFlag();
         dryRunForcedSymbols.clear();
