@@ -16,7 +16,7 @@ interface SymbolRowProps {
 
 const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false }) => {
   const [expanded, setExpanded] = useState(false);
-  const { state, legacyMetrics, timeAndSales, cvd, openInterest, funding, absorption, bids, asks } = data;
+  const { state, legacyMetrics, timeAndSales, cvd, openInterest, funding, absorption, bids, asks, aiTrend } = data;
 
   // If we don't have legacy metrics yet (unseeded), render a placeholder row
   if (!legacyMetrics) {
@@ -84,6 +84,18 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
     if (hours > 0) return `${hours}h ${mins}m`;
     return `${mins}m`;
   };
+  const trendSide = aiTrend?.side ?? null;
+  const trendScorePct = aiTrend ? Math.round(Math.max(0, Math.min(1, Number(aiTrend.score || 0))) * 100) : null;
+  const trendLabel = trendSide || 'NEUTRAL';
+  const trendClass = !aiTrend
+    ? 'bg-zinc-800 text-zinc-500 border-zinc-700'
+    : !aiTrend.intact
+      ? 'bg-amber-900/30 text-amber-300 border-amber-700/40'
+      : trendSide === 'LONG'
+        ? 'bg-green-900/25 text-green-300 border-green-700/40'
+        : trendSide === 'SHORT'
+          ? 'bg-red-900/25 text-red-300 border-red-700/40'
+          : 'bg-zinc-800 text-zinc-300 border-zinc-700';
   return (
     <div className="border-b border-zinc-800/50 hover:bg-zinc-900/30 transition-colors">
       {/* Main Row - Fixed Height & Width */}
@@ -101,6 +113,11 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
           </button>
           <span className="font-bold text-white text-sm truncate">{symbol}</span>
           <span className="text-[8px] px-1 py-0.5 bg-zinc-800 text-zinc-500 rounded flex-shrink-0 uppercase tracking-tighter">PERP</span>
+          {aiTrend && (
+            <span className={`text-[8px] px-1 py-0.5 rounded border flex-shrink-0 uppercase tracking-tight ${trendClass}`}>
+              TR {trendLabel} {trendScorePct}
+            </span>
+          )}
         </div>
 
         {/* Price */}

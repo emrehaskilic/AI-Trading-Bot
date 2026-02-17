@@ -116,6 +116,14 @@ export interface MetricsMessage {
   absorption: number | null;
   openInterest: OpenInterestMetrics | null;
   funding: FundingContext | null;
+  aiTrend?: {
+    side: 'LONG' | 'SHORT' | null;
+    score: number;
+    intact: boolean;
+    ageMs: number | null;
+    breakConfirm: number;
+    source?: 'runtime' | 'bootstrap';
+  } | null;
   legacyMetrics: LegacyMetrics;
   orderbookIntegrity?: {
     symbol: string;

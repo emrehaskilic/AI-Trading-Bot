@@ -119,6 +119,9 @@ const CLIENT_STALE_CONNECTION_MS = Number(process.env.CLIENT_STALE_CONNECTION_MS
 const WS_MAX_SUBSCRIPTIONS = Number(process.env.WS_MAX_SUBSCRIPTIONS || 500);
 const BACKFILL_RECORDING_ENABLED = parseEnvFlag(process.env.BACKFILL_RECORDING_ENABLED);
 const BACKFILL_SNAPSHOT_INTERVAL_MS = Number(process.env.BACKFILL_SNAPSHOT_INTERVAL_MS || 2000);
+const AI_TREND_BOOTSTRAP_DEFAULT_HOURS = Math.max(1, Number(process.env.AI_TREND_BOOTSTRAP_HOURS || 6));
+const AI_TREND_BOOTSTRAP_MAX_HOURS = 12;
+const AI_TREND_BOOTSTRAP_MIN_BARS = 120;
 
 // [PHASE 3] Execution Flags
 let KILL_SWITCH = false;
@@ -363,6 +366,192 @@ function pruneWindow(values: number[], windowMs: number, now: number): void {
 function countWindow(values: number[], windowMs: number, now: number): number {
     pruneWindow(values, windowMs, now);
     return values.length;
+}
+
+interface KlineSample1m {
+    openTimeMs: number;
+    closeTimeMs: number;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+}
+
+interface BootstrapTrendSeed {
+    bias: 'LONG' | 'SHORT';
+    strength: number;
+    asOfMs: number;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+    if (!Number.isFinite(value)) return min;
+    return Math.min(max, Math.max(min, value));
+}
+
+function computeEmaSeries(values: number[], period: number): number[] {
+    if (values.length === 0) return [];
+    const p = Math.max(1, Math.round(period));
+    const alpha = 2 / (p + 1);
+    const out = new Array<number>(values.length);
+    out[0] = values[0];
+    for (let i = 1; i < values.length; i++) {
+        out[i] = (values[i] * alpha) + (out[i - 1] * (1 - alpha));
+    }
+    return out;
+}
+
+async function fetchRecent1mKlines(symbol: string, limit: number): Promise<KlineSample1m[]> {
+    const safeLimit = clampNumber(Math.round(limit), AI_TREND_BOOTSTRAP_MIN_BARS, 1000);
+    const url = `${BINANCE_REST_BASE}/fapi/v1/klines?symbol=${symbol}&interval=1m&limit=${safeLimit}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    try {
+        const res = await fetch(url, { signal: controller.signal });
+        if (!res.ok) {
+            throw new Error(`kline_http_${res.status}`);
+        }
+        const raw = await res.json();
+        if (!Array.isArray(raw)) {
+            throw new Error('kline_payload_invalid');
+        }
+        const parsed: KlineSample1m[] = [];
+        for (const row of raw) {
+            if (!Array.isArray(row) || row.length < 7) continue;
+            const openTimeMs = Number(row[0]);
+            const open = Number(row[1]);
+            const high = Number(row[2]);
+            const low = Number(row[3]);
+            const close = Number(row[4]);
+            const volume = Number(row[5]);
+            const closeTimeMs = Number(row[6]);
+            if (
+                !Number.isFinite(openTimeMs) || !Number.isFinite(closeTimeMs) ||
+                !Number.isFinite(open) || !Number.isFinite(high) || !Number.isFinite(low) ||
+                !Number.isFinite(close) || !Number.isFinite(volume) ||
+                open <= 0 || high <= 0 || low <= 0 || close <= 0
+            ) {
+                continue;
+            }
+            parsed.push({
+                openTimeMs,
+                closeTimeMs,
+                open,
+                high,
+                low,
+                close,
+                volume,
+            });
+        }
+        return parsed;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+function deriveBootstrapTrendSeed(klines: KlineSample1m[]): BootstrapTrendSeed | null {
+    if (klines.length < AI_TREND_BOOTSTRAP_MIN_BARS) return null;
+    const closes = klines.map((k) => k.close);
+    const closeFirst = closes[0];
+    const closeLast = closes[closes.length - 1];
+    if (!Number.isFinite(closeFirst) || !Number.isFinite(closeLast) || closeFirst <= 0 || closeLast <= 0) {
+        return null;
+    }
+
+    const emaFast = computeEmaSeries(closes, 21);
+    const emaSlow = computeEmaSeries(closes, 89);
+    const fastNow = emaFast[emaFast.length - 1];
+    const slowNow = emaSlow[emaSlow.length - 1];
+    if (!Number.isFinite(fastNow) || !Number.isFinite(slowNow) || slowNow <= 0) {
+        return null;
+    }
+
+    const slopeLookback = Math.min(60, Math.max(5, emaSlow.length - 1));
+    const slowPrev = emaSlow[Math.max(0, emaSlow.length - 1 - slopeLookback)];
+    if (!Number.isFinite(slowPrev) || slowPrev <= 0) {
+        return null;
+    }
+
+    const driftPct = ((closeLast - closeFirst) / closeFirst) * 100;
+    const recentLookback = Math.min(45, closes.length - 1);
+    const recentBase = closes[Math.max(0, closes.length - 1 - recentLookback)];
+    const recentDriftPct = recentBase > 0 ? ((closeLast - recentBase) / recentBase) * 100 : 0;
+    const emaGapPct = ((fastNow - slowNow) / closeLast) * 100;
+    const emaSlopePct = ((slowNow - slowPrev) / slowPrev) * 100;
+
+    let aboveSlowCount = 0;
+    let upBars = 0;
+    for (let i = 1; i < closes.length; i++) {
+        if (closes[i] > emaSlow[i]) aboveSlowCount++;
+        if (closes[i] > closes[i - 1]) upBars++;
+    }
+    const aboveSlowRatio = aboveSlowCount / Math.max(1, closes.length - 1);
+    const upBarRatio = upBars / Math.max(1, closes.length - 1);
+
+    const driftNorm = clampNumber(driftPct / 1.8, -1, 1);
+    const recentNorm = clampNumber(recentDriftPct / 0.6, -1, 1);
+    const gapNorm = clampNumber(emaGapPct / 0.35, -1, 1);
+    const slopeNorm = clampNumber(emaSlopePct / 0.45, -1, 1);
+    const structureNorm = clampNumber((aboveSlowRatio - 0.5) * 2, -1, 1);
+    const flowNorm = clampNumber((upBarRatio - 0.5) * 2, -1, 1);
+
+    const directionalScore =
+        (driftNorm * 0.28) +
+        (recentNorm * 0.08) +
+        (gapNorm * 0.24) +
+        (slopeNorm * 0.20) +
+        (structureNorm * 0.14) +
+        (flowNorm * 0.06);
+    const confidenceBase = Math.abs(directionalScore);
+    const consistency = (Math.abs(structureNorm) * 0.55) + (Math.abs(flowNorm) * 0.45);
+    const strength = clampNumber((confidenceBase * 0.78) + (consistency * 0.22), 0, 1);
+    const side = directionalScore > 0 ? 'LONG' : directionalScore < 0 ? 'SHORT' : null;
+
+    if (!side || strength < 0.34) {
+        return null;
+    }
+
+    return {
+        bias: side,
+        strength: Number(strength.toFixed(4)),
+        asOfMs: klines[klines.length - 1].closeTimeMs,
+    };
+}
+
+async function buildBootstrapTrendBySymbol(symbols: string[], hours: number): Promise<Record<string, BootstrapTrendSeed>> {
+    const boundedHours = clampNumber(Math.round(hours), 1, AI_TREND_BOOTSTRAP_MAX_HOURS);
+    const limit = clampNumber(boundedHours * 60, AI_TREND_BOOTSTRAP_MIN_BARS, 1000);
+    const result: Record<string, BootstrapTrendSeed> = {};
+    const settled = await Promise.allSettled(symbols.map(async (symbol) => {
+        const klines = await fetchRecent1mKlines(symbol, limit);
+        const seed = deriveBootstrapTrendSeed(klines);
+        if (!seed) {
+            log('AI_TREND_BOOTSTRAP_NO_BIAS', { symbol, bars: klines.length, hours: boundedHours });
+            return;
+        }
+        result[symbol] = seed;
+        log('AI_TREND_BOOTSTRAP_SEED', { symbol, bias: seed.bias, strength: seed.strength, asOfMs: seed.asOfMs, bars: klines.length });
+    }));
+
+    let failed = 0;
+    for (let i = 0; i < settled.length; i++) {
+        const s = settled[i];
+        if (s.status === 'fulfilled') continue;
+        failed++;
+        log('AI_TREND_BOOTSTRAP_FAIL', {
+            symbol: symbols[i],
+            hours: boundedHours,
+            error: s.reason instanceof Error ? s.reason.message : String(s.reason || 'bootstrap_fetch_failed'),
+        });
+    }
+    log('AI_TREND_BOOTSTRAP_DONE', {
+        symbols: symbols.length,
+        seeded: Object.keys(result).length,
+        failed,
+        hours: boundedHours,
+        barsPerSymbol: limit,
+    });
+    return result;
 }
 
 function recordLiveSample(symbol: string, live: boolean): void {
@@ -1228,6 +1417,7 @@ function broadcastMetrics(
     const oiLegacy = leg.getOpenInterestMetrics();
     const bf = getBackfill(s).getState();
     const integrity = getIntegrity(s).getStatus(now);
+    const aiTrend = aiDryRun.getTrendStatus(s, now);
 
     const payload: any = {
         type: 'metrics',
@@ -1261,6 +1451,14 @@ function broadcastMetrics(
             stabilityMsg: oiM.stabilityMsg
         },
         funding: lastFunding.get(s) || null,
+        aiTrend: aiTrend ? {
+            side: aiTrend.side,
+            score: Number(aiTrend.score.toFixed(4)),
+            intact: aiTrend.intact,
+            ageMs: aiTrend.ageMs,
+            breakConfirm: aiTrend.breakConfirm,
+            source: aiTrend.source,
+        } : null,
         legacyMetrics: legacyM,
         orderbookIntegrity: integrity,
         signalDisplay: decision
@@ -1661,6 +1859,15 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
             return;
         }
 
+        const bootstrapTrendEnabled = req.body?.bootstrapTrendEnabled !== false;
+        const requestedBootstrapHours = Number(req.body?.bootstrapTrendHours ?? AI_TREND_BOOTSTRAP_DEFAULT_HOURS);
+        const bootstrapTrendHours = Number.isFinite(requestedBootstrapHours)
+            ? clampNumber(Math.round(requestedBootstrapHours), 1, AI_TREND_BOOTSTRAP_MAX_HOURS)
+            : AI_TREND_BOOTSTRAP_DEFAULT_HOURS;
+        const bootstrapTrendBySymbol = bootstrapTrendEnabled
+            ? await buildBootstrapTrendBySymbol(symbolsRequested, bootstrapTrendHours)
+            : {};
+
         const fundingRates: Record<string, number> = {};
         for (const symbol of symbolsRequested) {
             fundingRates[symbol] = lastFunding.get(symbol)?.rate ?? Number(req.body?.fundingRate ?? 0);
@@ -1685,10 +1892,11 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
             symbols: symbolsRequested,
             apiKey,
             model,
-            decisionIntervalMs: Number(req.body?.decisionIntervalMs ?? 1000),
+            decisionIntervalMs: Number(req.body?.decisionIntervalMs ?? 2000),
             temperature: Number(req.body?.temperature ?? 0),
             maxOutputTokens: Number(req.body?.maxOutputTokens ?? 256),
             localOnly,
+            bootstrapTrendBySymbol,
         });
 
         updateDryRunHealthFlag();
@@ -1708,7 +1916,16 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
             }
         }
 
-        res.json({ ok: true, status, ai: aiDryRun.getStatus() });
+        res.json({
+            ok: true,
+            status,
+            ai: aiDryRun.getStatus(),
+            bootstrapTrend: {
+                enabled: bootstrapTrendEnabled,
+                hours: bootstrapTrendHours,
+                seededSymbols: Object.keys(bootstrapTrendBySymbol),
+            },
+        });
     } catch (e: any) {
         res.status(500).json({ ok: false, error: e?.message || 'ai_dry_run_start_failed' });
     }

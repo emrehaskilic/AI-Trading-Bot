@@ -82,8 +82,13 @@ interface DryRunStatus {
     position: {
       side: 'LONG' | 'SHORT';
       qty: number;
+      notionalUsdt: number;
       entryPrice: number;
+      breakEvenPrice: number | null;
       markPrice: number;
+      unrealizedPnl: number;
+      realizedPnl: number;
+      netPnl: number;
       liqPrice: null;
     } | null;
     openLimitOrders: Array<{
@@ -199,6 +204,7 @@ const AIDryRunDashboard: React.FC = () => {
   const [apiKeyStatus, setApiKeyStatus] = useState<'idle' | 'validating' | 'valid' | 'invalid'>('idle');
   const [apiKeyError, setApiKeyError] = useState<string | null>(null);
   const [lastMetricsUpdateMs, setLastMetricsUpdateMs] = useState(0);
+  const [isRefreshingPositions, setIsRefreshingPositions] = useState(false);
 
   const activeMetricSymbols = useMemo(
     () => (status.running && status.symbols.length > 0 ? status.symbols : selectedPairs),
@@ -364,6 +370,26 @@ const AIDryRunDashboard: React.FC = () => {
       }
     } catch (e: any) {
       setActionError(e?.message || 'ai_dry_run_reset_failed');
+    }
+  };
+
+  const refreshPositions = async () => {
+    setActionError(null);
+    setIsRefreshingPositions(true);
+    try {
+      const res = await fetchWithAuth(`${proxyUrl}/api/ai-dry-run/status`);
+      const data = await res.json();
+      if (!res.ok || !data?.status) {
+        throw new Error(data?.error || 'ai_dry_run_status_failed');
+      }
+      const next = data.status as DryRunStatus;
+      const nextAi = (data?.ai || null) as AIDryRunStatus | null;
+      setStatus(next);
+      setAiStatus(nextAi);
+    } catch (e: any) {
+      setActionError(e?.message || 'ai_dry_run_status_failed');
+    } finally {
+      setIsRefreshingPositions(false);
     }
   };
 
@@ -692,15 +718,28 @@ const AIDryRunDashboard: React.FC = () => {
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4 overflow-x-auto">
-            <h2 className="text-sm font-semibold text-zinc-300 mb-3">Per-Symbol Positions</h2>
-            <table className="w-full text-xs min-w-[980px]">
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <h2 className="text-sm font-semibold text-zinc-300">Per-Symbol Positions</h2>
+              <button
+                onClick={refreshPositions}
+                disabled={isRefreshingPositions}
+                className="px-2 py-1 text-[11px] font-semibold rounded border border-zinc-700 bg-zinc-950 text-zinc-300 hover:bg-zinc-800 disabled:opacity-60"
+              >
+                {isRefreshingPositions ? 'Refreshing...' : 'Refresh'}
+              </button>
+            </div>
+            <table className="w-full text-xs min-w-[1320px]">
               <thead>
                 <tr className="text-zinc-500 border-b border-zinc-800">
                   <th className="text-left py-2">Symbol</th>
                   <th className="text-left py-2">Side</th>
                   <th className="text-right py-2">Entry</th>
-                  <th className="text-right py-2">Qty</th>
+                  <th className="text-right py-2">Breakeven</th>
+                  <th className="text-right py-2">Notional (USDT)</th>
                   <th className="text-right py-2">Mark</th>
+                  <th className="text-right py-2">uPnL</th>
+                  <th className="text-right py-2">rPnL</th>
+                  <th className="text-right py-2">Net</th>
                   <th className="text-right py-2">Eq</th>
                   <th className="text-right py-2">Margin Health</th>
                   <th className="text-right py-2">Streak</th>
@@ -713,7 +752,7 @@ const AIDryRunDashboard: React.FC = () => {
               <tbody>
                 {symbolRows.length === 0 && (
                   <tr>
-                    <td colSpan={12} className="py-4 text-center text-zinc-600 italic">No active symbol session</td>
+                    <td colSpan={16} className="py-4 text-center text-zinc-600 italic">No active symbol session</td>
                   </tr>
                 )}
                 {symbolRows.map((row) => (
@@ -723,8 +762,21 @@ const AIDryRunDashboard: React.FC = () => {
                       {row.position?.side || '-'}
                     </td>
                     <td className="py-2 text-right font-mono">{row.position ? formatNum(row.position.entryPrice, 4) : '-'}</td>
-                    <td className="py-2 text-right font-mono">{row.position ? formatNum(row.position.qty, 6) : '-'}</td>
+                    <td className="py-2 text-right font-mono">{row.position?.breakEvenPrice != null ? formatNum(row.position.breakEvenPrice, 4) : '-'}</td>
+                    <td className="py-2 text-right font-mono">{row.position ? formatNum(row.position.notionalUsdt, 2) : '-'}</td>
                     <td className="py-2 text-right font-mono">{formatNum(row.metrics.markPrice, 4)}</td>
+                    <td className={`py-2 text-right font-mono ${(row.position?.unrealizedPnl ?? row.metrics.unrealizedPnl) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                      {(row.position?.unrealizedPnl ?? row.metrics.unrealizedPnl) >= 0 ? '+' : ''}
+                      {formatNum(row.position?.unrealizedPnl ?? row.metrics.unrealizedPnl, 4)}
+                    </td>
+                    <td className={`py-2 text-right font-mono ${(row.position?.realizedPnl ?? row.metrics.realizedPnl) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                      {(row.position?.realizedPnl ?? row.metrics.realizedPnl) >= 0 ? '+' : ''}
+                      {formatNum(row.position?.realizedPnl ?? row.metrics.realizedPnl, 4)}
+                    </td>
+                    <td className={`py-2 text-right font-mono ${(row.position?.netPnl ?? (row.metrics.unrealizedPnl + row.metrics.realizedPnl - row.metrics.feePaid + row.metrics.fundingPnl)) >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>
+                      {(row.position?.netPnl ?? (row.metrics.unrealizedPnl + row.metrics.realizedPnl - row.metrics.feePaid + row.metrics.fundingPnl)) >= 0 ? '+' : ''}
+                      {formatNum(row.position?.netPnl ?? (row.metrics.unrealizedPnl + row.metrics.realizedPnl - row.metrics.feePaid + row.metrics.fundingPnl), 4)}
+                    </td>
                     <td className="py-2 text-right font-mono">{formatNum(row.metrics.totalEquity, 4)}</td>
                     <td className="py-2 text-right font-mono">{formatNum(row.metrics.marginHealth * 100, 2)}%</td>
                     <td className="py-2 text-right font-mono">
@@ -803,7 +855,7 @@ const AIDryRunDashboard: React.FC = () => {
                 className="grid gap-0 px-5 py-4 text-[11px] font-bold text-zinc-500 uppercase tracking-widest bg-zinc-900 border-b border-zinc-800"
                 style={{ gridTemplateColumns: 'minmax(140px, 1fr) 110px 130px 90px 90px 90px 90px 90px 120px' }}
               >
-                <div>Symbol</div>
+                <div>Symbol / Trend</div>
                 <div className="text-right">Price</div>
                 <div className="text-right">OI / Change</div>
                 <div className="text-center">OBI (10L)</div>

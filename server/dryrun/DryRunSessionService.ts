@@ -65,8 +65,13 @@ export interface DryRunSymbolStatus {
   position: {
     side: 'LONG' | 'SHORT';
     qty: number;
+    notionalUsdt: number;
     entryPrice: number;
+    breakEvenPrice: number | null;
     markPrice: number;
+    unrealizedPnl: number;
+    realizedPnl: number;
+    netPnl: number;
     liqPrice: null;
   } | null;
   openLimitOrders: DryRunStateSnapshot['openLimitOrders'];
@@ -1247,8 +1252,16 @@ export class DryRunSessionService {
           ? {
             side: session.lastState.position.side,
             qty: session.lastState.position.qty,
+            notionalUsdt: roundTo(Math.abs(session.lastState.position.qty * session.latestMarkPrice), 8),
             entryPrice: session.lastState.position.entryPrice,
+            breakEvenPrice: (() => {
+              const value = this.computeBreakEvenPrice(session);
+              return value == null ? null : roundTo(value, 8);
+            })(),
             markPrice: session.latestMarkPrice,
+            unrealizedPnl: roundTo(symbolUnrealized, 8),
+            realizedPnl: roundTo(session.realizedPnl, 8),
+            netPnl: roundTo(symbolUnrealized + session.realizedPnl - session.feePaid + session.fundingPnl, 8),
             liqPrice: null,
           }
           : null,
@@ -1886,6 +1899,35 @@ export class DryRunSessionService {
     if (!pos || !(markPrice > 0) || !(pos.entryPrice > 0)) return 0;
     if (pos.side === 'LONG') return (markPrice - pos.entryPrice) / pos.entryPrice;
     return (pos.entryPrice - markPrice) / pos.entryPrice;
+  }
+
+  private computeBreakEvenPrice(session: SymbolSession): number | null {
+    const position = session.lastState.position;
+    if (!position) return null;
+    const qty = Math.abs(Number(position.qty) || 0);
+    const entryPrice = Number(position.entryPrice) || 0;
+    if (!(qty > 0) || !(entryPrice > 0)) return null;
+
+    const trade = session.currentTrade;
+    const netCarry = trade
+      ? Number(trade.pnlRealized || 0) - Number(trade.feeAcc || 0) + Number(trade.fundingAcc || 0)
+      : 0;
+    const configuredFeeRate = Number(this.config?.takerFeeRate ?? DEFAULT_TAKER_FEE_RATE);
+    const feeRate = Number.isFinite(configuredFeeRate)
+      ? clampNumber(configuredFeeRate, DEFAULT_TAKER_FEE_RATE, 0, 0.1)
+      : DEFAULT_TAKER_FEE_RATE;
+
+    let breakEven = entryPrice;
+    if (position.side === 'LONG') {
+      const denom = qty * Math.max(1e-6, 1 - feeRate);
+      breakEven = ((qty * entryPrice) - netCarry) / denom;
+    } else {
+      const denom = qty * (1 + feeRate);
+      breakEven = ((qty * entryPrice) + netCarry) / denom;
+    }
+
+    if (!Number.isFinite(breakEven) || !(breakEven > 0)) return entryPrice;
+    return breakEven;
   }
 
   private computeSpreadPct(book: DryRunOrderBook): number | null {

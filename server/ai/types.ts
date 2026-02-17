@@ -36,7 +36,9 @@ export type GuardrailReason =
   | 'MIN_HOLD_ACTIVE'
   | 'RISK_LOCK'
   | 'MARGIN_CAP'
-  | 'GATE_NOT_PASSED';
+  | 'GATE_NOT_PASSED'
+  | 'EDGE_TOO_WEAK'
+  | 'UNDERTRADING_PROBE';
 
 export type AIDryRunConfig = {
   apiKey?: string;
@@ -57,8 +59,20 @@ export type AIDecisionTelemetry = {
   forcedExits: number;
   flipsCount: number;
   addsCount: number;
+  probeEntries: number;
+  edgeFilteredEntries: number;
+  holdOverrides: number;
   avgHoldTimeMs: number;
   feePct: number | null;
+};
+
+export type AITrendStatus = {
+  side: StrategySide | null;
+  score: number;
+  intact: boolean;
+  ageMs: number | null;
+  breakConfirm: number;
+  source: 'runtime' | 'bootstrap';
 };
 
 export type AIDryRunStatus = {
@@ -105,6 +119,15 @@ export type AIMetricsSnapshot = {
     holdStreak: number;
     lastAddMsAgo: number | null;
     lastFlipMsAgo: number | null;
+    trendBias?: StrategySide | null;
+    trendStrength?: number;
+    trendIntact?: boolean;
+    trendAgeMs?: number | null;
+    trendBreakConfirm?: number;
+    lastTrendTakeProfitMsAgo?: number | null;
+    bootstrapPhaseMsRemaining?: number;
+    bootstrapSeedStrength?: number;
+    bootstrapWarmupMsRemaining?: number;
   };
   market: {
     price: number;

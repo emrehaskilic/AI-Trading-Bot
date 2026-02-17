@@ -30,6 +30,18 @@ const MobileSymbolCard: React.FC<MobileSymbolCardProps> = ({ symbol, metrics, sh
     );
   }
   const lm = metrics.legacyMetrics;
+  const trend = metrics.aiTrend || null;
+  const trendSide = trend?.side || 'NEUTRAL';
+  const trendScorePct = trend ? Math.round(Math.max(0, Math.min(1, Number(trend.score || 0))) * 100) : null;
+  const trendClass = !trend
+    ? 'bg-zinc-800 text-zinc-500 border-zinc-700'
+    : !trend.intact
+      ? 'bg-amber-900/30 text-amber-300 border-amber-700/40'
+      : trend.side === 'LONG'
+        ? 'bg-green-900/25 text-green-300 border-green-700/40'
+        : trend.side === 'SHORT'
+          ? 'bg-red-900/25 text-red-300 border-red-700/40'
+          : 'bg-zinc-800 text-zinc-300 border-zinc-700';
   const posNegClass = (n: number) => (n > 0 ? 'text-green-400' : n < 0 ? 'text-red-400' : 'text-zinc-300');
 
   return (
@@ -43,6 +55,13 @@ const MobileSymbolCard: React.FC<MobileSymbolCardProps> = ({ symbol, metrics, sh
           <div>
             <div className="text-base sm:text-lg font-bold text-white">{symbol}</div>
             <div className="text-sm text-zinc-300 font-mono">${lm.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+            {trend && (
+              <div className="mt-1">
+                <span className={`text-[10px] px-1.5 py-0.5 rounded border uppercase tracking-tight ${trendClass}`}>
+                  Trend {trendSide} {trendScorePct}
+                </span>
+              </div>
+            )}
           </div>
         </div>
         <div className="flex items-center space-x-2">

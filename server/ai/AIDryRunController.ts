@@ -13,6 +13,7 @@ import {
   AIForcedAction,
   AIDryRunConfig,
   AIDryRunStatus,
+  AITrendStatus,
   AIMetricsSnapshot,
   AIUrgency,
   GuardrailReason,
@@ -20,13 +21,39 @@ import {
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
-const DEFAULT_MIN_HOLD_MS = Math.max(5_000, Number(process.env.AI_MIN_HOLD_MS || 60_000));
-const DEFAULT_FLIP_COOLDOWN_MS = Math.max(2_000, Number(process.env.AI_FLIP_COOLDOWN_MS || 45_000));
-const DEFAULT_MIN_ADD_GAP_MS = Math.max(1_000, Number(process.env.AI_MIN_ADD_GAP_MS || 20_000));
+const DEFAULT_MIN_HOLD_MS = Math.max(5_000, Number(process.env.AI_MIN_HOLD_MS || 180_000));
+const DEFAULT_FLIP_COOLDOWN_MS = Math.max(2_000, Number(process.env.AI_FLIP_COOLDOWN_MS || 240_000));
+const DEFAULT_MIN_ADD_GAP_MS = Math.max(1_000, Number(process.env.AI_MIN_ADD_GAP_MS || 60_000));
 const DEFAULT_MAX_DECISION_INTERVAL_MS = 2_500;
 const DEFAULT_MIN_DECISION_INTERVAL_MS = 500;
-const DEFAULT_ADD_MARGIN_USAGE_CAP = clamp(Number(process.env.AI_ADD_MARGIN_USAGE_CAP || 0.85), 0.3, 0.98);
-const DEFAULT_ADD_MIN_UPNL_PCT = clamp(Number(process.env.AI_ADD_MIN_UPNL_PCT || 0.0015), 0, 0.05);
+const DEFAULT_ADD_MARGIN_USAGE_CAP = clamp(Number(process.env.AI_ADD_MARGIN_USAGE_CAP || 0.65), 0.3, 0.98);
+const DEFAULT_ADD_MIN_UPNL_PCT = clamp(Number(process.env.AI_ADD_MIN_UPNL_PCT || 0.003), 0, 0.05);
+const DEFAULT_PULLBACK_ADD_MAX_ADVERSE_PCT = clamp(Number(process.env.AI_PULLBACK_ADD_MAX_ADVERSE_PCT || 0.0075), 0, 0.05);
+const DEFAULT_PULLBACK_ADD_TRIGGER_UPNL_PCT = clamp(Number(process.env.AI_PULLBACK_ADD_TRIGGER_UPNL_PCT || 0.001), -0.02, 0.02);
+const DEFAULT_PULLBACK_ADD_EDGE_BPS = clamp(Number(process.env.AI_PULLBACK_ADD_EDGE_BPS || 0.8), -5, 20);
+const DEFAULT_PULLBACK_ADD_SIZE_MULT = clamp(Number(process.env.AI_PULLBACK_ADD_SIZE_MULT || 0.5), 0.1, 1.5);
+const DEFAULT_ENTRY_FEE_BPS = clamp(Number(process.env.AI_ENTRY_FEE_BPS || 2.2), 0, 30);
+const DEFAULT_ENTRY_SLIPPAGE_BPS = clamp(Number(process.env.AI_ENTRY_SLIPPAGE_BPS || 1), 0, 30);
+const DEFAULT_EDGE_MIN_BPS = clamp(Number(process.env.AI_EDGE_MIN_BPS || 4.5), -5, 30);
+const DEFAULT_PROBE_EDGE_BPS = clamp(Number(process.env.AI_PROBE_EDGE_BPS || 6), -5, 30);
+const DEFAULT_PROBE_HOLD_STREAK = Math.max(1, Math.trunc(Number(process.env.AI_PROBE_HOLD_STREAK || 3)));
+const DEFAULT_PROBE_SIZE_MULT = clamp(Number(process.env.AI_PROBE_SIZE_MULT || 0.2), 0.1, 1.2);
+const DEFAULT_FIRST_ENTRY_EDGE_BPS = clamp(Number(process.env.AI_FIRST_ENTRY_EDGE_BPS || 1.8), -5, 30);
+const DEFAULT_FIRST_ENTRY_HOLD_STREAK = Math.max(1, Math.trunc(Number(process.env.AI_FIRST_ENTRY_HOLD_STREAK || 1)));
+const DEFAULT_FIRST_ENTRY_MIN_STRENGTH = clamp(Number(process.env.AI_FIRST_ENTRY_MIN_STRENGTH || 0.5), 0, 1);
+const DEFAULT_SIDE_ALIGN_STRENGTH = clamp(Number(process.env.AI_SIDE_ALIGN_STRENGTH || 0.62), 0, 1);
+const DEFAULT_TREND_ENTRY_SCORE = clamp(Number(process.env.AI_TREND_ENTRY_SCORE || 0.62), 0, 1);
+const DEFAULT_TREND_BREAK_SCORE = clamp(Number(process.env.AI_TREND_BREAK_SCORE || 0.38), 0, 1);
+const DEFAULT_TREND_SIDE_GAP = clamp(Number(process.env.AI_TREND_SIDE_GAP || 0.12), 0, 0.5);
+const DEFAULT_TREND_CONFIRM_TICKS = Math.max(1, Math.trunc(Number(process.env.AI_TREND_CONFIRM_TICKS || 30)));
+const DEFAULT_TREND_BREAK_CONFIRM_TICKS = Math.max(1, Math.trunc(Number(process.env.AI_TREND_BREAK_CONFIRM_TICKS || 45)));
+const DEFAULT_TREND_TP_MIN_UPNL_PCT = clamp(Number(process.env.AI_TREND_TP_MIN_UPNL_PCT || 0.004), 0, 0.08);
+const DEFAULT_TREND_TP_REDUCE_PCT = clamp(Number(process.env.AI_TREND_TP_REDUCE_PCT || 0.15), 0.05, 0.8);
+const DEFAULT_TREND_TP_COOLDOWN_MS = Math.max(5_000, Math.trunc(Number(process.env.AI_TREND_TP_COOLDOWN_MS || 90_000)));
+const DEFAULT_BOOTSTRAP_PHASE_MS = Math.max(30_000, Math.trunc(Number(process.env.AI_BOOTSTRAP_PHASE_MS || 180_000)));
+const DEFAULT_BOOTSTRAP_MIN_STRENGTH = clamp(Number(process.env.AI_BOOTSTRAP_MIN_STRENGTH || 0.56), 0, 1);
+const DEFAULT_BOOTSTRAP_MIN_EDGE_BPS = clamp(Number(process.env.AI_BOOTSTRAP_MIN_EDGE_BPS || 6), -5, 30);
+const DEFAULT_BOOTSTRAP_WARMUP_MS = Math.max(30_000, Math.trunc(Number(process.env.AI_BOOTSTRAP_WARMUP_MS || 90_000)));
 const DEFAULT_FALLBACK_MODELS = String(process.env.AI_FALLBACK_MODELS || 'gemini-2.5-flash-lite,gemini-2.0-flash')
   .split(',')
   .map((m) => m.trim())
@@ -78,6 +105,48 @@ type RuntimeState = {
   lastFlipTs: number;
   lastExitSide: StrategySide | null;
   holdStartTs: number;
+  trendBias: StrategySide | null;
+  trendBiasSinceTs: number;
+  trendLongConfirmTicks: number;
+  trendShortConfirmTicks: number;
+  trendBreakConfirmTicks: number;
+  trendLastStrength: number;
+  trendIntact: boolean;
+  lastTrendTakeProfitTs: number;
+  bootstrapSeeded: boolean;
+  bootstrapSeedStrength: number;
+  bootstrapPhaseUntilTs: number;
+  bootstrapWarmupUntilTs: number;
+};
+
+type MicroAlphaContext = {
+  sideBias: StrategySide | null;
+  longVotes: number;
+  shortVotes: number;
+  signalStrength: number;
+  trendIntact: boolean;
+  tradableFlow: boolean;
+  spreadBps: number;
+  expectedMoveBps: number;
+  estimatedCostBps: number;
+  expectedEdgeBps: number;
+};
+
+type TrendStateView = {
+  bias: StrategySide | null;
+  longScore: number;
+  shortScore: number;
+  strength: number;
+  candidate: StrategySide | null;
+  intact: boolean;
+  ageMs: number | null;
+  breakConfirm: number;
+};
+
+type BootstrapTrendSeed = {
+  bias: StrategySide | null;
+  strength: number;
+  asOfMs: number;
 };
 
 const toTag = (raw: unknown): AIExplanationTag | null => {
@@ -93,6 +162,7 @@ export class AIDryRunController {
   private readonly pending = new Set<string>();
   private readonly holdStreak = new Map<string, number>();
   private readonly runtime = new Map<string, RuntimeState>();
+  private readonly bootstrapTrendBySymbol = new Map<string, BootstrapTrendSeed>();
   private readonly guardrails = new SafetyGuardrails();
   private nonceSeq = 0;
   private holdDurationTotalMs = 0;
@@ -104,6 +174,9 @@ export class AIDryRunController {
     forcedExits: 0,
     flipsCount: 0,
     addsCount: 0,
+    probeEntries: 0,
+    edgeFilteredEntries: 0,
+    holdOverrides: 0,
     avgHoldTimeMs: 0,
     feePct: null as number | null,
   };
@@ -123,6 +196,7 @@ export class AIDryRunController {
     temperature?: number;
     maxOutputTokens?: number;
     localOnly?: boolean;
+    bootstrapTrendBySymbol?: Record<string, { bias: 'LONG' | 'SHORT' | null; strength?: number; asOfMs?: number }>;
   }): void {
     const symbols = input.symbols.map((s) => s.toUpperCase()).filter(Boolean);
     const apiKey = String(input.apiKey || '').trim();
@@ -132,7 +206,7 @@ export class AIDryRunController {
     this.config = {
       apiKey,
       model,
-      decisionIntervalMs: clamp(Number(input.decisionIntervalMs ?? 1000), DEFAULT_MIN_DECISION_INTERVAL_MS, DEFAULT_MAX_DECISION_INTERVAL_MS),
+      decisionIntervalMs: clamp(Number(input.decisionIntervalMs ?? 2000), DEFAULT_MIN_DECISION_INTERVAL_MS, DEFAULT_MAX_DECISION_INTERVAL_MS),
       temperature: Number.isFinite(input.temperature as number) ? Number(input.temperature) : 0,
       maxOutputTokens: Math.max(128, Number(input.maxOutputTokens ?? 512)),
       localOnly,
@@ -145,6 +219,7 @@ export class AIDryRunController {
     this.pending.clear();
     this.lastDecisionTs.clear();
     this.runtime.clear();
+    this.bootstrapTrendBySymbol.clear();
     this.holdStreak.clear();
     this.nonceSeq = 0;
     this.holdDurationTotalMs = 0;
@@ -155,8 +230,22 @@ export class AIDryRunController {
     this.telemetry.forcedExits = 0;
     this.telemetry.flipsCount = 0;
     this.telemetry.addsCount = 0;
+    this.telemetry.probeEntries = 0;
+    this.telemetry.edgeFilteredEntries = 0;
+    this.telemetry.holdOverrides = 0;
     this.telemetry.avgHoldTimeMs = 0;
     this.telemetry.feePct = null;
+    for (const symbol of symbols) {
+      const seed = input.bootstrapTrendBySymbol?.[symbol];
+      if (!seed) continue;
+      const bias = seed.bias === 'LONG' || seed.bias === 'SHORT' ? seed.bias : null;
+      if (!bias) continue;
+      this.bootstrapTrendBySymbol.set(symbol, {
+        bias,
+        strength: clamp(Number(seed.strength ?? 0.5), 0, 1),
+        asOfMs: Math.max(0, Number(seed.asOfMs || Date.now())),
+      });
+    }
     this.log?.('AI_DRY_RUN_START', { symbols, model: this.config.model || null, localOnly });
   }
 
@@ -166,6 +255,7 @@ export class AIDryRunController {
     this.pending.clear();
     this.holdStreak.clear();
     this.runtime.clear();
+    this.bootstrapTrendBySymbol.clear();
     this.log?.('AI_DRY_RUN_STOP', {});
   }
 
@@ -195,6 +285,35 @@ export class AIDryRunController {
     };
   }
 
+  getTrendStatus(symbol: string, nowMs = Date.now()): AITrendStatus | null {
+    const normalized = String(symbol || '').toUpperCase();
+    if (!this.isTrackingSymbol(normalized)) return null;
+
+    const runtime = this.runtime.get(normalized);
+    if (runtime) {
+      const ageMs = runtime.trendBiasSinceTs > 0 ? Math.max(0, nowMs - runtime.trendBiasSinceTs) : null;
+      return {
+        side: runtime.trendBias,
+        score: clamp(Number(runtime.trendLastStrength || 0), 0, 1),
+        intact: Boolean(runtime.trendIntact),
+        ageMs,
+        breakConfirm: Math.max(0, Math.trunc(Number(runtime.trendBreakConfirmTicks || 0))),
+        source: 'runtime',
+      };
+    }
+
+    const seed = this.bootstrapTrendBySymbol.get(normalized);
+    if (!seed) return null;
+    return {
+      side: seed.bias,
+      score: clamp(Number(seed.strength || 0), 0, 1),
+      intact: Boolean(seed.bias),
+      ageMs: seed.asOfMs > 0 ? Math.max(0, nowMs - seed.asOfMs) : null,
+      breakConfirm: 0,
+      source: 'bootstrap',
+    };
+  }
+
   async onMetrics(snapshot: AIMetricsSnapshot): Promise<void> {
     if (!this.isActive() || !this.config) return;
     if (!this.isTrackingSymbol(snapshot.symbol)) return;
@@ -205,11 +324,13 @@ export class AIDryRunController {
     if (nowMs - lastTs < intervalMs) return;
     if (this.pending.has(snapshot.symbol)) return;
 
-    const runtime = this.getRuntimeState(snapshot.symbol);
+    const runtime = this.getRuntimeState(snapshot.symbol, nowMs);
     const runtimeContext = this.buildRuntimeContext(snapshot, runtime, nowMs);
     const preGuard = this.guardrails.evaluate(snapshot, runtimeContext, null);
     const blockedReasons = [...new Set([...(snapshot.blockedReasons || []), ...preGuard.blockedReasons])];
-    const enrichedSnapshot = this.enrichSnapshot(snapshot, runtime, blockedReasons, runtimeContext);
+    const microAlpha = this.computeMicroAlphaContext(snapshot);
+    const trend = this.updateTrendState(runtime, snapshot, microAlpha, nowMs);
+    const enrichedSnapshot = this.enrichSnapshot(snapshot, runtime, blockedReasons, runtimeContext, trend);
     const promptNonce = this.generatePromptNonce(snapshot.symbol, nowMs);
     const snapshotHash = this.hashSnapshot(enrichedSnapshot, promptNonce);
 
@@ -221,6 +342,15 @@ export class AIDryRunController {
       interval: intervalMs,
       promptNonce,
       blockedReasons,
+      sideBias: microAlpha.sideBias,
+      signalStrength: Number(microAlpha.signalStrength.toFixed(4)),
+      expectedEdgeBps: Number(microAlpha.expectedEdgeBps.toFixed(4)),
+      tradableFlow: microAlpha.tradableFlow,
+      trendBias: trend.bias,
+      trendLongScore: Number(trend.longScore.toFixed(4)),
+      trendShortScore: Number(trend.shortScore.toFixed(4)),
+      trendStrength: Number(trend.strength.toFixed(4)),
+      trendIntact: trend.intact,
       snapshotHash,
     });
 
@@ -230,7 +360,7 @@ export class AIDryRunController {
       if (this.config.localOnly || !this.config.apiKey || !this.config.model) {
         proposedPlan = this.buildSafeHoldPlan(promptNonce, 'LOCAL_ONLY');
       } else {
-        const prompt = this.buildPrompt(enrichedSnapshot, promptNonce);
+        const prompt = this.buildPrompt(enrichedSnapshot, promptNonce, microAlpha);
         const resolved = await this.resolvePlanWithFallback(prompt, promptNonce, snapshot.symbol);
         const plan = resolved.plan;
         if (!plan) {
@@ -243,12 +373,14 @@ export class AIDryRunController {
         }
       }
 
-      const postGuard = this.guardrails.evaluate(enrichedSnapshot, runtimeContext, proposedPlan);
-      const resolvedPlan = this.applyGuardrails(enrichedSnapshot, proposedPlan, postGuard);
+      const orchestratedPlan = this.orchestratePlan(enrichedSnapshot, proposedPlan, microAlpha, trend, runtime);
+      const postGuard = this.guardrails.evaluate(enrichedSnapshot, runtimeContext, orchestratedPlan);
+      const resolvedPlan = this.applyGuardrails(enrichedSnapshot, orchestratedPlan, postGuard);
       const decision = this.buildDecision(enrichedSnapshot, resolvedPlan, {
         promptNonce,
         blockedReasons: postGuard.blockedReasons,
         forcedAction: postGuard.forcedAction,
+        microAlpha,
         snapshotHash,
       });
 
@@ -271,11 +403,20 @@ export class AIDryRunController {
       this.log?.('AI_DECISION_RESULT', {
         symbol: snapshot.symbol,
         promptNonce,
+        proposedIntent: proposedPlan.intent,
+        orchestratedIntent: orchestratedPlan.intent,
         intent: resolvedPlan.intent,
         confidence: resolvedPlan.confidence,
         tags: resolvedPlan.explanationTags,
         blockedReasons: postGuard.blockedReasons,
         forcedAction: postGuard.forcedAction,
+        sideBias: microAlpha.sideBias,
+        signalStrength: Number(microAlpha.signalStrength.toFixed(4)),
+        expectedEdgeBps: Number(microAlpha.expectedEdgeBps.toFixed(4)),
+        tradableFlow: microAlpha.tradableFlow,
+        trendBias: trend.bias,
+        trendStrength: Number(trend.strength.toFixed(4)),
+        trendIntact: trend.intact,
         ordersCreated: orderDetails.length,
         orders: orderDetails,
         positionBefore,
@@ -294,6 +435,7 @@ export class AIDryRunController {
         promptNonce,
         blockedReasons: forced ? ['RISK_LOCK'] : ['COOLDOWN_ACTIVE'],
         forcedAction: forced,
+        microAlpha,
         snapshotHash,
       });
       this.dryRunSession.submitStrategyDecision(snapshot.symbol, safeDecision, snapshot.timestampMs);
@@ -390,7 +532,7 @@ export class AIDryRunController {
     );
   }
 
-  private buildPrompt(snapshot: AIMetricsSnapshot, nonce: string): string {
+  private buildPrompt(snapshot: AIMetricsSnapshot, nonce: string, microAlpha: MicroAlphaContext): string {
     const payload = {
       nonce,
       symbol: snapshot.symbol,
@@ -406,6 +548,7 @@ export class AIDryRunController {
       absorption: snapshot.absorption,
       volatility: snapshot.volatility,
       position: snapshot.position,
+      microAlpha,
     };
 
     return [
@@ -423,18 +566,23 @@ export class AIDryRunController {
       '- reducePct is null or in [0.1, 1.0].',
       '- explanationTags max length is 5.',
       '- Keep numbers short (max 4 decimal places).',
-      '- HOLD is valid only when risk/market context is genuinely unclear or blocked.',
-      '- If gatePassed=true, blockedReasons is empty, and position is null, avoid repetitive HOLD.',
-      '- If flat and executionState.holdStreak >= 3, prefer a small probing ENTER over another HOLD when directional evidence exists.',
+      '- HOLD is preferred when edge is weak, costs are high, or direction is not clear.',
+      '- Avoid overtrading and avoid frequent flips.',
+      '- If flat, open ENTER only when expected edge clearly exceeds costs.',
       '- Directional evidence means at least 2 of these align with a side: sign(delta1s+delta5s), sign(cvdSlope), sign(obiDeep), absorption side.',
-      '- In marginal but tradable conditions, prefer ENTER with LOW/MED urgency and sizeMultiplier in [0.35, 0.8] instead of HOLD.',
+      '- If executionState.trendBias is LONG/SHORT and executionState.trendIntact=true, do not open opposite direction entries.',
+      '- If executionState.bootstrapPhaseMsRemaining > 0 and trendBias exists, prefer that side for first entry if edge is sufficient.',
+      '- If executionState.bootstrapWarmupMsRemaining > 0 and position is flat, keep HOLD until warmup is complete.',
+      '- During intact trend, prefer MANAGE reducePct 0.1-0.3 for small profit-taking instead of full EXIT.',
+      '- Use microAlpha.expectedEdgeBps and microAlpha.tradableFlow as primary gating for ENTER decisions.',
+      '- If microAlpha.expectedEdgeBps < 0, prefer HOLD unless forced risk management is needed.',
       '',
       'You should manage full lifecycle: entry, add, reduce, exit.',
-      'Prefer add-on only when winner conditions and trend integrity hold.',
-      'Under-trading is penalized: do not stay idle for long during active tradable flow.',
+      'Prefer add-on when winner conditions hold, or when trend is intact and price is in pullback/reclaim zone.',
+      'Over-trading is penalized: do not churn entries without clear edge.',
       '',
       'JSON schema fields:',
-      '{"version":1,"nonce":"...","intent":"HOLD|ENTER|MANAGE|EXIT","side":"LONG|SHORT|null","urgency":"LOW|MED|HIGH","entryStyle":"LIMIT|MARKET_SMALL|HYBRID","sizeMultiplier":0.1,"maxAdds":0,"addRule":"WINNER_ONLY|TREND_INTACT|NEVER","addTrigger":{"minUnrealizedPnlPct":0.0015,"trendIntact":true,"obiSupportMin":0.1,"deltaConfirm":true},"reducePct":null,"invalidationHint":"VWAP|ATR|OBI_FLIP|ABSORPTION_BREAK|NONE","explanationTags":["TREND_INTACT"],"confidence":0.0}',
+      '{"version":1,"nonce":"...","intent":"HOLD|ENTER|MANAGE|EXIT","side":"LONG|SHORT|null","urgency":"LOW|MED|HIGH","entryStyle":"LIMIT|MARKET_SMALL|HYBRID","sizeMultiplier":0.1,"maxAdds":0,"addRule":"WINNER_ONLY|TREND_INTACT|NEVER","addTrigger":{"minUnrealizedPnlPct":0.003,"trendIntact":true,"obiSupportMin":0.1,"deltaConfirm":true},"reducePct":null,"invalidationHint":"VWAP|ATR|OBI_FLIP|ABSORPTION_BREAK|NONE","explanationTags":["TREND_INTACT"],"confidence":0.0}',
       '',
       'Snapshot:',
       JSON.stringify(payload),
@@ -521,7 +669,7 @@ export class AIDryRunController {
     const entryStyle = this.parseEntryStyle(parsed.entryStyle);
     const addRule = this.parseAddRule(parsed.addRule);
     const invalidationHint = this.parseInvalidationHint(parsed.invalidationHint);
-    const confidence = clampPlanNumber(Number(parsed.confidence), 0, 1);
+    const confidence = clampPlanNumber(Number(parsed.confidence ?? 0.35), 0, 1);
     const sizeMultiplier = clampPlanNumber(Number(parsed.sizeMultiplier ?? 1), 0.1, 2);
     const maxAdds = clamp(Math.trunc(Number(parsed.maxAdds ?? 0)), 0, 5);
 
@@ -529,7 +677,7 @@ export class AIDryRunController {
       ? parsed.addTrigger as Record<string, unknown>
       : {};
     const addTrigger = {
-      minUnrealizedPnlPct: clampPlanNumber(Number(addTriggerInput.minUnrealizedPnlPct ?? DEFAULT_ADD_MIN_UPNL_PCT), 0, 0.05),
+      minUnrealizedPnlPct: clampPlanNumber(Number(addTriggerInput.minUnrealizedPnlPct ?? DEFAULT_ADD_MIN_UPNL_PCT), -0.05, 0.05),
       trendIntact: Boolean(addTriggerInput.trendIntact),
       obiSupportMin: clampPlanNumber(Number(addTriggerInput.obiSupportMin ?? 0.1), -1, 1),
       deltaConfirm: Boolean(addTriggerInput.deltaConfirm),
@@ -718,6 +866,562 @@ export class AIDryRunController {
     }
   }
 
+  private computeMicroAlphaContext(snapshot: AIMetricsSnapshot): MicroAlphaContext {
+    const deltaSignal = Number(snapshot.market.delta1s || 0) + Number(snapshot.market.delta5s || 0);
+    const cvdSignal = Number(snapshot.market.cvdSlope || 0);
+    const obiSignal = Number(snapshot.market.obiDeep || 0);
+    const absorptionSide = snapshot.absorption.side;
+    const absorptionValue = Math.max(0, Number(snapshot.absorption.value || 0));
+
+    const longVotes =
+      (deltaSignal > 0 ? 1 : 0) +
+      (cvdSignal > 0 ? 1 : 0) +
+      (obiSignal > 0 ? 1 : 0) +
+      (absorptionSide === 'buy' ? 1 : 0);
+    const shortVotes =
+      (deltaSignal < 0 ? 1 : 0) +
+      (cvdSignal < 0 ? 1 : 0) +
+      (obiSignal < 0 ? 1 : 0) +
+      (absorptionSide === 'sell' ? 1 : 0);
+
+    const sideBias: StrategySide | null =
+      longVotes >= 2 && longVotes > shortVotes
+        ? 'LONG'
+        : shortVotes >= 2 && shortVotes > longVotes
+          ? 'SHORT'
+          : null;
+
+    const deltaNorm = Math.abs(Math.tanh(deltaSignal / 4_000));
+    const cvdNorm = Math.abs(Math.tanh(cvdSignal / 300_000));
+    const obiNorm = clamp(Math.abs(obiSignal), 0, 1);
+    const burstNorm = clamp(Number(snapshot.trades.burstCount || 0) / 6, 0, 1);
+    const absorptionNorm = absorptionSide ? clamp(absorptionValue, 0, 1) : 0;
+    const signalStrength = clamp(
+      (deltaNorm * 0.34)
+      + (cvdNorm * 0.24)
+      + (obiNorm * 0.24)
+      + (burstNorm * 0.12)
+      + (absorptionNorm * 0.06),
+      0,
+      1
+    );
+
+    const trendIntact = sideBias != null
+      ? (sideBias === 'LONG'
+        ? (deltaSignal >= 0 && cvdSignal >= 0)
+        : (deltaSignal <= 0 && cvdSignal <= 0))
+      : false;
+
+    const spreadPctRaw = Number(snapshot.market.spreadPct ?? 0);
+    const spreadPct = Number.isFinite(spreadPctRaw) ? Math.abs(spreadPctRaw) : 0;
+    const spreadBps = spreadPct * 100;
+    const estimatedCostBps = (spreadBps * 0.5) + DEFAULT_ENTRY_FEE_BPS + DEFAULT_ENTRY_SLIPPAGE_BPS;
+    const regimeBonus = snapshot.decision.regime === 'TR' ? 1.4 : snapshot.decision.regime === 'MR' ? 0.4 : 0.2;
+    const flowBonus = clamp(Number(snapshot.trades.printsPerSecond || 0) / 12, 0, 1) * 1.4;
+    const expectedMoveBps = 1.6 + (signalStrength * 10.5) + regimeBonus + flowBonus;
+    const expectedEdgeBps = Number((expectedMoveBps - estimatedCostBps).toFixed(4));
+    const tradableFlow =
+      Number(snapshot.trades.printsPerSecond || 0) >= 0.5
+      && Number(snapshot.trades.tradeCount || 0) >= 6
+      && spreadPct <= 0.55
+      && Boolean(snapshot.decision.gatePassed);
+
+    return {
+      sideBias,
+      longVotes,
+      shortVotes,
+      signalStrength,
+      trendIntact,
+      tradableFlow,
+      spreadBps,
+      expectedMoveBps: Number(expectedMoveBps.toFixed(4)),
+      estimatedCostBps: Number(estimatedCostBps.toFixed(4)),
+      expectedEdgeBps,
+    };
+  }
+
+  private updateTrendState(
+    runtime: RuntimeState,
+    snapshot: AIMetricsSnapshot,
+    microAlpha: MicroAlphaContext,
+    nowMs: number
+  ): TrendStateView {
+    const price = Number(snapshot.market.price || 0);
+    const vwap = Number(snapshot.market.vwap || price || 1);
+    const vwapGap = vwap > 0 ? (price - vwap) / vwap : 0;
+    const vwapNorm = clamp(Math.tanh(vwapGap * 320), -1, 1);
+    const deltaNorm = clamp(Math.tanh((Number(snapshot.market.delta1s || 0) + Number(snapshot.market.delta5s || 0)) / 4000), -1, 1);
+    const cvdNorm = clamp(Math.tanh(Number(snapshot.market.cvdSlope || 0) / 250_000), -1, 1);
+    const obiNorm = clamp(Number(snapshot.market.obiDeep || 0), -1, 1);
+    const oiNorm = clamp(Number(snapshot.openInterest.oiChangePct || 0) / 1.2, -1, 1);
+    const absorptionNorm = snapshot.absorption.side === 'buy'
+      ? clamp(Number(snapshot.absorption.value || 0), 0, 1)
+      : snapshot.absorption.side === 'sell'
+        ? -clamp(Number(snapshot.absorption.value || 0), 0, 1)
+        : 0;
+
+    const directional = clamp(
+      (vwapNorm * 0.28)
+      + (deltaNorm * 0.22)
+      + (cvdNorm * 0.2)
+      + (obiNorm * 0.18)
+      + (oiNorm * 0.07)
+      + (absorptionNorm * 0.05),
+      -1,
+      1
+    );
+
+    const longScore = clamp((((directional + 1) * 0.5) * 0.75) + (microAlpha.signalStrength * 0.25), 0, 1);
+    const shortScore = clamp(((((-directional) + 1) * 0.5) * 0.75) + (microAlpha.signalStrength * 0.25), 0, 1);
+    const strength = Math.max(longScore, shortScore);
+    const candidate: StrategySide | null =
+      longScore >= DEFAULT_TREND_ENTRY_SCORE && (longScore - shortScore) >= DEFAULT_TREND_SIDE_GAP
+        ? 'LONG'
+        : shortScore >= DEFAULT_TREND_ENTRY_SCORE && (shortScore - longScore) >= DEFAULT_TREND_SIDE_GAP
+          ? 'SHORT'
+          : null;
+    const inBootstrapPhase =
+      runtime.bootstrapSeeded
+      && runtime.bootstrapPhaseUntilTs > nowMs
+      && runtime.trendBias != null;
+    const breakScoreThreshold = inBootstrapPhase
+      ? Math.max(0, DEFAULT_TREND_BREAK_SCORE - 0.06)
+      : DEFAULT_TREND_BREAK_SCORE;
+    const breakGapThreshold = inBootstrapPhase
+      ? -DEFAULT_TREND_SIDE_GAP
+      : (-DEFAULT_TREND_SIDE_GAP * 0.5);
+    const breakConfirmRequired = inBootstrapPhase
+      ? Math.max(DEFAULT_TREND_BREAK_CONFIRM_TICKS, Math.round(DEFAULT_TREND_BREAK_CONFIRM_TICKS * 1.8))
+      : DEFAULT_TREND_BREAK_CONFIRM_TICKS;
+
+    if (candidate === 'LONG') {
+      runtime.trendLongConfirmTicks += 1;
+      runtime.trendShortConfirmTicks = 0;
+    } else if (candidate === 'SHORT') {
+      runtime.trendShortConfirmTicks += 1;
+      runtime.trendLongConfirmTicks = 0;
+    } else {
+      runtime.trendLongConfirmTicks = Math.max(0, runtime.trendLongConfirmTicks - 1);
+      runtime.trendShortConfirmTicks = Math.max(0, runtime.trendShortConfirmTicks - 1);
+    }
+
+    const prevBias = runtime.trendBias;
+    if (!runtime.trendBias) {
+      if (runtime.trendLongConfirmTicks >= DEFAULT_TREND_CONFIRM_TICKS) {
+        runtime.trendBias = 'LONG';
+        runtime.trendBiasSinceTs = nowMs;
+        runtime.trendBreakConfirmTicks = 0;
+      } else if (runtime.trendShortConfirmTicks >= DEFAULT_TREND_CONFIRM_TICKS) {
+        runtime.trendBias = 'SHORT';
+        runtime.trendBiasSinceTs = nowMs;
+        runtime.trendBreakConfirmTicks = 0;
+      }
+    } else {
+      const sameScore = runtime.trendBias === 'LONG' ? longScore : shortScore;
+      const oppositeScore = runtime.trendBias === 'LONG' ? shortScore : longScore;
+      const intactNow =
+        sameScore >= breakScoreThreshold
+        && (sameScore - oppositeScore) >= breakGapThreshold;
+      if (intactNow) {
+        runtime.trendBreakConfirmTicks = 0;
+        runtime.trendIntact = true;
+      } else {
+        runtime.trendBreakConfirmTicks += 1;
+      }
+      if (runtime.trendBreakConfirmTicks >= breakConfirmRequired) {
+        if (candidate && candidate !== runtime.trendBias) {
+          runtime.trendBias = candidate;
+          runtime.trendBiasSinceTs = nowMs;
+          runtime.trendBreakConfirmTicks = 0;
+          runtime.trendIntact = true;
+        } else {
+          runtime.trendBias = null;
+          runtime.trendBiasSinceTs = 0;
+          runtime.trendIntact = false;
+          runtime.trendBreakConfirmTicks = 0;
+        }
+      }
+    }
+
+    if (runtime.trendBias) {
+      const sameScore = runtime.trendBias === 'LONG' ? longScore : shortScore;
+      const oppositeScore = runtime.trendBias === 'LONG' ? shortScore : longScore;
+      runtime.trendIntact =
+        sameScore >= breakScoreThreshold
+        && (sameScore - oppositeScore) >= breakGapThreshold;
+    } else {
+      runtime.trendIntact = false;
+    }
+
+    runtime.trendLastStrength = strength;
+    if (prevBias !== runtime.trendBias) {
+      this.log?.('AI_TREND_BIAS_CHANGE', {
+        symbol: snapshot.symbol,
+        previousBias: prevBias,
+        nextBias: runtime.trendBias,
+        longScore: Number(longScore.toFixed(4)),
+        shortScore: Number(shortScore.toFixed(4)),
+        strength: Number(strength.toFixed(4)),
+      });
+    }
+
+    return {
+      bias: runtime.trendBias,
+      longScore,
+      shortScore,
+      strength,
+      candidate,
+      intact: runtime.trendIntact,
+      ageMs: runtime.trendBiasSinceTs > 0 ? Math.max(0, nowMs - runtime.trendBiasSinceTs) : null,
+      breakConfirm: runtime.trendBreakConfirmTicks,
+    };
+  }
+
+  private orchestratePlan(
+    snapshot: AIMetricsSnapshot,
+    plan: AIDecisionPlan,
+    microAlpha: MicroAlphaContext,
+    trend: TrendStateView,
+    runtime: RuntimeState
+  ): AIDecisionPlan {
+    const flat = !snapshot.position;
+    const holdStreak = Number(snapshot.executionState.holdStreak || 0);
+    const blocked = Array.isArray(snapshot.blockedReasons) && snapshot.blockedReasons.length > 0;
+    const trendBias = trend.bias;
+    const trendIntact = trend.intact;
+    const trendStrength = Number(trend.strength || 0);
+    const position = snapshot.position;
+    const nowMs = Number(snapshot.timestampMs || Date.now());
+    const bootstrapPhaseMsRemaining = runtime.bootstrapPhaseUntilTs > nowMs
+      ? Math.max(0, runtime.bootstrapPhaseUntilTs - nowMs)
+      : 0;
+    const bootstrapWarmupMsRemaining = runtime.bootstrapWarmupUntilTs > nowMs
+      ? Math.max(0, runtime.bootstrapWarmupUntilTs - nowMs)
+      : 0;
+    const warmupComplete = bootstrapWarmupMsRemaining <= 0;
+    const bootstrapPhaseActive =
+      flat
+      && runtime.bootstrapSeeded
+      && runtime.bootstrapSeedStrength >= DEFAULT_BOOTSTRAP_MIN_STRENGTH
+      && bootstrapPhaseMsRemaining > 0
+      && Boolean(trendBias)
+      && warmupComplete;
+
+    if (plan.intent === 'ENTER' && flat && !warmupComplete) {
+      this.log?.('AI_ENTRY_DELAYED_WARMUP', {
+        symbol: snapshot.symbol,
+        warmupMsRemaining: bootstrapWarmupMsRemaining,
+      });
+      return this.buildSafeHoldPlan(plan.nonce, 'COOLDOWN_ACTIVE');
+    }
+
+    if (trendBias && plan.intent === 'ENTER') {
+      const currentSide = plan.side ? (plan.side as StrategySide) : null;
+      if (!currentSide || currentSide !== trendBias) {
+        const aligned: AIDecisionPlan = {
+          ...plan,
+          side: trendBias,
+          explanationTags: this.pushTag(plan.explanationTags, 'TREND_INTACT'),
+          confidence: clampPlanNumber(Math.max(Number(plan.confidence || 0), 0.35 + (trendStrength * 0.4)), 0, 1),
+        };
+        this.log?.('AI_TREND_SIDE_LOCK', {
+          symbol: snapshot.symbol,
+          originalSide: currentSide,
+          alignedSide: trendBias,
+          trendStrength: Number(trendStrength.toFixed(4)),
+        });
+        plan = aligned;
+      }
+    }
+
+    if (trendBias && plan.intent === 'EXIT' && position && position.side === trendBias && trendIntact && microAlpha.expectedEdgeBps > -0.1) {
+      return {
+        ...plan,
+        intent: 'MANAGE',
+        reducePct: DEFAULT_TREND_TP_REDUCE_PCT,
+        explanationTags: this.pushTag(plan.explanationTags, 'TREND_INTACT'),
+      };
+    }
+
+    if (
+      trendBias
+      && position
+      && position.side === trendBias
+      && trendIntact
+      && plan.intent === 'HOLD'
+    ) {
+      const upnl = Number(position.unrealizedPnlPct || 0);
+      const sinceLastTp = Number(snapshot.executionState.lastTrendTakeProfitMsAgo ?? Number.POSITIVE_INFINITY);
+      if (upnl >= DEFAULT_TREND_TP_MIN_UPNL_PCT && sinceLastTp >= DEFAULT_TREND_TP_COOLDOWN_MS) {
+        this.telemetry.holdOverrides += 1;
+        return {
+          ...plan,
+          intent: 'MANAGE',
+          side: position.side,
+          reducePct: DEFAULT_TREND_TP_REDUCE_PCT,
+          addRule: 'NEVER',
+          maxAdds: 0,
+          explanationTags: this.pushTag(plan.explanationTags, 'TREND_INTACT'),
+          confidence: clampPlanNumber(Math.max(Number(plan.confidence || 0), 0.55), 0, 1),
+        };
+      }
+
+      const pullbackEligible =
+        upnl <= DEFAULT_PULLBACK_ADD_TRIGGER_UPNL_PCT
+        && upnl >= -DEFAULT_PULLBACK_ADD_MAX_ADVERSE_PCT
+        && snapshot.decision.gatePassed
+        && !blocked
+        && microAlpha.tradableFlow
+        && microAlpha.expectedEdgeBps >= DEFAULT_PULLBACK_ADD_EDGE_BPS;
+      if (pullbackEligible) {
+        this.telemetry.holdOverrides += 1;
+        this.log?.('AI_HOLD_OVERRIDE_TO_PULLBACK_ADD', {
+          symbol: snapshot.symbol,
+          upnlPct: Number(upnl.toFixed(6)),
+          edgeBps: Number(microAlpha.expectedEdgeBps.toFixed(4)),
+          trendBias,
+          trendStrength: Number(trendStrength.toFixed(4)),
+        });
+        return {
+          ...plan,
+          intent: 'MANAGE',
+          side: position.side,
+          reducePct: null,
+          sizeMultiplier: clampPlanNumber(
+            Math.max(Number(plan.sizeMultiplier || 0), DEFAULT_PULLBACK_ADD_SIZE_MULT + (microAlpha.signalStrength * 0.2)),
+            0.1,
+            1.3
+          ),
+          maxAdds: Math.max(Number(plan.maxAdds || 0), 3),
+          addRule: 'TREND_INTACT',
+          addTrigger: {
+            minUnrealizedPnlPct: -DEFAULT_PULLBACK_ADD_MAX_ADVERSE_PCT,
+            trendIntact: true,
+            obiSupportMin: 0.06,
+            deltaConfirm: true,
+          },
+          explanationTags: this.pushTag(plan.explanationTags, 'TREND_INTACT'),
+          confidence: clampPlanNumber(Math.max(Number(plan.confidence || 0), 0.5 + (microAlpha.signalStrength * 0.22)), 0, 1),
+        };
+      }
+    }
+
+    if (plan.intent === 'HOLD') {
+      const firstEntrySide = (trendBias || microAlpha.sideBias) as StrategySide | null;
+      const firstEntryStrength = trendBias ? trendStrength : microAlpha.signalStrength;
+      const firstEntryIntact = trendBias ? trendIntact : microAlpha.trendIntact;
+      const isFirstEntryPending = flat && runtime.lastEntryTs <= 0;
+      const shouldForceFirstEntry =
+        isFirstEntryPending
+        && snapshot.decision.gatePassed
+        && !blocked
+        && warmupComplete
+        && microAlpha.tradableFlow
+        && Boolean(firstEntrySide)
+        && firstEntryIntact
+        && firstEntryStrength >= DEFAULT_FIRST_ENTRY_MIN_STRENGTH
+        && holdStreak >= DEFAULT_FIRST_ENTRY_HOLD_STREAK
+        && microAlpha.expectedEdgeBps >= DEFAULT_FIRST_ENTRY_EDGE_BPS;
+      if (shouldForceFirstEntry) {
+        this.telemetry.holdOverrides += 1;
+        this.telemetry.probeEntries += 1;
+        const firstEntry = this.buildProbeEnterPlan(plan.nonce, microAlpha, firstEntrySide);
+        const tunedFirstEntry: AIDecisionPlan = {
+          ...firstEntry,
+          sizeMultiplier: clampPlanNumber(
+            Math.max(Number(firstEntry.sizeMultiplier || 0.25), 0.3 + (firstEntryStrength * 0.35)),
+            0.2,
+            1.1
+          ),
+          confidence: clampPlanNumber(Math.max(Number(firstEntry.confidence || 0), 0.5 + (firstEntryStrength * 0.3)), 0, 1),
+          explanationTags: this.pushTag(firstEntry.explanationTags, 'TREND_INTACT'),
+        };
+        this.log?.('AI_HOLD_OVERRIDE_TO_FIRST_ENTRY', {
+          symbol: snapshot.symbol,
+          holdStreak,
+          side: tunedFirstEntry.side,
+          expectedEdgeBps: Number(microAlpha.expectedEdgeBps.toFixed(4)),
+          strength: Number(firstEntryStrength.toFixed(4)),
+          thresholdEdgeBps: DEFAULT_FIRST_ENTRY_EDGE_BPS,
+        });
+        return tunedFirstEntry;
+      }
+
+      const shouldBootstrapEnter =
+        bootstrapPhaseActive
+        && snapshot.decision.gatePassed
+        && !blocked
+        && microAlpha.tradableFlow
+        && microAlpha.expectedEdgeBps >= DEFAULT_BOOTSTRAP_MIN_EDGE_BPS;
+      if (shouldBootstrapEnter) {
+        this.telemetry.holdOverrides += 1;
+        const bootstrapEnter = this.buildBootstrapEnterPlan(plan.nonce, microAlpha, trendBias as StrategySide, runtime.bootstrapSeedStrength);
+        this.log?.('AI_BOOTSTRAP_ENTER', {
+          symbol: snapshot.symbol,
+          side: bootstrapEnter.side,
+          edgeBps: Number(microAlpha.expectedEdgeBps.toFixed(4)),
+          seedStrength: Number(runtime.bootstrapSeedStrength.toFixed(4)),
+          bootstrapPhaseMsRemaining,
+        });
+        return bootstrapEnter;
+      }
+      const shouldProbe =
+        flat
+        && snapshot.decision.gatePassed
+        && !blocked
+        && warmupComplete
+        && microAlpha.tradableFlow
+        && (trendBias != null || microAlpha.sideBias != null)
+        && holdStreak >= DEFAULT_PROBE_HOLD_STREAK
+        && microAlpha.expectedEdgeBps >= DEFAULT_PROBE_EDGE_BPS;
+      if (shouldProbe) {
+        this.telemetry.holdOverrides += 1;
+        this.telemetry.probeEntries += 1;
+        const probe = this.buildProbeEnterPlan(plan.nonce, microAlpha, trendBias);
+        this.log?.('AI_HOLD_OVERRIDE_TO_PROBE', {
+          symbol: snapshot.symbol,
+          holdStreak,
+          expectedEdgeBps: Number(microAlpha.expectedEdgeBps.toFixed(4)),
+          side: probe.side,
+          urgency: probe.urgency,
+          entryStyle: probe.entryStyle,
+          sizeMultiplier: probe.sizeMultiplier,
+        });
+        return probe;
+      }
+      return plan;
+    }
+
+    if (plan.intent === 'ENTER') {
+      if (!microAlpha.tradableFlow || microAlpha.expectedEdgeBps < DEFAULT_EDGE_MIN_BPS) {
+        this.telemetry.edgeFilteredEntries += 1;
+        this.log?.('AI_ENTRY_DEMOTED_EDGE', {
+          symbol: snapshot.symbol,
+          expectedEdgeBps: Number(microAlpha.expectedEdgeBps.toFixed(4)),
+          tradableFlow: microAlpha.tradableFlow,
+          threshold: DEFAULT_EDGE_MIN_BPS,
+        });
+        return this.buildSafeHoldPlan(plan.nonce, 'EDGE_TOO_WEAK');
+      }
+
+      const tuned: AIDecisionPlan = { ...plan };
+      if (!tuned.side && (trendBias || microAlpha.sideBias)) {
+        tuned.side = (trendBias || microAlpha.sideBias) as 'LONG' | 'SHORT';
+      }
+      if (trendBias && tuned.side && tuned.side !== trendBias) {
+        tuned.side = trendBias;
+      } else if (microAlpha.sideBias && tuned.side && tuned.side !== microAlpha.sideBias && microAlpha.signalStrength >= DEFAULT_SIDE_ALIGN_STRENGTH) {
+        tuned.side = microAlpha.sideBias;
+      }
+      tuned.urgency = this.deriveUrgencyFromEdge(microAlpha.expectedEdgeBps);
+      tuned.entryStyle = this.deriveEntryStyle(microAlpha.expectedEdgeBps, microAlpha.spreadBps);
+      const baseSize = clampPlanNumber(Number(tuned.sizeMultiplier ?? 1), 0.1, 2);
+      const edgeScaled = clamp(0.35 + (microAlpha.signalStrength * 0.9), 0.25, 1.6);
+      tuned.sizeMultiplier = clampPlanNumber((baseSize * 0.5) + (edgeScaled * 0.5), 0.1, 2);
+      tuned.confidence = clampPlanNumber(Math.max(Number(tuned.confidence || 0), 0.2 + (microAlpha.signalStrength * 0.6)), 0, 1);
+      tuned.addTrigger = {
+        ...tuned.addTrigger,
+        trendIntact: tuned.addTrigger.trendIntact || microAlpha.trendIntact,
+      };
+      tuned.explanationTags = this.pushTag(tuned.explanationTags, microAlpha.trendIntact ? 'TREND_INTACT' : 'TREND_BROKEN');
+      return tuned;
+    }
+
+    if (plan.intent === 'MANAGE' && this.planImpliesAdd(plan) && microAlpha.expectedEdgeBps < Math.max(-0.2, DEFAULT_EDGE_MIN_BPS * 0.25)) {
+      this.log?.('AI_ADD_DEMOTED_EDGE', {
+        symbol: snapshot.symbol,
+        expectedEdgeBps: Number(microAlpha.expectedEdgeBps.toFixed(4)),
+      });
+      return this.buildSafeHoldPlan(plan.nonce, 'EDGE_TOO_WEAK');
+    }
+
+    return plan;
+  }
+
+  private buildProbeEnterPlan(nonce: string, microAlpha: MicroAlphaContext, forcedSide?: StrategySide | null): AIDecisionPlan {
+    const side: 'LONG' | 'SHORT' = forcedSide === 'SHORT' || microAlpha.sideBias === 'SHORT' ? 'SHORT' : 'LONG';
+    const sizeMultiplier = clampPlanNumber(DEFAULT_PROBE_SIZE_MULT + (microAlpha.signalStrength * 0.35), 0.1, 1.2);
+    const firstTag = side === 'LONG' ? 'OBI_UP' : 'OBI_DOWN';
+    return {
+      version: PLAN_VERSION,
+      nonce,
+      intent: 'ENTER',
+      side,
+      urgency: this.deriveUrgencyFromEdge(microAlpha.expectedEdgeBps),
+      entryStyle: this.deriveEntryStyle(microAlpha.expectedEdgeBps, microAlpha.spreadBps),
+      sizeMultiplier,
+      maxAdds: 2,
+      addRule: 'TREND_INTACT',
+      addTrigger: {
+        minUnrealizedPnlPct: -Math.min(DEFAULT_PULLBACK_ADD_MAX_ADVERSE_PCT, 0.003),
+        trendIntact: microAlpha.trendIntact,
+        obiSupportMin: 0.08,
+        deltaConfirm: true,
+      },
+      reducePct: null,
+      invalidationHint: 'VWAP',
+      explanationTags: [firstTag, 'DELTA_BURST', microAlpha.trendIntact ? 'TREND_INTACT' : 'TREND_BROKEN']
+        .filter((tag): tag is AIExplanationTag => ALLOWED_TAGS.has(tag as AIExplanationTag))
+        .slice(0, 5),
+      confidence: clampPlanNumber(0.45 + (microAlpha.signalStrength * 0.4), 0, 0.95),
+    };
+  }
+
+  private buildBootstrapEnterPlan(
+    nonce: string,
+    microAlpha: MicroAlphaContext,
+    trendBias: StrategySide,
+    seedStrength: number
+  ): AIDecisionPlan {
+    const side: 'LONG' | 'SHORT' = trendBias === 'SHORT' ? 'SHORT' : 'LONG';
+    const sizeMultiplier = clampPlanNumber(
+      0.35 + (clamp(seedStrength, 0, 1) * 0.35) + (clamp(microAlpha.signalStrength, 0, 1) * 0.2),
+      0.25,
+      0.95
+    );
+    const firstTag: AIExplanationTag = side === 'LONG' ? 'OBI_UP' : 'OBI_DOWN';
+    return {
+      version: PLAN_VERSION,
+      nonce,
+      intent: 'ENTER',
+      side,
+      urgency: this.deriveUrgencyFromEdge(Math.max(microAlpha.expectedEdgeBps, DEFAULT_BOOTSTRAP_MIN_EDGE_BPS)),
+      entryStyle: 'LIMIT',
+      sizeMultiplier,
+      maxAdds: 2,
+      addRule: 'TREND_INTACT',
+      addTrigger: {
+        minUnrealizedPnlPct: -Math.min(DEFAULT_PULLBACK_ADD_MAX_ADVERSE_PCT, 0.0035),
+        trendIntact: true,
+        obiSupportMin: 0.12,
+        deltaConfirm: true,
+      },
+      reducePct: null,
+      invalidationHint: 'VWAP',
+      explanationTags: [firstTag, 'TREND_INTACT'],
+      confidence: clampPlanNumber(0.5 + (clamp(seedStrength, 0, 1) * 0.3) + (clamp(microAlpha.signalStrength, 0, 1) * 0.2), 0, 0.96),
+    };
+  }
+
+  private deriveUrgencyFromEdge(expectedEdgeBps: number): AIUrgency {
+    if (expectedEdgeBps >= 6) return 'HIGH';
+    if (expectedEdgeBps >= 2) return 'MED';
+    return 'LOW';
+  }
+
+  private deriveEntryStyle(expectedEdgeBps: number, spreadBps: number): AIEntryStyle {
+    if (spreadBps >= 7) return 'LIMIT';
+    if (expectedEdgeBps >= 5.5) return 'MARKET_SMALL';
+    return 'HYBRID';
+  }
+
+  private pushTag(tags: AIExplanationTag[] | undefined, tag: AIExplanationTag): AIExplanationTag[] {
+    const next = Array.isArray(tags) ? [...tags] : [];
+    if (!ALLOWED_TAGS.has(tag)) return next.slice(0, 5);
+    if (!next.includes(tag)) next.push(tag);
+    return next.slice(0, 5);
+  }
+
   private applyGuardrails(
     snapshot: AIMetricsSnapshot,
     plan: AIDecisionPlan,
@@ -762,6 +1466,7 @@ export class AIDryRunController {
       promptNonce: string;
       blockedReasons: GuardrailReason[];
       forcedAction: AIForcedAction | null;
+      microAlpha: MicroAlphaContext;
       snapshotHash: string;
     }
   ): StrategyDecision {
@@ -850,6 +1555,12 @@ export class AIDryRunController {
           promptNonce: context.promptNonce,
           blockedReasons: context.blockedReasons,
           forcedAction: context.forcedAction,
+          microAlpha: {
+            sideBias: context.microAlpha.sideBias,
+            signalStrength: Number(context.microAlpha.signalStrength.toFixed(4)),
+            expectedEdgeBps: Number(context.microAlpha.expectedEdgeBps.toFixed(4)),
+            tradableFlow: context.microAlpha.tradableFlow,
+          },
           snapshotHash: context.snapshotHash,
         },
       },
@@ -862,6 +1573,9 @@ export class AIDryRunController {
       stats: {
         aiDecision: 1,
         aiConfidence: plan.confidence,
+        expectedEdgeBps: Number(context.microAlpha.expectedEdgeBps.toFixed(4)),
+        signalStrength: Number(context.microAlpha.signalStrength.toFixed(4)),
+        tradableFlow: context.microAlpha.tradableFlow ? 1 : 0,
       },
     };
 
@@ -894,9 +1608,13 @@ export class AIDryRunController {
       : 0;
     if (marginUsage >= DEFAULT_ADD_MARGIN_USAGE_CAP) return false;
 
-    const minUpnl = clampPlanNumber(plan.addTrigger.minUnrealizedPnlPct, 0, 0.05);
+    const minUpnl = clampPlanNumber(plan.addTrigger.minUnrealizedPnlPct, -0.05, 0.05);
     const upnl = Number(position.unrealizedPnlPct || 0);
     const sideSign = position.side === 'LONG' ? 1 : -1;
+    const executionTrendIntact = typeof snapshot.executionState.trendIntact === 'boolean'
+      ? snapshot.executionState.trendIntact
+      : plan.addTrigger.trendIntact;
+    const trendIntactNow = Boolean(plan.addTrigger.trendIntact) && Boolean(executionTrendIntact);
 
     const deltaAligned = plan.addTrigger.deltaConfirm
       ? sideSign * (snapshot.market.delta5s + snapshot.market.delta1s) > 0
@@ -909,11 +1627,12 @@ export class AIDryRunController {
     if (!deltaAligned || !obiSupport) return false;
 
     if (plan.addRule === 'WINNER_ONLY') {
-      return upnl >= Math.max(minUpnl, DEFAULT_ADD_MIN_UPNL_PCT) && Boolean(plan.addTrigger.trendIntact);
+      return upnl >= Math.max(minUpnl, DEFAULT_ADD_MIN_UPNL_PCT) && trendIntactNow;
     }
 
     if (plan.addRule === 'TREND_INTACT') {
-      return Boolean(plan.addTrigger.trendIntact) && upnl >= 0;
+      const pullbackFloor = Math.max(-DEFAULT_PULLBACK_ADD_MAX_ADVERSE_PCT, minUpnl);
+      return trendIntactNow && upnl >= pullbackFloor;
     }
 
     return false;
@@ -956,6 +1675,10 @@ export class AIDryRunController {
     if (plan.intent === 'MANAGE' && this.planImpliesAdd(plan) && this.shouldAllowAdd(snapshot, plan)) {
       runtime.lastAddTs = nowMs;
       this.telemetry.addsCount += 1;
+    }
+
+    if (plan.intent === 'MANAGE' && plan.reducePct != null) {
+      runtime.lastTrendTakeProfitTs = nowMs;
     }
 
     if (plan.intent === 'EXIT' && snapshot.position) {
@@ -1061,9 +1784,10 @@ export class AIDryRunController {
     return 'NONE';
   }
 
-  private getRuntimeState(symbol: string): RuntimeState {
+  private getRuntimeState(symbol: string, nowMs = Date.now()): RuntimeState {
     let state = this.runtime.get(symbol);
     if (!state) {
+      const seed = this.bootstrapTrendBySymbol.get(symbol);
       state = {
         lastAction: 'NONE',
         lastActionSide: null,
@@ -1072,8 +1796,28 @@ export class AIDryRunController {
         lastFlipTs: 0,
         lastExitSide: null,
         holdStartTs: 0,
+        trendBias: seed?.bias ?? null,
+        trendBiasSinceTs: seed?.asOfMs ?? 0,
+        trendLongConfirmTicks: seed?.bias === 'LONG' ? Math.max(1, Math.floor(DEFAULT_TREND_CONFIRM_TICKS / 2)) : 0,
+        trendShortConfirmTicks: seed?.bias === 'SHORT' ? Math.max(1, Math.floor(DEFAULT_TREND_CONFIRM_TICKS / 2)) : 0,
+        trendBreakConfirmTicks: 0,
+        trendLastStrength: clamp(Number(seed?.strength ?? 0), 0, 1),
+        trendIntact: Boolean(seed?.bias),
+        lastTrendTakeProfitTs: 0,
+        bootstrapSeeded: Boolean(seed?.bias),
+        bootstrapSeedStrength: clamp(Number(seed?.strength ?? 0), 0, 1),
+        bootstrapPhaseUntilTs: seed?.bias ? (nowMs + DEFAULT_BOOTSTRAP_PHASE_MS) : 0,
+        bootstrapWarmupUntilTs: nowMs + DEFAULT_BOOTSTRAP_WARMUP_MS,
       };
       this.runtime.set(symbol, state);
+      if (seed?.bias) {
+        this.log?.('AI_TREND_BOOTSTRAP_APPLIED', {
+          symbol,
+          bias: seed.bias,
+          strength: Number(state.trendLastStrength.toFixed(4)),
+          asOfMs: seed.asOfMs,
+        });
+      }
     }
     return state;
   }
@@ -1117,7 +1861,8 @@ export class AIDryRunController {
     snapshot: AIMetricsSnapshot,
     runtime: RuntimeState,
     blockedReasons: string[],
-    runtimeContext: GuardrailRuntimeContext
+    runtimeContext: GuardrailRuntimeContext,
+    trend: TrendStateView
   ): AIMetricsSnapshot {
     const nowMs = Number(snapshot.timestampMs || Date.now());
     const holdStreak = this.holdStreak.get(snapshot.symbol) || 0;
@@ -1137,6 +1882,15 @@ export class AIDryRunController {
         holdStreak,
         lastAddMsAgo: runtime.lastAddTs > 0 ? Math.max(0, nowMs - runtime.lastAddTs) : null,
         lastFlipMsAgo: runtime.lastFlipTs > 0 ? Math.max(0, nowMs - runtime.lastFlipTs) : null,
+        trendBias: trend.bias,
+        trendStrength: Number(trend.strength.toFixed(4)),
+        trendIntact: trend.intact,
+        trendAgeMs: trend.ageMs,
+        trendBreakConfirm: trend.breakConfirm,
+        lastTrendTakeProfitMsAgo: runtime.lastTrendTakeProfitTs > 0 ? Math.max(0, nowMs - runtime.lastTrendTakeProfitTs) : null,
+        bootstrapPhaseMsRemaining: runtime.bootstrapPhaseUntilTs > nowMs ? Math.max(0, runtime.bootstrapPhaseUntilTs - nowMs) : 0,
+        bootstrapSeedStrength: runtime.bootstrapSeedStrength > 0 ? Number(runtime.bootstrapSeedStrength.toFixed(4)) : 0,
+        bootstrapWarmupMsRemaining: runtime.bootstrapWarmupUntilTs > nowMs ? Math.max(0, runtime.bootstrapWarmupUntilTs - nowMs) : 0,
       },
       position: snapshot.position
         ? {

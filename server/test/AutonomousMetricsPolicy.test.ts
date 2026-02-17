@@ -243,6 +243,64 @@ export function runTests() {
 
   {
     const controller = getController();
+    const shouldAllowAdd = (controller as any).shouldAllowAdd.bind(controller);
+    const pullbackAllowed = shouldAllowAdd(
+      buildSnapshot({
+        decision: { gatePassed: true },
+        executionState: { trendIntact: true },
+        position: {
+          side: 'LONG',
+          qty: 0.5,
+          entryPrice: 60_000,
+          unrealizedPnlPct: -0.0035,
+          addsUsed: 1,
+          timeInPositionMs: 40_000,
+        },
+        market: { obiDeep: 0.42, delta1s: 18, delta5s: 55 },
+      }),
+      buildPlan({
+        intent: 'MANAGE',
+        addRule: 'TREND_INTACT',
+        addTrigger: {
+          minUnrealizedPnlPct: -0.006,
+          trendIntact: true,
+          obiSupportMin: 0.1,
+          deltaConfirm: true,
+        },
+      })
+    );
+    assert(pullbackAllowed === true, 'trend-intact pullback should allow add in controlled adverse range');
+
+    const pullbackTooDeep = shouldAllowAdd(
+      buildSnapshot({
+        decision: { gatePassed: true },
+        executionState: { trendIntact: true },
+        position: {
+          side: 'LONG',
+          qty: 0.5,
+          entryPrice: 60_000,
+          unrealizedPnlPct: -0.02,
+          addsUsed: 1,
+          timeInPositionMs: 40_000,
+        },
+        market: { obiDeep: 0.42, delta1s: 18, delta5s: 55 },
+      }),
+      buildPlan({
+        intent: 'MANAGE',
+        addRule: 'TREND_INTACT',
+        addTrigger: {
+          minUnrealizedPnlPct: -0.02,
+          trendIntact: true,
+          obiSupportMin: 0.1,
+          deltaConfirm: true,
+        },
+      })
+    );
+    assert(pullbackTooDeep === false, 'pullback add should be blocked when drawdown is too deep');
+  }
+
+  {
+    const controller = getController();
     const applyGuardrails = (controller as any).applyGuardrails.bind(controller);
     const out = applyGuardrails(
       buildSnapshot({
@@ -265,5 +323,122 @@ export function runTests() {
       }
     );
     assert(out.intent === 'HOLD', 'flip cooldown should prevent reversal entry');
+  }
+
+  {
+    const controller = getController();
+    const computeMicroAlphaContext = (controller as any).computeMicroAlphaContext.bind(controller);
+    const getRuntimeState = (controller as any).getRuntimeState.bind(controller);
+    const updateTrendState = (controller as any).updateTrendState.bind(controller);
+    const orchestratePlan = (controller as any).orchestratePlan.bind(controller);
+    const snapshot = buildSnapshot({
+      executionState: { holdStreak: 5 },
+      blockedReasons: [],
+      position: null,
+    });
+    const microAlpha = computeMicroAlphaContext(snapshot);
+    const runtime = getRuntimeState(snapshot.symbol);
+    const trend = updateTrendState(runtime, snapshot, microAlpha, snapshot.timestampMs);
+    const out = orchestratePlan(snapshot, buildPlan({ intent: 'HOLD', side: null }), microAlpha, trend);
+    assert(out.intent === 'ENTER', 'hold streak with tradable positive edge should trigger probe ENTER');
+    assert(out.side === 'LONG' || out.side === 'SHORT', 'probe entry should select a side');
+  }
+
+  {
+    const controller = getController();
+    const computeMicroAlphaContext = (controller as any).computeMicroAlphaContext.bind(controller);
+    const getRuntimeState = (controller as any).getRuntimeState.bind(controller);
+    const updateTrendState = (controller as any).updateTrendState.bind(controller);
+    const orchestratePlan = (controller as any).orchestratePlan.bind(controller);
+    const snapshot = buildSnapshot({
+      executionState: { holdStreak: 1 },
+      blockedReasons: [],
+      position: null,
+      market: { delta1s: -120, delta5s: -800, cvdSlope: -240_000, obiDeep: -0.65, spreadPct: 0.03 },
+      absorption: { side: 'sell', value: 1 },
+      trades: { printsPerSecond: 6, tradeCount: 22, burstCount: 3, burstSide: 'sell' },
+    });
+    const runtime = getRuntimeState(snapshot.symbol);
+    runtime.bootstrapWarmupUntilTs = snapshot.timestampMs - 1;
+    runtime.trendBias = 'SHORT';
+    runtime.trendIntact = true;
+    runtime.trendBiasSinceTs = snapshot.timestampMs - 180_000;
+    const microAlpha = computeMicroAlphaContext(snapshot);
+    const trend = updateTrendState(runtime, snapshot, microAlpha, snapshot.timestampMs);
+    const out = orchestratePlan(snapshot, buildPlan({ intent: 'HOLD', side: null }), microAlpha, trend, runtime);
+    assert(out.intent === 'ENTER', 'first-entry hold override should force trend-aligned enter on valid short bias');
+    assert(out.side === 'SHORT', 'first-entry hold override should align with short trend');
+  }
+
+  {
+    const controller = getController();
+    const computeMicroAlphaContext = (controller as any).computeMicroAlphaContext.bind(controller);
+    const getRuntimeState = (controller as any).getRuntimeState.bind(controller);
+    const updateTrendState = (controller as any).updateTrendState.bind(controller);
+    const orchestratePlan = (controller as any).orchestratePlan.bind(controller);
+    const snapshot = buildSnapshot({
+      market: { spreadPct: 1.2 },
+      trades: { printsPerSecond: 9, tradeCount: 40 },
+    });
+    const microAlpha = computeMicroAlphaContext(snapshot);
+    const runtime = getRuntimeState(snapshot.symbol);
+    const trend = updateTrendState(runtime, snapshot, microAlpha, snapshot.timestampMs);
+    const out = orchestratePlan(snapshot, buildPlan({ intent: 'ENTER', side: 'LONG' }), microAlpha, trend);
+    assert(out.intent === 'HOLD', 'entry should be filtered when edge is not tradable');
+  }
+
+  {
+    const controller = getController();
+    const computeMicroAlphaContext = (controller as any).computeMicroAlphaContext.bind(controller);
+    const getRuntimeState = (controller as any).getRuntimeState.bind(controller);
+    const updateTrendState = (controller as any).updateTrendState.bind(controller);
+    const orchestratePlan = (controller as any).orchestratePlan.bind(controller);
+    const runtime = getRuntimeState('BTCUSDT');
+    runtime.trendBias = 'LONG';
+    runtime.trendIntact = true;
+    runtime.trendBiasSinceTs = Date.now() - 120_000;
+
+    const snapshot = buildSnapshot({
+      executionState: { holdStreak: 0, trendBias: 'LONG', trendIntact: true, trendAgeMs: 120_000 },
+      position: null,
+    });
+    const microAlpha = computeMicroAlphaContext(snapshot);
+    const trend = updateTrendState(runtime, snapshot, microAlpha, snapshot.timestampMs);
+    const out = orchestratePlan(snapshot, buildPlan({ intent: 'ENTER', side: 'SHORT' }), microAlpha, trend);
+    assert(out.intent === 'ENTER' && out.side === 'LONG', 'trend bias should lock opposite entry to trend side');
+  }
+
+  {
+    const controller = getController();
+    const computeMicroAlphaContext = (controller as any).computeMicroAlphaContext.bind(controller);
+    const getRuntimeState = (controller as any).getRuntimeState.bind(controller);
+    const updateTrendState = (controller as any).updateTrendState.bind(controller);
+    const orchestratePlan = (controller as any).orchestratePlan.bind(controller);
+    const runtime = getRuntimeState('BTCUSDT');
+    runtime.trendBias = 'LONG';
+    runtime.trendIntact = true;
+    runtime.trendBiasSinceTs = Date.now() - 240_000;
+
+    const snapshot = buildSnapshot({
+      executionState: {
+        holdStreak: 0,
+        trendBias: 'LONG',
+        trendIntact: true,
+        trendAgeMs: 240_000,
+        lastTrendTakeProfitMsAgo: 120_000,
+      },
+      position: {
+        side: 'LONG',
+        qty: 0.4,
+        entryPrice: 60_000,
+        unrealizedPnlPct: 0.004,
+        addsUsed: 0,
+        timeInPositionMs: 120_000,
+      },
+    });
+    const microAlpha = computeMicroAlphaContext(snapshot);
+    const trend = updateTrendState(runtime, snapshot, microAlpha, snapshot.timestampMs);
+    const out = orchestratePlan(snapshot, buildPlan({ intent: 'HOLD', side: null }), microAlpha, trend);
+    assert(out.intent === 'MANAGE' && Number(out.reducePct) > 0, 'intact trend with pnl should convert HOLD to partial reduce');
   }
 }
