@@ -58,6 +58,8 @@ export interface DepthApplyResult {
   gapDetected: boolean;
 }
 
+const MAX_LEVELS_PER_SIDE = Math.max(200, Number(process.env.ORDERBOOK_MAX_LEVELS_PER_SIDE || 2000));
+
 export function createOrderbookState(): OrderbookState {
   return {
     lastUpdateId: 0,
@@ -204,10 +206,22 @@ function applyDelta(state: OrderbookState, update: BufferedDepthUpdate): { appli
     else state.asks.set(price, qty);
   }
 
+  // Keep depth maps bounded to prevent unbounded memory/CPU growth.
+  pruneLevels(state.bids, false);
+  pruneLevels(state.asks, true);
+
   state.lastUpdateId = update.u;
   state.lastDepthTime = update.receiptTimeMs || Date.now();
   state.stats.applied++;
   return { applied: true, dropped: false };
+}
+
+function pruneLevels(levels: Map<number, number>, isAsk: boolean): void {
+  if (levels.size <= MAX_LEVELS_PER_SIDE) return;
+  const prices = Array.from(levels.keys()).sort((a, b) => isAsk ? a - b : b - a);
+  for (let i = MAX_LEVELS_PER_SIDE; i < prices.length; i += 1) {
+    levels.delete(prices[i]);
+  }
 }
 
 export function bestBid(state: OrderbookState): number | null {

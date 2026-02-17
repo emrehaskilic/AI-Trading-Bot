@@ -1,19 +1,14 @@
 /**
- * Multi‑timeframe Delta and CVD computation.
+ * Multi-timeframe Delta and CVD computation.
  *
  * This module consumes trade events (identical to those used by
  * TimeAndSales) and aggregates them into rolling windows of
- * configurable durations.  For each timeframe it maintains a
+ * configurable durations. For each timeframe it maintains a
  * cumulative volume delta (CVD) and the net delta (buy minus sell)
- * over the window.  It also provides a basic exhaustion indicator
- * which triggers when the CVD continues to rise (or fall) while the
- * last trade price fails to make new highs (or lows).  This
- * exhaustion flag is a heuristic and should be supplemented by
- * additional context (e.g. liquidity levels) before making trading
- * decisions.
+ * over the window.
  */
 
-import { AggressiveSide, TradeEvent } from './TimeAndSales';
+import { TradeEvent } from './TimeAndSales';
 
 export interface CvdMetrics {
   timeframe: string;
@@ -26,56 +21,49 @@ interface StoredCvdTrade extends TradeEvent {
   price: number;
 }
 
+interface TimeframeStore {
+  windowMs: number;
+  trades: StoredCvdTrade[];
+  head: number;
+}
+
 export class CvdCalculator {
-  private readonly windows: Map<string, number> = new Map();
-  private readonly trades: Map<string, StoredCvdTrade[]> = new Map();
+  private readonly stores: Map<string, TimeframeStore> = new Map();
 
   constructor(timeframes: Record<string, number> = { '1m': 60_000, '5m': 300_000, '15m': 900_000 }) {
     for (const [tf, ms] of Object.entries(timeframes)) {
-      this.windows.set(tf, ms);
-      this.trades.set(tf, []);
+      this.stores.set(tf, { windowMs: ms, trades: [], head: 0 });
     }
   }
 
   /**
-   * Add a trade event to all tracked timeframes.  The `price` field
-   * should represent the trade price.  The `timestamp` should be the
-   * event time as reported by the exchange.
+   * Add a trade event to all tracked timeframes.
    */
   public addTrade(event: TradeEvent & { price: number }): void {
     const arrival = Date.now();
-    // Normalise side to numeric delta: buy=+quantity, sell=−quantity
     const signedQty = event.side === 'buy' ? event.quantity : -event.quantity;
-    for (const [tf, ms] of this.windows.entries()) {
-      const arr = this.trades.get(tf)!;
-      arr.push({ ...event, quantity: signedQty, arrival, price: event.price });
-      // Remove expired trades based on trade timestamp
-      const cutoff = event.timestamp - ms;
-      const filtered = arr.filter(t => t.timestamp >= cutoff);
-      this.trades.set(tf, filtered);
+
+    for (const store of this.stores.values()) {
+      store.trades.push({ ...event, quantity: signedQty, arrival, price: event.price });
+      this.pruneExpired(store, event.timestamp - store.windowMs);
     }
   }
 
   /**
-   * Get trade counts for each timeframe (for debugging)
-   * Also returns warmup percentage showing how "full" each timeframe is
+   * Get trade counts for each timeframe and warmup percentage.
    */
   public getTradeCounts(): Record<string, { count: number; warmUpPct: number }> {
     const counts: Record<string, { count: number; warmUpPct: number }> = {};
     const now = Date.now();
 
-    for (const [tf, ms] of this.windows.entries()) {
-      const arr = this.trades.get(tf) ?? [];
-      const count = arr.length;
+    for (const [tf, store] of this.stores.entries()) {
+      const count = this.activeCount(store);
+      let warmUpPct = 0;
 
-      // Calculate warmup: how much of the timeframe window is filled with data
-      let warmUpPct = 100;
-      if (arr.length > 0) {
-        const oldest = arr[0].timestamp;
+      if (count > 0) {
+        const oldest = store.trades[store.head].timestamp;
         const span = now - oldest;
-        warmUpPct = Math.min(100, Math.round((span / ms) * 100));
-      } else {
-        warmUpPct = 0;
+        warmUpPct = Math.min(100, Math.round((span / store.windowMs) * 100));
       }
 
       counts[tf] = { count, warmUpPct };
@@ -84,20 +72,37 @@ export class CvdCalculator {
   }
 
   /**
-   * Compute CVD metrics for all timeframes.  If no trades exist
-   * within a timeframe the corresponding metrics will be zero.
+   * Compute CVD metrics for all timeframes.
    */
   public computeMetrics(): CvdMetrics[] {
     const results: CvdMetrics[] = [];
-    for (const [tf, _ms] of this.windows.entries()) {
-      const arr = this.trades.get(tf)!;
+
+    for (const [tf, store] of this.stores.entries()) {
       let cvd = 0;
-      for (const t of arr) {
-        cvd += t.quantity;
+      const arr = store.trades;
+      for (let i = store.head; i < arr.length; i += 1) {
+        cvd += arr[i].quantity;
       }
-      const delta = cvd;
-      results.push({ timeframe: tf, cvd, delta });
+      results.push({ timeframe: tf, cvd, delta: cvd });
     }
+
     return results;
+  }
+
+  private activeCount(store: TimeframeStore): number {
+    return Math.max(0, store.trades.length - store.head);
+  }
+
+  private pruneExpired(store: TimeframeStore, cutoffTs: number): void {
+    const arr = store.trades;
+    while (store.head < arr.length && arr[store.head].timestamp < cutoffTs) {
+      store.head += 1;
+    }
+
+    // Compact occasionally to avoid unbounded memory growth.
+    if (store.head > 0 && (store.head >= 4096 || store.head > (arr.length >> 1))) {
+      store.trades = arr.slice(store.head);
+      store.head = 0;
+    }
   }
 }

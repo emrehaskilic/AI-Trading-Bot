@@ -108,6 +108,7 @@ interface StoredTrade extends TradeEvent {
 export class TimeAndSales {
   private readonly windowMs: number;
   private trades: StoredTrade[] = [];
+  private head = 0;
   private lastBurstSide: AggressiveSide | null = null;
   private lastBurstCount = 0;
 
@@ -132,9 +133,7 @@ export class TimeAndSales {
     const arrival = Date.now();
     this.trades.push({ ...event, arrival });
 
-    // Purge expired trades based on the event timestamp (not receipt time)
-    const cutoff = event.timestamp - this.windowMs;
-    this.trades = this.trades.filter(t => t.timestamp >= cutoff);
+    this.pruneExpired(event.timestamp - this.windowMs);
 
     // Update consecutive burst detection.  If the side matches the
     // previous trade’s side we increment the burst counter; otherwise
@@ -163,7 +162,8 @@ export class TimeAndSales {
     let sellVol = 0;
     const sizes: number[] = [];
 
-    for (const t of this.trades) {
+    for (let i = this.head; i < this.trades.length; i += 1) {
+      const t = this.trades[i];
       sizes.push(t.quantity);
       if (t.side === 'buy') {
         buyVol += t.quantity;
@@ -172,7 +172,7 @@ export class TimeAndSales {
       }
     }
 
-    const tradeCount = this.trades.length;
+    const tradeCount = this.activeCount();
     // Determine thresholds based on distribution of sizes
     let smallThreshold = 1;
     let largeThreshold = 10;
@@ -221,5 +221,20 @@ export class TimeAndSales {
       consecutiveBurst: burst,
       printsPerSecond,
     };
+  }
+
+  private activeCount(): number {
+    return Math.max(0, this.trades.length - this.head);
+  }
+
+  private pruneExpired(cutoffTs: number): void {
+    while (this.head < this.trades.length && this.trades[this.head].timestamp < cutoffTs) {
+      this.head += 1;
+    }
+    // Compact periodically to avoid unbounded array growth.
+    if (this.head > 0 && (this.head >= 4096 || this.head > (this.trades.length >> 1))) {
+      this.trades = this.trades.slice(this.head);
+      this.head = 0;
+    }
   }
 }

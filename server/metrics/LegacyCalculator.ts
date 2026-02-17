@@ -1,6 +1,6 @@
 // [GITHUB VERIFIED] Backend implementation of OBI, VWAP, DeltaZ, CVD Slope, and Advanced Scores
 // Senior Quantitative Finance Developer Implementation
-import { OrderbookState, bestBid, bestAsk } from './OrderbookManager';
+import { OrderbookState } from './OrderbookManager';
 import { OpenInterestMonitor, OpenInterestMetrics as OIMetrics } from './OpenInterestMonitor';
 
 // Type for a trade used in the legacy metrics calculations
@@ -39,6 +39,7 @@ const ABSORPTION_WINDOW = 60;
 export class LegacyCalculator {
     // Keep a rolling list of trades for delta calculations (max 10 seconds)
     private trades: LegacyTrade[] = [];
+    private tradesHead = 0;
     private oiMonitor: OpenInterestMonitor | null = null;
 
     constructor(symbol?: string) {
@@ -82,20 +83,16 @@ export class LegacyCalculator {
         this.totalNotional += trade.quantity * trade.price;
         this.cvdSession += trade.side === 'buy' ? trade.quantity : -trade.quantity;
         // Remove old trades beyond 10 seconds
-        const cutoff = now - 10_000;
-        while (this.trades.length > 0 && this.trades[0].timestamp < cutoff) {
-            this.trades.shift();
-        }
+        this.pruneOldTrades(now - 10_000);
         // Every trade, recompute delta1s and store for Z‐score.  Compute
         // delta1s as net volume over last 1s.
         const oneSecCutoff = now - 1_000;
         let delta1s = 0;
         let delta5s = 0;
-        let count1s = 0;
-        for (const t of this.trades) {
+        for (let i = this.tradesHead; i < this.trades.length; i += 1) {
+            const t = this.trades[i];
             if (t.timestamp >= oneSecCutoff) {
                 delta1s += t.side === 'buy' ? t.quantity : -t.quantity;
-                count1s++;
             }
             if (t.timestamp >= now - 5_000) {
                 delta5s += t.side === 'buy' ? t.quantity : -t.quantity;
@@ -158,22 +155,21 @@ export class LegacyCalculator {
      * the original UI.  Undefined values are returned as null.
      */
     computeMetrics(ob: OrderbookState) {
-        // Helper to calculate raw volume for a given depth (descending for bids, ascending for asks)
-        const calcVolume = (levels: Map<number, number>, depth: number, isAsk: boolean): number => {
-            const entries = Array.from(levels.entries());
-            // Sort: Bids Descending, Asks Ascending
-            entries.sort((a, b) => isAsk ? a[0] - b[0] : b[0] - a[0]);
+        const sortedBids = Array.from(ob.bids.entries()).sort((a, b) => b[0] - a[0]);
+        const sortedAsks = Array.from(ob.asks.entries()).sort((a, b) => a[0] - b[0]);
+        const sumTop = (levels: Array<[number, number]>, depth: number): number => {
             let vol = 0;
-            for (let i = 0; i < Math.min(depth, entries.length); i++) {
-                vol += entries[i][1];
+            const limit = Math.min(depth, levels.length);
+            for (let i = 0; i < limit; i += 1) {
+                vol += levels[i][1];
             }
             return vol;
         };
 
         // --- A) OBI Weighted (Normalized) ---
         // Top 10 levels
-        const bidVol10 = calcVolume(ob.bids, 10, false);
-        const askVol10 = calcVolume(ob.asks, 10, true);
+        const bidVol10 = sumTop(sortedBids, 10);
+        const askVol10 = sumTop(sortedAsks, 10);
 
         const rawObiWeighted = bidVol10 - askVol10;
         const denomWeighted = bidVol10 + askVol10;
@@ -182,8 +178,8 @@ export class LegacyCalculator {
 
         // --- B) OBI Deep Book (Normalized) ---
         // Top 50 levels (representing deep liquidity)
-        const bidVol50 = calcVolume(ob.bids, 50, false);
-        const askVol50 = calcVolume(ob.asks, 50, true);
+        const bidVol50 = sumTop(sortedBids, 50);
+        const askVol50 = sumTop(sortedAsks, 50);
 
         const rawObiDeep = bidVol50 - askVol50;
         const denomDeep = bidVol50 + askVol50;
@@ -196,12 +192,13 @@ export class LegacyCalculator {
         const obiDivergence = obiWeighted - obiDeep;
 
         // Recompute rolling delta windows.
-        const refTime = this.trades.length > 0
+        const refTime = this.getActiveTradeCount() > 0
             ? this.trades[this.trades.length - 1].timestamp
             : Date.now();
         let delta1s = 0;
         let delta5s = 0;
-        for (const t of this.trades) {
+        for (let i = this.tradesHead; i < this.trades.length; i += 1) {
+            const t = this.trades[i];
             if (t.timestamp >= refTime - 1_000) {
                 delta1s += t.side === 'buy' ? t.quantity : -t.quantity;
             }
@@ -226,8 +223,8 @@ export class LegacyCalculator {
         const vwap = this.totalVolume > EPSILON ? this.totalNotional / this.totalVolume : 0;
 
         // Compose object
-        const bestBidPrice = bestBid(ob) ?? 0;
-        const bestAskPrice = bestAsk(ob) ?? 0;
+        const bestBidPrice = sortedBids.length > 0 ? sortedBids[0][0] : 0;
+        const bestAskPrice = sortedAsks.length > 0 ? sortedAsks[0][0] : 0;
         const midPrice = (bestBidPrice + bestAskPrice) / 2;
 
         return {
@@ -243,7 +240,22 @@ export class LegacyCalculator {
             vwap,
             totalVolume: this.totalVolume,
             totalNotional: this.totalNotional,
-            tradeCount: this.trades.length,
+            tradeCount: this.getActiveTradeCount(),
         };
+    }
+
+    private getActiveTradeCount(): number {
+        return Math.max(0, this.trades.length - this.tradesHead);
+    }
+
+    private pruneOldTrades(cutoffTs: number): void {
+        while (this.tradesHead < this.trades.length && this.trades[this.tradesHead].timestamp < cutoffTs) {
+            this.tradesHead += 1;
+        }
+        // Compact periodically to avoid repeated O(n) shifts and heap growth.
+        if (this.tradesHead > 0 && (this.tradesHead >= 4096 || this.tradesHead > (this.trades.length >> 1))) {
+            this.trades = this.trades.slice(this.tradesHead);
+            this.tradesHead = 0;
+        }
     }
 }

@@ -122,6 +122,7 @@ const BACKFILL_SNAPSHOT_INTERVAL_MS = Number(process.env.BACKFILL_SNAPSHOT_INTER
 const AI_TREND_BOOTSTRAP_DEFAULT_HOURS = Math.max(1, Number(process.env.AI_TREND_BOOTSTRAP_HOURS || 6));
 const AI_TREND_BOOTSTRAP_MAX_HOURS = 12;
 const AI_TREND_BOOTSTRAP_MIN_BARS = 120;
+const STRATEGY_EVAL_MIN_INTERVAL_MS = Math.max(50, Number(process.env.STRATEGY_EVAL_MIN_INTERVAL_MS || 200));
 
 // [PHASE 3] Execution Flags
 let KILL_SWITCH = false;
@@ -227,6 +228,9 @@ interface SymbolMeta {
     eventQueue: SymbolEventQueue;
     // [PHASE 1] Snapshot tracker
     snapshotTracker: SnapshotTracker;
+    // Strategy throttling cache
+    lastStrategyEvalTs: number;
+    lastStrategyDecision: any | null;
 }
 
 const symbolMeta = new Map<string, SymbolMeta>();
@@ -342,6 +346,8 @@ function getMeta(symbol: string): SymbolMeta {
             }),
             // [PHASE 1] Snapshot tracker
             snapshotTracker: new SnapshotTracker(),
+            lastStrategyEvalTs: 0,
+            lastStrategyDecision: null,
         };
         symbolMeta.set(symbol, meta);
     }
@@ -1222,93 +1228,50 @@ async function processSymbolEvent(s: string, d: any) {
         const absVal = abs.addTrade(s, p, side, t, levelSize);
         absorptionResult.set(s, absVal);
 
-        // [NEW_STRATEGY_V1.1] Decision Check
+        // [NEW_STRATEGY_V1.1] Decision Check (throttled to reduce event-loop pressure)
         const strategy = getStrategy(s);
         const backfill = getBackfill(s);
-        const calcStart = Date.now();
-        const legMetrics = leg.computeMetrics(ob);
         const oiMetrics = leg.getOpenInterestMetrics();
-        const integrity = getIntegrity(s).getStatus(now);
-        const bestBidPx = bestBid(ob);
-        const bestAskPx = bestAsk(ob);
-        const mid = (bestBidPx && bestAskPx) ? (bestBidPx + bestAskPx) / 2 : p;
-        const spreadPct = (bestBidPx && bestAskPx && mid)
-            ? ((bestAskPx - bestBidPx) / mid) * 100
-            : null;
+        let decision = meta.lastStrategyDecision;
+        let tasMetrics: any = null;
+        let legMetrics: any = null;
+        let spreadPct: number | null = null;
+        let mid = p;
 
-        const tasMetrics = tas.computeMetrics();
-        const decision = strategy.evaluate({
-            symbol: s,
-            nowMs: Number(t || now),
-            source: oiMetrics?.source ?? 'real',
-            orderbook: {
-                lastUpdatedMs: integrity.lastUpdateTimestamp || now,
-                spreadPct,
-                bestBid: bestBidPx,
-                bestAsk: bestAskPx,
-            },
-            trades: {
-                lastUpdatedMs: Number(t || now),
-                printsPerSecond: tasMetrics.printsPerSecond,
-                tradeCount: tasMetrics.tradeCount,
-                aggressiveBuyVolume: tasMetrics.aggressiveBuyVolume,
-                aggressiveSellVolume: tasMetrics.aggressiveSellVolume,
-                consecutiveBurst: tasMetrics.consecutiveBurst,
-            },
-            market: {
-                price: p,
-                vwap: legMetrics?.vwap || mid || p,
-                delta1s: legMetrics?.delta1s || 0,
-                delta5s: legMetrics?.delta5s || 0,
-                deltaZ: legMetrics?.deltaZ || 0,
-                cvdSlope: legMetrics?.cvdSlope || 0,
-                obiWeighted: legMetrics?.obiWeighted || 0,
-                obiDeep: legMetrics?.obiDeep || 0,
-                obiDivergence: legMetrics?.obiDivergence || 0,
-            },
-            openInterest: oiMetrics ? {
-                oiChangePct: oiMetrics.oiChangePct,
-                lastUpdatedMs: oiMetrics.lastUpdated,
-                source: oiMetrics.source,
-            } : null,
-            absorption: {
-                value: absVal,
-                side: absVal ? side : null,
-            },
-            volatility: backfill.getState().atr || 0,
-            position: dryRunSession.getStrategyPosition(s),
-        });
+        const shouldEvaluateStrategy = !decision || (now - meta.lastStrategyEvalTs) >= STRATEGY_EVAL_MIN_INTERVAL_MS;
+        if (shouldEvaluateStrategy) {
+            const calcStart = Date.now();
+            legMetrics = leg.computeMetrics(ob);
+            tasMetrics = tas.computeMetrics();
+            const integrity = getIntegrity(s).getStatus(now);
+            const bestBidPx = bestBid(ob);
+            const bestAskPx = bestAsk(ob);
+            mid = (bestBidPx && bestAskPx) ? (bestBidPx + bestAskPx) / 2 : p;
+            spreadPct = (bestBidPx && bestAskPx && mid)
+                ? ((bestAskPx - bestBidPx) / mid) * 100
+                : null;
 
-        latencyTracker.record('strategy_calc_ms', Date.now() - calcStart);
-
-        // [DRY RUN INTEGRATION]
-        const isDryRunTracked = dryRunSession.isTrackingSymbol(s);
-        const aiActive = aiDryRun.isActive() && aiDryRun.isTrackingSymbol(s);
-        if (aiActive) {
-            const snapshotTs = Number(t || now);
-            const rawPosition = dryRunSession.getStrategyPosition(s);
-            const riskState = dryRunSession.getAIDryRunRiskState(s, snapshotTs);
-            const executionState = dryRunSession.getAIDryRunExecutionState(s, snapshotTs);
-            const blockedReasons: string[] = [];
-            if (!decision.gatePassed) blockedReasons.push('GATE_NOT_PASSED');
-            if (spreadPct != null && spreadPct > 0.6) blockedReasons.push('SPREAD_TOO_WIDE');
-            if (tasMetrics.printsPerSecond < 0.25 || tasMetrics.tradeCount < 4) blockedReasons.push('ACTIVITY_WEAK');
-
-            void aiDryRun.onMetrics({
+            decision = strategy.evaluate({
                 symbol: s,
-                timestampMs: snapshotTs,
-                decision: {
-                    regime: decision.regime,
-                    dfs: decision.dfs,
-                    dfsPercentile: decision.dfsPercentile,
-                    volLevel: decision.volLevel,
-                    gatePassed: decision.gatePassed,
-                    thresholds: decision.log.thresholds,
+                nowMs: Number(t || now),
+                source: oiMetrics?.source ?? 'real',
+                orderbook: {
+                    lastUpdatedMs: integrity.lastUpdateTimestamp || now,
+                    spreadPct,
+                    bestBid: bestBidPx,
+                    bestAsk: bestAskPx,
+                },
+                trades: {
+                    lastUpdatedMs: Number(t || now),
+                    printsPerSecond: tasMetrics.printsPerSecond,
+                    tradeCount: tasMetrics.tradeCount,
+                    aggressiveBuyVolume: tasMetrics.aggressiveBuyVolume,
+                    aggressiveSellVolume: tasMetrics.aggressiveSellVolume,
+                    consecutiveBurst: tasMetrics.consecutiveBurst,
                 },
                 market: {
                     price: p,
                     vwap: legMetrics?.vwap || mid || p,
-                    spreadPct,
                     delta1s: legMetrics?.delta1s || 0,
                     delta5s: legMetrics?.delta5s || 0,
                     deltaZ: legMetrics?.deltaZ || 0,
@@ -1317,41 +1280,107 @@ async function processSymbolEvent(s: string, d: any) {
                     obiDeep: legMetrics?.obiDeep || 0,
                     obiDivergence: legMetrics?.obiDivergence || 0,
                 },
-                trades: {
-                    printsPerSecond: tasMetrics.printsPerSecond,
-                    tradeCount: tasMetrics.tradeCount,
-                    aggressiveBuyVolume: tasMetrics.aggressiveBuyVolume,
-                    aggressiveSellVolume: tasMetrics.aggressiveSellVolume,
-                    burstCount: tasMetrics.consecutiveBurst.count,
-                    burstSide: tasMetrics.consecutiveBurst.side,
-                },
-                openInterest: { oiChangePct: oiMetrics ? oiMetrics.oiChangePct : null },
-                absorption: { value: absVal, side: absVal ? side : null },
-                volatility: backfill.getState().atr || 0,
-                blockedReasons,
-                riskState,
-                executionState,
-                position: rawPosition ? {
-                    ...rawPosition,
-                    timeInPositionMs: Math.max(0, Number(rawPosition.timeInPositionMs || 0)),
+                openInterest: oiMetrics ? {
+                    oiChangePct: oiMetrics.oiChangePct,
+                    lastUpdatedMs: oiMetrics.lastUpdated,
+                    source: oiMetrics.source,
                 } : null,
+                absorption: {
+                    value: absVal,
+                    side: absVal ? side : null,
+                },
+                volatility: backfill.getState().atr || 0,
+                position: dryRunSession.getStrategyPosition(s),
             });
-        } else if (isDryRunTracked) {
-            if (Math.random() < 0.05) {
-                log('DRY_RUN_STRATEGY_CHECK', {
-                    symbol: s,
-                    regime: decision.regime,
-                    dfsP: decision.dfsPercentile,
-                    gate: decision.gatePassed
-                });
-            }
-            dryRunSession.submitStrategyDecision(s, decision, Number(t || now));
+            meta.lastStrategyDecision = decision;
+            meta.lastStrategyEvalTs = now;
+            latencyTracker.record('strategy_calc_ms', Date.now() - calcStart);
         }
 
-        abTestManager.submitStrategyDecision(s, decision, Number(t || now));
+        // [DRY RUN INTEGRATION]
+        const isDryRunTracked = dryRunSession.isTrackingSymbol(s);
+        const aiActive = aiDryRun.isActive() && aiDryRun.isTrackingSymbol(s);
+        if (shouldEvaluateStrategy && decision) {
+            if (aiActive) {
+                const snapshotTs = Number(t || now);
+                const rawPosition = dryRunSession.getStrategyPosition(s);
+                const riskState = dryRunSession.getAIDryRunRiskState(s, snapshotTs);
+                const executionState = dryRunSession.getAIDryRunExecutionState(s, snapshotTs);
+                const blockedReasons: string[] = [];
+                if (!decision.gatePassed) blockedReasons.push('GATE_NOT_PASSED');
+                if (spreadPct != null && spreadPct > 0.6) blockedReasons.push('SPREAD_TOO_WIDE');
+                if (tasMetrics && (tasMetrics.printsPerSecond < 0.25 || tasMetrics.tradeCount < 4)) blockedReasons.push('ACTIVITY_WEAK');
 
-        // Broadcast
-        broadcastMetrics(s, ob, tas, cvd, absVal, leg, t, decision);
+                void aiDryRun.onMetrics({
+                    symbol: s,
+                    timestampMs: snapshotTs,
+                    decision: {
+                        regime: decision.regime,
+                        dfs: decision.dfs,
+                        dfsPercentile: decision.dfsPercentile,
+                        volLevel: decision.volLevel,
+                        gatePassed: decision.gatePassed,
+                        thresholds: decision.log.thresholds,
+                    },
+                    market: {
+                        price: p,
+                        vwap: legMetrics?.vwap || mid || p,
+                        spreadPct,
+                        delta1s: legMetrics?.delta1s || 0,
+                        delta5s: legMetrics?.delta5s || 0,
+                        deltaZ: legMetrics?.deltaZ || 0,
+                        cvdSlope: legMetrics?.cvdSlope || 0,
+                        obiWeighted: legMetrics?.obiWeighted || 0,
+                        obiDeep: legMetrics?.obiDeep || 0,
+                        obiDivergence: legMetrics?.obiDivergence || 0,
+                    },
+                    trades: {
+                        printsPerSecond: tasMetrics?.printsPerSecond || 0,
+                        tradeCount: tasMetrics?.tradeCount || 0,
+                        aggressiveBuyVolume: tasMetrics?.aggressiveBuyVolume || 0,
+                        aggressiveSellVolume: tasMetrics?.aggressiveSellVolume || 0,
+                        burstCount: tasMetrics?.consecutiveBurst?.count || 0,
+                        burstSide: tasMetrics?.consecutiveBurst?.side || null,
+                    },
+                    openInterest: { oiChangePct: oiMetrics ? oiMetrics.oiChangePct : null },
+                    absorption: { value: absVal, side: absVal ? side : null },
+                    volatility: backfill.getState().atr || 0,
+                    blockedReasons,
+                    riskState,
+                    executionState,
+                    position: rawPosition ? {
+                        ...rawPosition,
+                        timeInPositionMs: Math.max(0, Number(rawPosition.timeInPositionMs || 0)),
+                    } : null,
+                });
+            } else if (isDryRunTracked) {
+                if (Math.random() < 0.05) {
+                    log('DRY_RUN_STRATEGY_CHECK', {
+                        symbol: s,
+                        regime: decision.regime,
+                        dfsP: decision.dfsPercentile,
+                        gate: decision.gatePassed
+                    });
+                }
+                dryRunSession.submitStrategyDecision(s, decision, Number(t || now));
+            }
+
+            abTestManager.submitStrategyDecision(s, decision, Number(t || now));
+        }
+
+        // Broadcast (reuse precomputed metrics when available)
+        broadcastMetrics(
+            s,
+            ob,
+            tas,
+            cvd,
+            absVal,
+            leg,
+            t,
+            decision,
+            'trade',
+            shouldEvaluateStrategy ? { tasMetrics, legacyMetrics: legMetrics } : undefined
+        );
     }
 }
 
@@ -1383,7 +1412,8 @@ function broadcastMetrics(
     leg: LegacyCalculator,
     eventTimeMs: number,
     decision: any = null,
-    reason: 'depth' | 'trade' = 'trade'
+    reason: 'depth' | 'trade' = 'trade',
+    precomputed?: { tasMetrics?: any; cvdMetrics?: any[]; legacyMetrics?: any }
 ) {
     const THROTTLE_MS = 250; // 4Hz max per symbol
     const meta = getMeta(s);
@@ -1397,12 +1427,14 @@ function broadcastMetrics(
         return;
     }
 
-    const cvdM = cvd.computeMetrics();
-    const tasMetrics = tas.computeMetrics();
+    const cvdM = precomputed?.cvdMetrics ?? cvd.computeMetrics();
+    const tasMetrics = precomputed?.tasMetrics ?? tas.computeMetrics();
     // Calculate OBI/Legacy if Orderbook has data (bids and asks exist)
     // This allows metrics to continue displaying during brief resyncs
     const hasBookData = ob.bids.size > 0 && ob.asks.size > 0;
-    const legacyM = hasBookData ? leg.computeMetrics(ob) : null;
+    const legacyM = precomputed && Object.prototype.hasOwnProperty.call(precomputed, 'legacyMetrics')
+        ? precomputed.legacyMetrics
+        : (hasBookData ? leg.computeMetrics(ob) : null);
 
     // Top of book
     const { bids, asks } = getTopLevels(ob, 20);
@@ -1418,6 +1450,9 @@ function broadcastMetrics(
     const bf = getBackfill(s).getState();
     const integrity = getIntegrity(s).getStatus(now);
     const aiTrend = aiDryRun.getTrendStatus(s, now);
+    const tf1m = cvdM.find((x: any) => x.timeframe === '1m') || null;
+    const tf5m = cvdM.find((x: any) => x.timeframe === '5m') || null;
+    const tf15m = cvdM.find((x: any) => x.timeframe === '15m') || null;
 
     const payload: any = {
         type: 'metrics',
@@ -1427,9 +1462,9 @@ function broadcastMetrics(
         snapshot: meta.snapshotTracker.next({ s, mid }),
         timeAndSales: tasMetrics,
         cvd: {
-            tf1m: cvdM.find(x => x.timeframe === '1m') ? { ...cvdM.find(x => x.timeframe === '1m')!, state: classifyCVDState(cvdM.find(x => x.timeframe === '1m')!.delta) } : { cvd: 0, delta: 0, state: 'Normal' },
-            tf5m: cvdM.find(x => x.timeframe === '5m') ? { ...cvdM.find(x => x.timeframe === '5m')!, state: classifyCVDState(cvdM.find(x => x.timeframe === '5m')!.delta) } : { cvd: 0, delta: 0, state: 'Normal' },
-            tf15m: cvdM.find(x => x.timeframe === '15m') ? { ...cvdM.find(x => x.timeframe === '15m')!, state: classifyCVDState(cvdM.find(x => x.timeframe === '15m')!.delta) } : { cvd: 0, delta: 0, state: 'Normal' },
+            tf1m: tf1m ? { ...tf1m, state: classifyCVDState(tf1m.delta) } : { cvd: 0, delta: 0, state: 'Normal' },
+            tf5m: tf5m ? { ...tf5m, state: classifyCVDState(tf5m.delta) } : { cvd: 0, delta: 0, state: 'Normal' },
+            tf15m: tf15m ? { ...tf15m, state: classifyCVDState(tf15m.delta) } : { cvd: 0, delta: 0, state: 'Normal' },
             tradeCounts: cvd.getTradeCounts()
         },
         absorption: absVal,
@@ -1662,6 +1697,8 @@ app.get('/api/status', (req, res) => {
             depthMsgCount10s: meta.depthMsgCount10s,
             lastDepthMsgTs: meta.lastDepthMsgTs,
             bufferedDepthCount: ob.buffer.length,
+            bufferedEventCount: meta.eventQueue.getQueueLength(),
+            droppedEventCount: meta.eventQueue.getDroppedCount(),
             applyCount: ob.stats.applied,
             applyCount10s: meta.applyCount10s,
             dropCount: ob.stats.dropped,
