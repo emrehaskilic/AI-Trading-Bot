@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import SymbolRow from './SymbolRow';
 import MobileSymbolCard from './MobileSymbolCard';
 import { useTelemetrySocket } from '../services/useTelemetrySocket';
@@ -195,6 +195,7 @@ const AIDryRunDashboard: React.FC = () => {
   const [model, setModel] = useState('gemini-2.5-flash');
   const [customModel, setCustomModel] = useState('');
   const [localMode, setLocalMode] = useState(false);
+  const localModeManualOverrideRef = useRef(false);
   const [apiKeyStatus, setApiKeyStatus] = useState<'idle' | 'validating' | 'valid' | 'invalid'>('idle');
   const [apiKeyError, setApiKeyError] = useState<string | null>(null);
   const [lastMetricsUpdateMs, setLastMetricsUpdateMs] = useState(0);
@@ -250,7 +251,13 @@ const AIDryRunDashboard: React.FC = () => {
           setStatus(next);
           setAiStatus(nextAi);
           if (nextAi && typeof nextAi.localOnly === 'boolean') {
-            setLocalMode(nextAi.localOnly);
+            const shouldApplyServerLocalOnly = next.running || !localModeManualOverrideRef.current;
+            if (shouldApplyServerLocalOnly) {
+              setLocalMode(nextAi.localOnly);
+              if (next.running) {
+                localModeManualOverrideRef.current = false;
+              }
+            }
           }
           if (next.running && next.symbols.length > 0) {
             setSelectedPairs(next.symbols);
@@ -319,6 +326,7 @@ const AIDryRunDashboard: React.FC = () => {
       setAiStatus(nextAi);
       if (nextAi && typeof nextAi.localOnly === 'boolean') {
         setLocalMode(nextAi.localOnly);
+        localModeManualOverrideRef.current = false;
       }
     } catch (e: any) {
       setActionError(e?.message || 'ai_dry_run_start_failed');
@@ -390,6 +398,7 @@ const AIDryRunDashboard: React.FC = () => {
   const perf = summary.performance || DEFAULT_STATUS.summary.performance!;
   const marginHealthPct = summary.marginHealth * 100;
   const symbolRows = useMemo(() => Object.values(status.perSymbol), [status.perSymbol]);
+  const effectiveLocalMode = status.running ? Boolean(aiStatus?.localOnly) : localMode;
   const telemetryLagMs = lastMetricsUpdateMs > 0 ? Date.now() - lastMetricsUpdateMs : Number.POSITIVE_INFINITY;
   const telemetryConnection = telemetryLagMs < 3_000 ? 'CONNECTED' : telemetryLagMs < 10_000 ? 'STALE' : 'DISCONNECTED';
   const telemetryTone = telemetryConnection === 'CONNECTED'
@@ -421,7 +430,7 @@ const AIDryRunDashboard: React.FC = () => {
             {aiStatus?.model && (
               <span className="text-zinc-500 ml-2">AI: {aiStatus.model}</span>
             )}
-            {(aiStatus?.localOnly || localMode) && (
+            {effectiveLocalMode && (
               <span className="text-zinc-500 ml-2">MODE: LOCAL_POLICY</span>
             )}
             <span className={`ml-2 ${telemetryTone}`}>WS: {telemetryConnection}</span>
@@ -524,7 +533,10 @@ const AIDryRunDashboard: React.FC = () => {
                   type="checkbox"
                   checked={localMode}
                   disabled={status.running}
-                  onChange={(e) => setLocalMode(e.target.checked)}
+                  onChange={(e) => {
+                    localModeManualOverrideRef.current = true;
+                    setLocalMode(e.target.checked);
+                  }}
                   className="accent-zinc-300"
                 />
                 Use local autonomous policy (no external AI call)

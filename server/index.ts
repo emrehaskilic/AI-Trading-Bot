@@ -670,9 +670,12 @@ function updateStreams() {
     log('WS_CONNECT', { count: activeSymbols.size, url });
 
     wsState = 'connecting';
-    ws = new WebSocket(url);
+    const socket = new WebSocket(url);
+    ws = socket;
 
-    ws.on('open', () => {
+    socket.on('open', () => {
+        // Ignore stale events from an older socket instance.
+        if (ws !== socket) return;
         wsState = 'connected';
         log('WS_OPEN', {});
 
@@ -685,15 +688,23 @@ function updateStreams() {
         });
     });
 
-    ws.on('message', (raw: any) => handleMsg(raw));
+    socket.on('message', (raw: any) => {
+        if (ws !== socket) return;
+        handleMsg(raw);
+    });
 
-    ws.on('close', () => {
+    socket.on('close', () => {
+        if (ws !== socket) return;
         wsState = 'disconnected';
+        ws = null;
         log('WS_CLOSE', {});
         setTimeout(updateStreams, 5000);
     });
 
-    ws.on('error', (e) => log('WS_ERROR', { msg: e.message }));
+    socket.on('error', (e) => {
+        if (ws !== socket) return;
+        log('WS_ERROR', { msg: e.message });
+    });
 }
 
 

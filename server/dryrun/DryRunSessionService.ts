@@ -1943,6 +1943,7 @@ export class DryRunSessionService {
     options?: { mode?: 'ENTRY' | 'ADD'; incrementalRiskCapPct?: number }
   ): { qty: number; leverage: number } {
     if (!this.config || !(price > 0)) return { qty: 0, leverage: session.dynamicLeverage || 1 };
+    const sizingMode = options?.mode === 'ADD' ? 'ADD' : 'ENTRY';
     const leverage = session.dynamicLeverage || this.config.leverage || 1;
     const unrealized = this.computeUnrealizedPnl(session);
     const effectiveEquity = Math.max(0, session.lastState.walletBalance + unrealized);
@@ -1962,15 +1963,24 @@ export class DryRunSessionService {
     const marginBoundNotional = effectiveEquity > 0
       ? effectiveEquity * leverage * DEFAULT_AI_MAX_MARGIN_USAGE_PCT
       : 0;
-    const maxNotional = Math.max(0, Math.min(DEFAULT_AI_MAX_POSITION_NOTIONAL, marginBoundNotional || DEFAULT_AI_MAX_POSITION_NOTIONAL));
+    const userMinEntryNotional = Math.max(0, this.config.initialMarginUsdt * leverage);
+    const configuredMaxNotional = sizingMode === 'ENTRY'
+      ? Math.max(DEFAULT_AI_MAX_POSITION_NOTIONAL, userMinEntryNotional)
+      : DEFAULT_AI_MAX_POSITION_NOTIONAL;
+    const maxNotional = Math.max(0, Math.min(configuredMaxNotional, marginBoundNotional || configuredMaxNotional));
     const remainingNotional = Math.max(0, maxNotional - positionNotional);
     if (!(remainingNotional > 0)) return { qty: 0, leverage };
 
-    const addMode = options?.mode === 'ADD';
+    const addMode = sizingMode === 'ADD';
     const addRiskCapPct = this.normalizeRiskCapPct(options?.incrementalRiskCapPct);
     const addNotionalCap = addMode ? remainingNotional * addRiskCapPct : remainingNotional;
-    const targetNotional = baseQty * price;
+    const targetNotional = addMode
+      ? (baseQty * price)
+      : Math.max(baseQty * price, userMinEntryNotional);
     const cappedNotional = Math.max(0, Math.min(targetNotional, remainingNotional, addNotionalCap));
+    if (!addMode && userMinEntryNotional > 0 && cappedNotional < (userMinEntryNotional * 0.999)) {
+      return { qty: 0, leverage };
+    }
     const qty = roundTo(Math.max(0, cappedNotional / price), 6);
     return { qty, leverage };
   }
