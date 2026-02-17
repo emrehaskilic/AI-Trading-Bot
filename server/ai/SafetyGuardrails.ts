@@ -156,10 +156,6 @@ export class SafetyGuardrails {
       return { intent: 'EXIT', reason: 'RISK_LOCK' };
     }
 
-    if (reasons.has('INTEGRITY_FAIL') && reasons.has('GATE_NOT_PASSED')) {
-      return { intent: 'EXIT', reason: 'INTEGRITY_FAIL' };
-    }
-
     if (marginUsagePct >= this.config.maxMarginUsageHardPct) {
       return { intent: 'MANAGE', reducePct: 0.5, reason: 'MARGIN_CAP' };
     }

@@ -32,6 +32,7 @@ const DEFAULT_PULLBACK_ADD_MAX_ADVERSE_PCT = clamp(Number(process.env.AI_PULLBAC
 const DEFAULT_PULLBACK_ADD_TRIGGER_UPNL_PCT = clamp(Number(process.env.AI_PULLBACK_ADD_TRIGGER_UPNL_PCT || 0.001), -0.02, 0.02);
 const DEFAULT_PULLBACK_ADD_EDGE_BPS = clamp(Number(process.env.AI_PULLBACK_ADD_EDGE_BPS || 0.8), -5, 20);
 const DEFAULT_PULLBACK_ADD_SIZE_MULT = clamp(Number(process.env.AI_PULLBACK_ADD_SIZE_MULT || 0.5), 0.1, 1.5);
+const DEFAULT_TREND_DEFENSE_MIN_SIGNAL = clamp(Number(process.env.AI_TREND_DEFENSE_MIN_SIGNAL || 0.12), 0, 1);
 const DEFAULT_ENTRY_FEE_BPS = clamp(Number(process.env.AI_ENTRY_FEE_BPS || 2.2), 0, 30);
 const DEFAULT_ENTRY_SLIPPAGE_BPS = clamp(Number(process.env.AI_ENTRY_SLIPPAGE_BPS || 1), 0, 30);
 const DEFAULT_EDGE_MIN_BPS = clamp(Number(process.env.AI_EDGE_MIN_BPS || 4.5), -5, 30);
@@ -571,6 +572,7 @@ export class AIDryRunController {
       '- If flat, open ENTER only when expected edge clearly exceeds costs.',
       '- Directional evidence means at least 2 of these align with a side: sign(delta1s+delta5s), sign(cvdSlope), sign(obiDeep), absorption side.',
       '- If executionState.trendBias is LONG/SHORT and executionState.trendIntact=true, do not open opposite direction entries.',
+      '- If a position is open, request full EXIT only when executionState.trendBias is opposite to position side and trendIntact=true.',
       '- If executionState.bootstrapPhaseMsRemaining > 0 and trendBias exists, prefer that side for first entry if edge is sufficient.',
       '- If executionState.bootstrapWarmupMsRemaining > 0 and position is flat, keep HOLD until warmup is complete.',
       '- During intact trend, prefer MANAGE reducePct 0.1-0.3 for small profit-taking instead of full EXIT.',
@@ -1134,13 +1136,69 @@ export class AIDryRunController {
       }
     }
 
-    if (trendBias && plan.intent === 'EXIT' && position && position.side === trendBias && trendIntact && microAlpha.expectedEdgeBps > -0.1) {
-      return {
-        ...plan,
-        intent: 'MANAGE',
-        reducePct: DEFAULT_TREND_TP_REDUCE_PCT,
-        explanationTags: this.pushTag(plan.explanationTags, 'TREND_INTACT'),
-      };
+    if (plan.intent === 'EXIT' && position) {
+      const oppositeTrend: StrategySide = position.side === 'LONG' ? 'SHORT' : 'LONG';
+      const oppositeTrendConfirmed = Boolean(trendBias && trendIntact && trendBias === oppositeTrend);
+
+      if (!oppositeTrendConfirmed) {
+        const upnl = Number(position.unrealizedPnlPct || 0);
+        const trendAligned = Boolean(trendBias && trendBias === position.side && trendIntact);
+        const defensiveAddEligible =
+          trendAligned
+          && upnl <= DEFAULT_PULLBACK_ADD_TRIGGER_UPNL_PCT
+          && upnl >= -DEFAULT_PULLBACK_ADD_MAX_ADVERSE_PCT
+          && snapshot.decision.gatePassed
+          && !blocked
+          && (microAlpha.tradableFlow || microAlpha.signalStrength >= DEFAULT_TREND_DEFENSE_MIN_SIGNAL);
+
+        if (defensiveAddEligible) {
+          this.log?.('AI_EXIT_BLOCKED_TO_TREND_PULLBACK_ADD', {
+            symbol: snapshot.symbol,
+            positionSide: position.side,
+            trendBias,
+            trendIntact,
+            upnlPct: Number(upnl.toFixed(6)),
+            signalStrength: Number(microAlpha.signalStrength.toFixed(4)),
+          });
+          return {
+            ...plan,
+            intent: 'MANAGE',
+            side: position.side,
+            reducePct: null,
+            sizeMultiplier: clampPlanNumber(
+              Math.max(Number(plan.sizeMultiplier || 0), DEFAULT_PULLBACK_ADD_SIZE_MULT + (microAlpha.signalStrength * 0.25)),
+              0.15,
+              1.4
+            ),
+            maxAdds: Math.max(Number(plan.maxAdds || 0), 4),
+            addRule: 'TREND_INTACT',
+            addTrigger: {
+              minUnrealizedPnlPct: -DEFAULT_PULLBACK_ADD_MAX_ADVERSE_PCT,
+              trendIntact: true,
+              obiSupportMin: 0,
+              deltaConfirm: false,
+            },
+            explanationTags: this.pushTag(plan.explanationTags, 'TREND_INTACT'),
+            confidence: clampPlanNumber(Math.max(Number(plan.confidence || 0), 0.45 + (trendStrength * 0.3)), 0, 1),
+          };
+        }
+
+        this.log?.('AI_EXIT_BLOCKED_TREND_LOCK', {
+          symbol: snapshot.symbol,
+          positionSide: position.side,
+          trendBias,
+          trendIntact,
+          oppositeTrendRequired: oppositeTrend,
+        });
+        return {
+          ...plan,
+          intent: 'HOLD',
+          side: null,
+          reducePct: null,
+          explanationTags: this.pushTag(plan.explanationTags, trendAligned ? 'TREND_INTACT' : 'TREND_BROKEN'),
+          confidence: clampPlanNumber(Math.max(Number(plan.confidence || 0), 0.4), 0, 1),
+        };
+      }
     }
 
     if (
@@ -1620,9 +1678,11 @@ export class AIDryRunController {
       ? sideSign * (snapshot.market.delta5s + snapshot.market.delta1s) > 0
       : true;
 
-    const obiSupport = sideSign > 0
-      ? snapshot.market.obiDeep >= plan.addTrigger.obiSupportMin
-      : snapshot.market.obiDeep <= -Math.abs(plan.addTrigger.obiSupportMin);
+    const obiSupport = plan.addTrigger.obiSupportMin <= 0
+      ? true
+      : sideSign > 0
+        ? snapshot.market.obiDeep >= plan.addTrigger.obiSupportMin
+        : snapshot.market.obiDeep <= -Math.abs(plan.addTrigger.obiSupportMin);
 
     if (!deltaAligned || !obiSupport) return false;
 
