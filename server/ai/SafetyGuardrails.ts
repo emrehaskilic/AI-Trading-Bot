@@ -152,14 +152,6 @@ export class SafetyGuardrails {
       return null;
     }
 
-    if (reasons.has('RISK_LOCK')) {
-      return { intent: 'EXIT', reason: 'RISK_LOCK' };
-    }
-
-    if (marginUsagePct >= this.config.maxMarginUsageHardPct) {
-      return { intent: 'MANAGE', reducePct: 0.5, reason: 'MARGIN_CAP' };
-    }
-
     if (proposedPlan?.intent === 'ENTER' && proposedPlan.side && snapshot.position.side !== proposedPlan.side) {
       if (reasons.has('MIN_HOLD_ACTIVE') || reasons.has('FLIP_COOLDOWN_ACTIVE')) {
         return { intent: 'HOLD', reason: 'COOLDOWN_ACTIVE' };

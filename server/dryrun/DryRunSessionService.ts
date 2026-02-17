@@ -1484,7 +1484,7 @@ export class DryRunSessionService {
       }
     }
 
-    if (this.shouldRiskEmergency(session, markPrice, this.computeSpreadPct(session.lastOrderBook))) {
+    if (!this.isAIAutonomousRun() && this.shouldRiskEmergency(session, markPrice, this.computeSpreadPct(session.lastOrderBook))) {
       const closeSide: 'BUY' | 'SELL' = position.side === 'LONG' ? 'SELL' : 'BUY';
       orders.push({
         side: closeSide,

@@ -575,7 +575,7 @@ export class AIDryRunController {
       '- If a position is open, request full EXIT only when executionState.trendBias is opposite to position side and trendIntact=true.',
       '- If executionState.bootstrapPhaseMsRemaining > 0 and trendBias exists, prefer that side for first entry if edge is sufficient.',
       '- If executionState.bootstrapWarmupMsRemaining > 0 and position is flat, keep HOLD until warmup is complete.',
-      '- During intact trend, prefer MANAGE reducePct 0.1-0.3 for small profit-taking instead of full EXIT.',
+      '- During intact trend, avoid REDUCE/EXIT. Prefer HOLD or MANAGE add-on in pullbacks.',
       '- Use microAlpha.expectedEdgeBps and microAlpha.tradableFlow as primary gating for ENTER decisions.',
       '- If microAlpha.expectedEdgeBps < 0, prefer HOLD unless forced risk management is needed.',
       '',
@@ -1136,7 +1136,7 @@ export class AIDryRunController {
       }
     }
 
-    if (plan.intent === 'EXIT' && position) {
+    if ((plan.intent === 'EXIT' || (plan.intent === 'MANAGE' && plan.reducePct != null)) && position) {
       const oppositeTrend: StrategySide = position.side === 'LONG' ? 'SHORT' : 'LONG';
       const oppositeTrendConfirmed = Boolean(trendBias && trendIntact && trendBias === oppositeTrend);
 
@@ -1152,7 +1152,7 @@ export class AIDryRunController {
           && (microAlpha.tradableFlow || microAlpha.signalStrength >= DEFAULT_TREND_DEFENSE_MIN_SIGNAL);
 
         if (defensiveAddEligible) {
-          this.log?.('AI_EXIT_BLOCKED_TO_TREND_PULLBACK_ADD', {
+          this.log?.('AI_CLOSE_BLOCKED_TO_TREND_PULLBACK_ADD', {
             symbol: snapshot.symbol,
             positionSide: position.side,
             trendBias,
@@ -1183,7 +1183,7 @@ export class AIDryRunController {
           };
         }
 
-        this.log?.('AI_EXIT_BLOCKED_TREND_LOCK', {
+        this.log?.('AI_CLOSE_BLOCKED_TREND_LOCK', {
           symbol: snapshot.symbol,
           positionSide: position.side,
           trendBias,
@@ -1209,20 +1209,6 @@ export class AIDryRunController {
       && plan.intent === 'HOLD'
     ) {
       const upnl = Number(position.unrealizedPnlPct || 0);
-      const sinceLastTp = Number(snapshot.executionState.lastTrendTakeProfitMsAgo ?? Number.POSITIVE_INFINITY);
-      if (upnl >= DEFAULT_TREND_TP_MIN_UPNL_PCT && sinceLastTp >= DEFAULT_TREND_TP_COOLDOWN_MS) {
-        this.telemetry.holdOverrides += 1;
-        return {
-          ...plan,
-          intent: 'MANAGE',
-          side: position.side,
-          reducePct: DEFAULT_TREND_TP_REDUCE_PCT,
-          addRule: 'NEVER',
-          maxAdds: 0,
-          explanationTags: this.pushTag(plan.explanationTags, 'TREND_INTACT'),
-          confidence: clampPlanNumber(Math.max(Number(plan.confidence || 0), 0.55), 0, 1),
-        };
-      }
 
       const pullbackEligible =
         upnl <= DEFAULT_PULLBACK_ADD_TRIGGER_UPNL_PCT
@@ -1486,7 +1472,11 @@ export class AIDryRunController {
     guardrails: ReturnType<SafetyGuardrails['evaluate']>
   ): AIDecisionPlan {
     if (guardrails.forcedAction) {
-      this.telemetry.forcedExits += 1;
+      if (guardrails.forcedAction.intent === 'EXIT') {
+        this.telemetry.forcedExits += 1;
+      } else {
+        this.telemetry.guardrailBlocks += 1;
+      }
       return this.planFromForcedAction(plan.nonce, guardrails.forcedAction);
     }
 
