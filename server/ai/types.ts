@@ -119,6 +119,10 @@ export type AIMetricsSnapshot = {
     holdStreak: number;
     lastAddMsAgo: number | null;
     lastFlipMsAgo: number | null;
+    winnerStopArmed?: boolean;
+    winnerStopType?: 'TRAIL_STOP' | 'PROFITLOCK' | null;
+    winnerStopPrice?: number | null;
+    winnerRMultiple?: number | null;
     trendBias?: StrategySide | null;
     trendStrength?: number;
     trendIntact?: boolean;

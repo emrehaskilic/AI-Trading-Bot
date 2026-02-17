@@ -222,6 +222,7 @@ type SymbolSession = {
   tradeSeq: number;
   currentTrade: ActiveTrade | null;
   lastSnapshotLogTs: number;
+  lastWinnerSignalLogTs: number;
 };
 
 type AIIntentMetadata = {
@@ -283,7 +284,10 @@ const DEFAULT_ADDON_COOLDOWN_MS = clampNumber(process.env.ADDON_COOLDOWN_MS, 60_
 const DEFAULT_ADDON_MAX_COUNT = Math.max(0, Math.trunc(clampNumber(process.env.ADDON_MAX_COUNT, 3, 0, 10)));
 const DEFAULT_ADDON_TTL_MS = Math.max(1000, Math.trunc(clampNumber(process.env.ADDON_TTL_MS, 15_000, 1000, 120_000)));
 const DEFAULT_ADDON_REPRICE_MAX = Math.max(0, Math.trunc(clampNumber(process.env.ADDON_REPRICE_MAX, 2, 0, 5)));
-const DEFAULT_TRAIL_ATR_MULT = clampNumber(process.env.TRAIL_ATR_MULT, 2.2, 0.5, 10);
+const DEFAULT_TRAIL_ATR_MULT = clampNumber(process.env.TRAIL_ATR_MULT, 3.8, 0.5, 10);
+const DEFAULT_TRAIL_ACTIVATE_R = clampNumber(process.env.TRAIL_ACTIVATE_R, 3.0, 0.5, 10);
+const DEFAULT_TRAIL_CONFIRM_TICKS = Math.max(1, Math.trunc(clampNumber(process.env.TRAIL_CONFIRM_TICKS, 4, 1, 20)));
+const DEFAULT_TRAIL_MIN_HOLD_MS = Math.max(0, Math.trunc(clampNumber(process.env.TRAIL_MIN_HOLD_MS, 180_000, 0, 1_800_000)));
 const DEFAULT_MAX_SPREAD_PCT = clampNumber(process.env.MAX_SPREAD_PCT, 0.0008, 0, 0.01);
 const DEFAULT_AI_MAX_MARGIN_USAGE_PCT = clampNumber(process.env.AI_MAX_MARGIN_USAGE_PCT, 0.85, 0.3, 0.98);
 const DEFAULT_AI_MAX_POSITION_NOTIONAL = clampNumber(process.env.AI_MAX_POSITION_NOTIONAL_USDT, DEFAULT_MAX_NOTIONAL, 10, 10_000_000);
@@ -369,6 +373,9 @@ export class DryRunSessionService {
       trailAtrMult: DEFAULT_TRAIL_ATR_MULT,
       rAtrMult: DEFAULT_STOP_ATR_MULT,
       minRDistance: DEFAULT_STOP_MIN_DIST,
+      trailActivateR: DEFAULT_TRAIL_ACTIVATE_R,
+      trailConfirmTicks: DEFAULT_TRAIL_CONFIRM_TICKS,
+      minHoldMs: DEFAULT_TRAIL_MIN_HOLD_MS,
     });
     this.addOnManager = new AddOnManager({
       minUnrealizedPnlPct: DEFAULT_ADDON_MIN_UPNL_PCT,
@@ -511,6 +518,7 @@ export class DryRunSessionService {
         tradeSeq: 0,
         currentTrade: null,
         lastSnapshotLogTs: 0,
+        lastWinnerSignalLogTs: 0,
       });
     }
 
@@ -671,6 +679,7 @@ export class DryRunSessionService {
         tradeSeq: 0,
         currentTrade: null,
         lastSnapshotLogTs: 0,
+        lastWinnerSignalLogTs: 0,
       });
     }
 
@@ -1002,6 +1011,10 @@ export class DryRunSessionService {
     holdStreak: number;
     lastAddMsAgo: number | null;
     lastFlipMsAgo: number | null;
+    winnerStopArmed?: boolean;
+    winnerStopType?: 'TRAIL_STOP' | 'PROFITLOCK' | null;
+    winnerStopPrice?: number | null;
+    winnerRMultiple?: number | null;
   } {
     const normalized = normalizeSymbol(symbol);
     const session = this.sessions.get(normalized);
@@ -1012,6 +1025,10 @@ export class DryRunSessionService {
         holdStreak: 0,
         lastAddMsAgo: null,
         lastFlipMsAgo: null,
+        winnerStopArmed: false,
+        winnerStopType: null,
+        winnerStopPrice: null,
+        winnerRMultiple: null,
       };
     }
 
@@ -1024,11 +1041,25 @@ export class DryRunSessionService {
       lastAction = 'ENTER';
     }
 
+    const winnerState = session.winnerState;
+    const winnerStopPrice = session.stopLossPrice ? roundTo(session.stopLossPrice, 8) : null;
+    const winnerRMultiple = winnerState && winnerState.rDistance > 0 && session.latestMarkPrice > 0
+      ? roundTo(
+        ((winnerState.side === 'LONG' ? 1 : -1) * (session.latestMarkPrice - winnerState.entryPrice)) / winnerState.rDistance,
+        4
+      )
+      : null;
+    const winnerStopType = winnerState?.trailingStop != null ? 'TRAIL_STOP' : winnerState?.profitLockStop != null ? 'PROFITLOCK' : null;
+
     return {
       lastAction,
       holdStreak: 0,
       lastAddMsAgo: session.addOnState.lastAddOnTs > 0 ? Math.max(0, nowMs - session.addOnState.lastAddOnTs) : null,
       lastFlipMsAgo: session.flipState.lastPartialReduceTs > 0 ? Math.max(0, nowMs - session.flipState.lastPartialReduceTs) : null,
+      winnerStopArmed: Boolean(winnerStopPrice != null),
+      winnerStopType,
+      winnerStopPrice,
+      winnerRMultiple,
     };
   }
 
@@ -1415,25 +1446,42 @@ export class DryRunSessionService {
 
     const position = state.position;
     this.ensureWinnerState(session, position, markPrice);
+    const positionHoldMs = this.computePositionTimeInMs(session, eventTimestampMs);
     const winnerDecision = this.winnerManager.update(session.winnerState as WinnerState, {
       markPrice,
       atr: session.atr || Math.abs(markPrice - position.entryPrice) * 0.01,
+      holdMs: positionHoldMs,
     });
     session.winnerState = winnerDecision.nextState;
     session.stopLossPrice = this.resolveActiveStop(session.winnerState);
 
     if (winnerDecision.action && position.qty > 0) {
-      const closeSide: 'BUY' | 'SELL' = position.side === 'LONG' ? 'SELL' : 'BUY';
-      orders.push({
-        side: closeSide,
-        type: 'MARKET',
-        qty: roundTo(position.qty, 6),
-        timeInForce: 'IOC',
-        reduceOnly: true,
-        reasonCode: winnerDecision.action === 'TRAIL_STOP' ? 'TRAIL_STOP' : 'PROFITLOCK',
-      });
-      session.pendingExitReason = winnerDecision.action === 'TRAIL_STOP' ? 'TRAIL_STOP' : 'PROFITLOCK_STOP';
-      return orders;
+      if (!this.isAIAutonomousRun()) {
+        const closeSide: 'BUY' | 'SELL' = position.side === 'LONG' ? 'SELL' : 'BUY';
+        orders.push({
+          side: closeSide,
+          type: 'MARKET',
+          qty: roundTo(position.qty, 6),
+          timeInForce: 'IOC',
+          reduceOnly: true,
+          reasonCode: winnerDecision.action === 'TRAIL_STOP' ? 'TRAIL_STOP' : 'PROFITLOCK',
+        });
+        session.pendingExitReason = winnerDecision.action === 'TRAIL_STOP' ? 'TRAIL_STOP' : 'PROFITLOCK_STOP';
+        return orders;
+      }
+
+      if (
+        session.lastWinnerSignalLogTs === 0
+        || (eventTimestampMs - session.lastWinnerSignalLogTs) >= this.config.heartbeatIntervalMs
+      ) {
+        this.addConsoleLog(
+          'INFO',
+          session.symbol,
+          `Winner stop armed (${winnerDecision.action}) at ${roundTo(winnerDecision.stopPrice ?? markPrice, 4)}; waiting AI decision.`,
+          eventTimestampMs
+        );
+        session.lastWinnerSignalLogTs = eventTimestampMs;
+      }
     }
 
     if (this.shouldRiskEmergency(session, markPrice, this.computeSpreadPct(session.lastOrderBook))) {
@@ -1975,6 +2023,11 @@ export class DryRunSessionService {
     const entryTs = Number.isFinite(entryTsRaw) && entryTsRaw > 0 ? entryTsRaw : fallbackTs;
     if (!(entryTs > 0) || !(nowMs > 0)) return 0;
     return Math.max(0, nowMs - entryTs);
+  }
+
+  private isAIAutonomousRun(): boolean {
+    const runId = String(this.runId || '').toLowerCase();
+    return runId.startsWith('ai-');
   }
 
   private computeRiskSizing(

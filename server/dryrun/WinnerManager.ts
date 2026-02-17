@@ -2,6 +2,9 @@ export interface WinnerManagerConfig {
   trailAtrMult: number;
   rAtrMult: number;
   minRDistance: number;
+  trailActivateR: number;
+  trailConfirmTicks: number;
+  minHoldMs: number;
 }
 
 export interface WinnerState {
@@ -12,6 +15,7 @@ export interface WinnerState {
   profitLockStop: number | null;
   trailingStop: number | null;
   lockedR: number;
+  stopBreachTicks: number;
 }
 
 export interface WinnerDecision {
@@ -37,14 +41,19 @@ export class WinnerManager {
       profitLockStop: null,
       trailingStop: null,
       lockedR: 0,
+      stopBreachTicks: 0,
     };
   }
 
-  update(state: WinnerState, params: { markPrice: number; atr: number }): WinnerDecision {
+  update(state: WinnerState, params: { markPrice: number; atr: number; holdMs?: number }): WinnerDecision {
     const sideSign = state.side === 'LONG' ? 1 : -1;
     const rMultiple = state.rDistance > 0
       ? (sideSign * (params.markPrice - state.entryPrice)) / state.rDistance
       : 0;
+    const holdMs = Number.isFinite(params.holdMs as number) ? Number(params.holdMs) : 0;
+    const minHoldMs = Math.max(0, this.config.minHoldMs);
+    const trailActivateR = Math.max(0, this.config.trailActivateR);
+    const trailConfirmTicks = Math.max(1, Math.trunc(this.config.trailConfirmTicks));
 
     let lockedR = state.lockedR;
     if (rMultiple >= 3) lockedR = Math.max(lockedR, 2);
@@ -57,7 +66,8 @@ export class WinnerManager {
     }
 
     let trailingStop = state.trailingStop;
-    if (rMultiple >= 2) {
+    const trailActivated = trailingStop != null || (holdMs >= minHoldMs && rMultiple >= trailActivateR);
+    if (trailActivated) {
       const atr = Number.isFinite(params.atr) && params.atr > 0 ? params.atr : state.rDistance;
       const nextTrail = state.side === 'LONG'
         ? params.markPrice - (this.config.trailAtrMult * atr)
@@ -81,15 +91,27 @@ export class WinnerManager {
       profitLockStop,
       trailingStop,
       maxFavorablePrice,
+      stopBreachTicks: state.stopBreachTicks,
     };
 
     const effectiveStop = state.side === 'LONG'
       ? Math.max(profitLockStop ?? -Infinity, trailingStop ?? -Infinity)
       : Math.min(profitLockStop ?? Infinity, trailingStop ?? Infinity);
 
+    let stopBreachTicks = state.stopBreachTicks;
+    const breached = Number.isFinite(effectiveStop)
+      ? (state.side === 'LONG' ? params.markPrice <= effectiveStop : params.markPrice >= effectiveStop)
+      : false;
+    if (breached) {
+      stopBreachTicks = Math.min(stopBreachTicks + 1, trailConfirmTicks + 2);
+    } else {
+      stopBreachTicks = 0;
+    }
+    nextState.stopBreachTicks = stopBreachTicks;
+
     let action: WinnerDecision['action'] = null;
     let stopPrice: number | null = null;
-    if (Number.isFinite(effectiveStop)) {
+    if (Number.isFinite(effectiveStop) && stopBreachTicks >= trailConfirmTicks) {
       if (state.side === 'LONG' && params.markPrice <= effectiveStop) {
         action = trailingStop != null && effectiveStop === trailingStop ? 'TRAIL_STOP' : 'PROFITLOCK';
         stopPrice = effectiveStop;
