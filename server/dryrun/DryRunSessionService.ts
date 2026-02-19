@@ -13,6 +13,8 @@ import { AddOnManager } from './AddOnManager';
 import { DryRunClock } from './DryRunClock';
 import path from 'path';
 
+export type AIGridProfile = 'safe' | 'balanced' | 'aggressive';
+
 export interface DryRunSessionStartInput {
   symbols?: string[];
   symbol?: string;
@@ -28,6 +30,7 @@ export interface DryRunSessionStartInput {
   fundingIntervalMs?: number;
   heartbeatIntervalMs?: number;
   debugAggressiveEntry?: boolean;
+  aiGridProfile?: AIGridProfile;
 }
 
 export interface DryRunConsoleLog {
@@ -93,6 +96,7 @@ export interface DryRunSessionStatus {
     fundingIntervalMs: number;
     heartbeatIntervalMs: number;
     debugAggressiveEntry: boolean;
+    aiGridProfile: AIGridProfile;
   } | null;
   summary: {
     totalEquity: number;
@@ -178,6 +182,24 @@ type AddOnState = {
   filledClientOrderIds: Set<string>;
 };
 
+type GridState = {
+  lastReconcileTs: number;
+  side: 'LONG' | 'SHORT' | null;
+};
+
+type AIGridRuntimeConfig = {
+  enabled: boolean;
+  levels: number;
+  ttlMs: number;
+  repriceMs: number;
+  sizeMult: number;
+  sizeStepMult: number;
+  minStepPct: number;
+  spreadMult: number;
+  atrMult: number;
+  fallbackMarginPct: number;
+};
+
 type SymbolSession = {
   symbol: string;
   engine: DryRunEngine;
@@ -200,6 +222,7 @@ type SymbolSession = {
   flipGovernor: FlipGovernor;
   flipState: { partialReduced: boolean; lastPartialReduceTs: number };
   addOnState: AddOnState;
+  gridState: GridState;
   lastEntryOrAddOnTs: number;
   lastSignal: SignalSnapshot | null;
   pendingFlipEntry: PendingFlipEntry | null;
@@ -293,6 +316,16 @@ const DEFAULT_AI_MAX_MARGIN_USAGE_PCT = clampNumber(process.env.AI_MAX_MARGIN_US
 const DEFAULT_AI_MAX_POSITION_NOTIONAL = clampNumber(process.env.AI_MAX_POSITION_NOTIONAL_USDT, DEFAULT_MAX_NOTIONAL, 10, 10_000_000);
 const DEFAULT_AI_ADD_RISK_CAP_PCT = clampNumber(process.env.AI_ADD_RISK_CAP_PCT, 0.25, 0.05, 1);
 const DEFAULT_AI_DAILY_LOSS_LOCK_PCT = clampNumber(process.env.AI_DAILY_LOSS_LOCK_PCT, 0.05, 0.005, 0.5);
+const BASE_AI_GRID_ENABLED = !['false', '0', 'no'].includes(String(process.env.AI_GRID_ENABLED || 'true').toLowerCase());
+const BASE_AI_GRID_LEVELS = Math.max(1, Math.trunc(clampNumber(process.env.AI_GRID_LEVELS, 3, 1, 20)));
+const BASE_AI_GRID_TTL_MS = Math.max(500, Math.trunc(clampNumber(process.env.AI_GRID_TTL_MS, 5000, 500, 120_000)));
+const BASE_AI_GRID_REPRICE_MS = Math.max(250, Math.trunc(clampNumber(process.env.AI_GRID_REPRICE_MS, 1000, 250, 60_000)));
+const BASE_AI_GRID_SIZE_MULT = clampNumber(process.env.AI_GRID_SIZE_MULT, 0.2, 0.01, 10);
+const BASE_AI_GRID_SIZE_STEP_MULT = clampNumber(process.env.AI_GRID_SIZE_STEP_MULT, 0.15, 0, 5);
+const BASE_AI_GRID_MIN_STEP_PCT = clampNumber(process.env.AI_GRID_MIN_STEP_PCT, 0.00035, 0.00001, 0.1);
+const BASE_AI_GRID_SPREAD_MULT = clampNumber(process.env.AI_GRID_SPREAD_MULT, 1.4, 0.1, 20);
+const BASE_AI_GRID_ATR_MULT = clampNumber(process.env.AI_GRID_ATR_MULT, 0.55, 0, 20);
+const BASE_AI_GRID_FALLBACK_MARGIN_PCT = clampNumber(process.env.AI_GRID_FALLBACK_MARGIN_PCT, 0.08, 0.0001, 10);
 
 function parseLimitStrategy(input: string): LimitStrategyMode {
   switch (input) {
@@ -342,6 +375,60 @@ function normalizeSymbols(input: { symbols?: string[]; symbol?: string }): strin
   return out;
 }
 
+function normalizeAIGridProfile(value: unknown): AIGridProfile | null {
+  const profile = String(value || '').trim().toLowerCase();
+  if (profile === 'safe' || profile === 'balanced' || profile === 'aggressive') {
+    return profile;
+  }
+  return null;
+}
+
+function buildGridProfilePresets(): Record<AIGridProfile, AIGridRuntimeConfig> {
+  const balanced: AIGridRuntimeConfig = {
+    enabled: BASE_AI_GRID_ENABLED,
+    levels: BASE_AI_GRID_LEVELS,
+    ttlMs: BASE_AI_GRID_TTL_MS,
+    repriceMs: BASE_AI_GRID_REPRICE_MS,
+    sizeMult: BASE_AI_GRID_SIZE_MULT,
+    sizeStepMult: BASE_AI_GRID_SIZE_STEP_MULT,
+    minStepPct: BASE_AI_GRID_MIN_STEP_PCT,
+    spreadMult: BASE_AI_GRID_SPREAD_MULT,
+    atrMult: BASE_AI_GRID_ATR_MULT,
+    fallbackMarginPct: BASE_AI_GRID_FALLBACK_MARGIN_PCT,
+  };
+
+  const safe: AIGridRuntimeConfig = {
+    enabled: balanced.enabled,
+    levels: Math.max(1, Math.round(balanced.levels * 0.7)),
+    ttlMs: Math.max(500, Math.trunc(balanced.ttlMs * 1.4)),
+    repriceMs: Math.max(250, Math.trunc(balanced.repriceMs * 1.4)),
+    sizeMult: Math.max(0.01, balanced.sizeMult * 0.65),
+    sizeStepMult: Math.max(0, balanced.sizeStepMult * 0.75),
+    minStepPct: Math.min(0.1, balanced.minStepPct * 1.35),
+    spreadMult: Math.min(20, balanced.spreadMult * 1.25),
+    atrMult: Math.min(20, balanced.atrMult * 1.2),
+    fallbackMarginPct: Math.max(0.0001, balanced.fallbackMarginPct * 0.55),
+  };
+
+  const aggressive: AIGridRuntimeConfig = {
+    enabled: balanced.enabled,
+    levels: Math.max(1, Math.round(balanced.levels * 1.8)),
+    ttlMs: Math.max(500, Math.trunc(balanced.ttlMs * 0.7)),
+    repriceMs: Math.max(250, Math.trunc(balanced.repriceMs * 0.7)),
+    sizeMult: Math.min(10, balanced.sizeMult * 1.8),
+    sizeStepMult: Math.min(5, balanced.sizeStepMult * 1.35),
+    minStepPct: Math.max(0.00001, balanced.minStepPct * 0.72),
+    spreadMult: Math.max(0.1, balanced.spreadMult * 0.78),
+    atrMult: Math.max(0, balanced.atrMult * 0.82),
+    fallbackMarginPct: Math.min(10, balanced.fallbackMarginPct * 1.7),
+  };
+
+  return { safe, balanced, aggressive };
+}
+
+const AI_GRID_PROFILE_PRESETS = buildGridProfilePresets();
+const DEFAULT_AI_GRID_PROFILE = normalizeAIGridProfile(process.env.AI_GRID_PROFILE) || 'balanced';
+
 export class DryRunSessionService {
   private running = false;
   private runId: string | null = null;
@@ -361,6 +448,8 @@ export class DryRunSessionService {
   private readonly clock = new DryRunClock();
   private readonly winnerManager: WinnerManager;
   private readonly addOnManager: AddOnManager;
+  private aiGridProfile: AIGridProfile = DEFAULT_AI_GRID_PROFILE;
+  private aiGridConfig: AIGridRuntimeConfig = { ...AI_GRID_PROFILE_PRESETS[DEFAULT_AI_GRID_PROFILE] };
 
   constructor(alertService?: AlertService) {
     this.limitStrategy = new LimitOrderStrategy({
@@ -423,6 +512,9 @@ export class DryRunSessionService {
     const fundingIntervalMs = Math.max(1, Math.trunc(finiteOr(input.fundingIntervalMs, DEFAULT_FUNDING_INTERVAL_MS)));
     const heartbeatIntervalMs = Math.max(1_000, Math.trunc(finiteOr(input.heartbeatIntervalMs, DEFAULT_HEARTBEAT_INTERVAL_MS)));
     const debugAggressiveEntry = Boolean(input.debugAggressiveEntry);
+    const aiGridProfile = normalizeAIGridProfile(input.aiGridProfile) || this.aiGridProfile || DEFAULT_AI_GRID_PROFILE;
+    this.aiGridProfile = aiGridProfile;
+    this.aiGridConfig = { ...AI_GRID_PROFILE_PRESETS[aiGridProfile] };
 
     this.running = true;
     this.runId = runIdBase;
@@ -441,6 +533,7 @@ export class DryRunSessionService {
       fundingIntervalMs,
       heartbeatIntervalMs,
       debugAggressiveEntry,
+      aiGridProfile,
     };
 
     for (const symbol of this.symbols) {
@@ -495,6 +588,10 @@ export class DryRunSessionService {
           pendingAddonIndex: null,
           pendingAttempt: 0,
           filledClientOrderIds: new Set<string>(),
+        },
+        gridState: {
+          lastReconcileTs: 0,
+          side: null,
         },
         lastEntryOrAddOnTs: 0,
         lastSignal: null,
@@ -596,7 +693,22 @@ export class DryRunSessionService {
     }
 
     this.running = false;
-    const config = payload.config as NonNullable<DryRunSessionStatus['config']>;
+    const configRaw = payload.config as Partial<NonNullable<DryRunSessionStatus['config']>>;
+    const aiGridProfile = normalizeAIGridProfile(configRaw?.aiGridProfile) || this.aiGridProfile || DEFAULT_AI_GRID_PROFILE;
+    const config: NonNullable<DryRunSessionStatus['config']> = {
+      walletBalanceStartUsdt: finiteOr(configRaw.walletBalanceStartUsdt, 5000),
+      initialMarginUsdt: finiteOr(configRaw.initialMarginUsdt, 200),
+      leverage: finiteOr(configRaw.leverage, 10),
+      makerFeeRate: finiteOr(configRaw.makerFeeRate, DEFAULT_MAKER_FEE_RATE),
+      takerFeeRate: finiteOr(configRaw.takerFeeRate, DEFAULT_TAKER_FEE_RATE),
+      maintenanceMarginRate: finiteOr(configRaw.maintenanceMarginRate, DEFAULT_MAINTENANCE_MARGIN_RATE),
+      fundingIntervalMs: Math.max(1, Math.trunc(finiteOr(configRaw.fundingIntervalMs, DEFAULT_FUNDING_INTERVAL_MS))),
+      heartbeatIntervalMs: Math.max(1_000, Math.trunc(finiteOr(configRaw.heartbeatIntervalMs, DEFAULT_HEARTBEAT_INTERVAL_MS))),
+      debugAggressiveEntry: Boolean(configRaw.debugAggressiveEntry),
+      aiGridProfile,
+    };
+    this.aiGridProfile = aiGridProfile;
+    this.aiGridConfig = { ...AI_GRID_PROFILE_PRESETS[aiGridProfile] };
     this.runId = payload.runId || sessionId;
     this.symbols = [...payload.symbols];
     this.config = config;
@@ -657,6 +769,10 @@ export class DryRunSessionService {
           pendingAttempt: 0,
           filledClientOrderIds: new Set<string>(),
         },
+        gridState: {
+          lastReconcileTs: 0,
+          side: null,
+        },
         lastEntryOrAddOnTs: 0,
         lastSignal: null,
         pendingFlipEntry: null,
@@ -688,6 +804,32 @@ export class DryRunSessionService {
 
   async listSessions(): Promise<string[]> {
     return this.sessionStore.list();
+  }
+
+  getAIGridProfile(): AIGridProfile {
+    return this.aiGridProfile;
+  }
+
+  setAIGridProfile(profileInput: unknown): { profile: AIGridProfile; running: boolean } {
+    const nextProfile = normalizeAIGridProfile(profileInput);
+    if (!nextProfile) {
+      throw new Error('invalid_ai_grid_profile');
+    }
+
+    this.aiGridProfile = nextProfile;
+    this.aiGridConfig = { ...AI_GRID_PROFILE_PRESETS[nextProfile] };
+
+    for (const session of this.sessions.values()) {
+      this.clearQueuedGridOrders(session);
+      session.gridState.lastReconcileTs = 0;
+    }
+
+    if (this.config) {
+      this.config.aiGridProfile = nextProfile;
+    }
+
+    this.addConsoleLog('INFO', null, `AI grid profile set to ${nextProfile}`, this.clock.now());
+    return { profile: nextProfile, running: this.running };
   }
 
   getActiveSymbols(): string[] {
@@ -1204,6 +1346,7 @@ export class DryRunSessionService {
     this.handleOrderActions(session, out.log.orderResults, markPrice, spreadPct, eventTimestampMs);
     this.handleTradeTransitions(session, prevPosition, out.log, out.state.position, eventTimestampMs);
     this.syncPositionStateAfterEvent(session, prevPosition, out.state.position, eventTimestampMs, markPrice);
+    this.reconcileAIDirectionalGrid(session, markPrice, eventTimestampMs);
     this.maybeLogSnapshot(session, eventTimestampMs);
 
     return this.getStatus();
@@ -1499,6 +1642,143 @@ export class DryRunSessionService {
     }
 
     return orders;
+  }
+
+  private buildGridClientOrderId(session: SymbolSession, side: 'LONG' | 'SHORT', level: number): string {
+    return `grid-${this.getRunId()}-${session.symbol}-${side}-${level}`;
+  }
+
+  private clearQueuedGridOrders(session: SymbolSession, side?: 'BUY' | 'SELL'): void {
+    if (session.manualOrders.length === 0) return;
+    session.manualOrders = session.manualOrders.filter((order) => {
+      if (order.reasonCode !== 'AI_GRID_ADD') return true;
+      if (!side) return false;
+      return order.side === side;
+    });
+  }
+
+  private reconcileAIDirectionalGrid(session: SymbolSession, markPrice: number, eventTimestampMs: number): void {
+    if (!this.config || !this.aiGridConfig.enabled || !this.isAIAutonomousRun()) {
+      return;
+    }
+
+    const position = session.lastState.position;
+    if (!position) {
+      this.clearQueuedGridOrders(session);
+      session.gridState.side = null;
+      session.gridState.lastReconcileTs = eventTimestampMs;
+      return;
+    }
+
+    if (session.pendingExitReason) {
+      return;
+    }
+
+    const orderSide: 'BUY' | 'SELL' = position.side === 'LONG' ? 'BUY' : 'SELL';
+    this.clearQueuedGridOrders(session, orderSide);
+
+    if (session.gridState.side && session.gridState.side !== position.side) {
+      session.gridState.lastReconcileTs = 0;
+    }
+
+    const hasHigherPriorityQueuedOrder = session.manualOrders.some((order) => order.reasonCode !== 'AI_GRID_ADD');
+    if (hasHigherPriorityQueuedOrder) {
+      return;
+    }
+
+    const elapsedSinceReconcile = session.gridState.lastReconcileTs > 0
+      ? eventTimestampMs - session.gridState.lastReconcileTs
+      : Number.POSITIVE_INFINITY;
+    if (elapsedSinceReconcile < this.aiGridConfig.repriceMs) {
+      return;
+    }
+
+    const bestBid = session.lastOrderBook.bids?.[0]?.price ?? 0;
+    const bestAsk = session.lastOrderBook.asks?.[0]?.price ?? 0;
+    if (!(bestBid > 0) || !(bestAsk > 0) || !(markPrice > 0)) {
+      return;
+    }
+
+    const spreadPct = this.computeSpreadPct(session.lastOrderBook) ?? 0;
+    const atrPct = session.atr > 0 ? Math.abs(session.atr / markPrice) : 0;
+    const dynamicStepPct = Math.max(
+      this.aiGridConfig.minStepPct,
+      Math.abs(spreadPct) * this.aiGridConfig.spreadMult,
+      atrPct * this.aiGridConfig.atrMult
+    );
+    const stepPct = Math.min(0.1, dynamicStepPct);
+
+    let targetLevels = this.aiGridConfig.levels;
+    if (session.volatilityRegime === 'HIGH') {
+      targetLevels += 1;
+    } else if (session.volatilityRegime === 'LOW') {
+      targetLevels = Math.max(1, targetLevels - 1);
+    }
+
+    const openGridOrders = session.lastState.openLimitOrders.filter(
+      (order) => order.reasonCode === 'AI_GRID_ADD' && order.side === orderSide && !order.reduceOnly
+    );
+    const queuedGridOrders = session.manualOrders.filter(
+      (order) => order.reasonCode === 'AI_GRID_ADD' && order.side === orderSide && !order.reduceOnly
+    );
+    const openGridClientIds = new Set(
+      openGridOrders.map((order) => String(order.clientOrderId || '')).filter(Boolean)
+    );
+    const queuedGridClientIds = new Set(
+      queuedGridOrders.map((order) => String(order.clientOrderId || '')).filter(Boolean)
+    );
+
+    const fallbackNotional = Math.max(
+      0,
+      this.config.initialMarginUsdt * this.config.leverage * this.aiGridConfig.fallbackMarginPct
+    );
+    const fallbackQty = fallbackNotional > 0 ? fallbackNotional / markPrice : 0;
+    const baseQty = Math.max(fallbackQty, Math.abs(position.qty) * this.aiGridConfig.sizeMult);
+    if (!(baseQty > 0)) {
+      session.gridState.side = position.side;
+      session.gridState.lastReconcileTs = eventTimestampMs;
+      return;
+    }
+
+    const anchorPrice = orderSide === 'BUY' ? bestBid : bestAsk;
+    for (let level = 1; level <= targetLevels; level += 1) {
+      const clientOrderId = this.buildGridClientOrderId(session, position.side, level);
+      if (openGridClientIds.has(clientOrderId) || queuedGridClientIds.has(clientOrderId)) {
+        continue;
+      }
+
+      const levelQty = roundTo(baseQty * (1 + ((level - 1) * this.aiGridConfig.sizeStepMult)), 6);
+      if (!(levelQty > 0)) {
+        continue;
+      }
+
+      const offset = stepPct * level;
+      const rawPrice = orderSide === 'BUY'
+        ? anchorPrice * (1 - offset)
+        : anchorPrice * (1 + offset);
+      const limitPrice = roundTo(rawPrice, 8);
+      if (!(limitPrice > 0)) {
+        continue;
+      }
+
+      session.manualOrders.push({
+        side: orderSide,
+        type: 'LIMIT',
+        qty: levelQty,
+        price: limitPrice,
+        timeInForce: 'GTC',
+        reduceOnly: false,
+        postOnly: true,
+        ttlMs: this.aiGridConfig.ttlMs,
+        reasonCode: 'AI_GRID_ADD',
+        clientOrderId,
+        addonIndex: level,
+      });
+      queuedGridClientIds.add(clientOrderId);
+    }
+
+    session.gridState.side = position.side;
+    session.gridState.lastReconcileTs = eventTimestampMs;
   }
 
   private updateDerivedMetrics(session: SymbolSession, book: DryRunOrderBook, markPrice: number): void {
@@ -2368,6 +2648,11 @@ export class DryRunSessionService {
         }
       }
 
+      if (reasonCode === 'AI_GRID_ADD' && Number(order.filledQty) > 0) {
+        session.lastEntryOrAddOnTs = eventTimestampMs;
+        session.addOnState.lastAddOnTs = eventTimestampMs;
+      }
+
       if (reasonCode === 'LIMIT_TTL_CANCEL') {
         this.repriceAddOnIfEligible(session, order, eventTimestampMs);
       }
@@ -2469,6 +2754,7 @@ export class DryRunSessionService {
     markPrice: number
   ): void {
     if (!prevPosition && nextPosition) {
+      this.clearQueuedGridOrders(session);
       session.winnerState = this.winnerManager.initState({
         entryPrice: nextPosition.entryPrice,
         side: nextPosition.side,
@@ -2486,10 +2772,13 @@ export class DryRunSessionService {
       session.flipGovernor.reset();
       session.flipState.partialReduced = false;
       session.flipState.lastPartialReduceTs = 0;
+      session.gridState.side = nextPosition.side;
+      session.gridState.lastReconcileTs = 0;
       return;
     }
 
     if (prevPosition && !nextPosition) {
+      this.clearQueuedGridOrders(session);
       session.winnerState = null;
       session.stopLossPrice = null;
       session.addOnState.pendingClientOrderId = null;
@@ -2498,10 +2787,13 @@ export class DryRunSessionService {
       session.flipGovernor.reset();
       session.flipState.partialReduced = false;
       session.flipState.lastPartialReduceTs = 0;
+      session.gridState.side = null;
+      session.gridState.lastReconcileTs = 0;
       return;
     }
 
     if (prevPosition && nextPosition && prevPosition.side !== nextPosition.side) {
+      this.clearQueuedGridOrders(session);
       session.winnerState = this.winnerManager.initState({
         entryPrice: nextPosition.entryPrice,
         side: nextPosition.side,
@@ -2513,6 +2805,8 @@ export class DryRunSessionService {
       session.flipGovernor.reset();
       session.flipState.partialReduced = false;
       session.flipState.lastPartialReduceTs = 0;
+      session.gridState.side = nextPosition.side;
+      session.gridState.lastReconcileTs = 0;
     }
   }
 

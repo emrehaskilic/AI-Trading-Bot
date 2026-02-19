@@ -7,6 +7,7 @@ export type DryRunReasonCode =
   | 'EXIT_MARKET'
   | 'AI_ENTRY'
   | 'AI_ADD'
+  | 'AI_GRID_ADD'
   | 'AI_REDUCE'
   | 'AI_EXIT'
   | 'AI_REVERSAL_EXIT'

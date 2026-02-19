@@ -679,6 +679,11 @@ export class DryRunEngine {
       return fpMin(fpAbs(requestedQty), fpAbs(currentQty));
     }
 
+    const runId = String(this.cfg.runId || '').toLowerCase();
+    if (runId.startsWith('ai-')) {
+      return requestedQty;
+    }
+
     const closePart = fpSign(currentQty) !== 0 && fpSign(currentQty) !== fpSign(signedDelta)
       ? fpMin(fpAbs(signedDelta), fpAbs(currentQty))
       : fpZero;
