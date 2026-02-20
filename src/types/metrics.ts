@@ -94,6 +94,79 @@ export interface FundingContext {
   timeToFundingMs: number;
   trend: 'up' | 'down' | 'flat';
   source: 'real' | 'mock';
+  markPrice?: number | null;
+  indexPrice?: number | null;
+}
+
+export interface LiquidityMetrics {
+  microPrice: number | null;
+  imbalanceCurve: {
+    level1: number;
+    level5: number;
+    level10: number;
+    level20: number;
+    level50: number;
+  };
+  bookSlopeBid: number;
+  bookSlopeAsk: number;
+  bookConvexity: number;
+  liquidityWallScore: number;
+  voidGapScore: number;
+  expectedSlippageBuy: number;
+  expectedSlippageSell: number;
+  resiliencyMs: number;
+  effectiveSpread: number;
+  realizedSpreadShortWindow: number;
+}
+
+export interface PassiveFlowMetrics {
+  bidAddRate: number;
+  askAddRate: number;
+  bidCancelRate: number;
+  askCancelRate: number;
+  depthDeltaDecomposition: {
+    addVolume: number;
+    cancelVolume: number;
+    tradeRelatedVolume: number;
+    netDepthDelta: number;
+  };
+  queueDeltaBestBid: number;
+  queueDeltaBestAsk: number;
+  spoofScore: number;
+  refreshRate: number;
+}
+
+export interface DerivativesMetrics {
+  markLastDeviationPct: number | null;
+  indexLastDeviationPct: number | null;
+  perpBasis: number | null;
+  perpBasisZScore: number;
+  liquidationProxyScore: number;
+}
+
+export interface ToxicityMetrics {
+  vpinApprox: number;
+  signedVolumeRatio: number;
+  priceImpactPerSignedNotional: number;
+  tradeToBookRatio: number;
+  burstPersistenceScore: number;
+}
+
+export interface RegimeMetrics {
+  realizedVol1m: number;
+  realizedVol5m: number;
+  realizedVol15m: number;
+  volOfVol: number;
+  microATR: number;
+  chopScore: number;
+  trendinessScore: number;
+}
+
+export interface CrossMarketMetrics {
+  spotPerpDivergence: number | null;
+  betaToBTC: number;
+  betaToETH: number;
+  crossVenueImbalanceDiff: number | null;
 }
 
 /**
@@ -142,6 +215,13 @@ export interface MetricsMessage {
     breakoutScore: number;
     volatilityIndex: number;
   };
+  liquidityMetrics?: LiquidityMetrics;
+  passiveFlowMetrics?: PassiveFlowMetrics;
+  derivativesMetrics?: DerivativesMetrics;
+  toxicityMetrics?: ToxicityMetrics;
+  regimeMetrics?: RegimeMetrics;
+  crossMarketMetrics?: CrossMarketMetrics | null;
+  enableCrossMarketConfirmation?: boolean;
   bids: [number, number, number][];
   asks: [number, number, number][];
   midPrice: number | null;

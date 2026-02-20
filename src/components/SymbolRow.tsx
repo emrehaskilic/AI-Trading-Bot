@@ -16,7 +16,25 @@ interface SymbolRowProps {
 
 const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false }) => {
   const [expanded, setExpanded] = useState(false);
-  const { state, legacyMetrics, timeAndSales, cvd, openInterest, funding, absorption, bids, asks, aiTrend } = data;
+  const {
+    state,
+    legacyMetrics,
+    timeAndSales,
+    cvd,
+    openInterest,
+    funding,
+    absorption,
+    bids,
+    asks,
+    aiTrend,
+    liquidityMetrics,
+    passiveFlowMetrics,
+    derivativesMetrics,
+    toxicityMetrics,
+    regimeMetrics,
+    crossMarketMetrics,
+    enableCrossMarketConfirmation,
+  } = data;
 
   // If we don't have legacy metrics yet (unseeded), render a placeholder row
   if (!legacyMetrics) {
@@ -94,13 +112,34 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
       : trendSide === 'LONG'
         ? 'bg-green-900/25 text-green-300 border-green-700/40'
         : trendSide === 'SHORT'
-          ? 'bg-red-900/25 text-red-300 border-red-700/40'
+        ? 'bg-red-900/25 text-red-300 border-red-700/40'
           : 'bg-zinc-800 text-zinc-300 border-zinc-700';
+  const posNegClass = (n: number) => (n > 0 ? 'text-emerald-300' : n < 0 ? 'text-rose-300' : 'text-zinc-200');
+  const asNumber = (v: unknown): number | null => (Number.isFinite(Number(v)) ? Number(v) : null);
+  const fmt = (v: unknown, d = 2) => {
+    const n = asNumber(v);
+    if (n == null) return '-';
+    return n.toFixed(d);
+  };
+  const fmtSigned = (v: unknown, d = 2) => {
+    const n = asNumber(v);
+    if (n == null) return '-';
+    return `${n > 0 ? '+' : ''}${n.toFixed(d)}`;
+  };
+  const fmtPct = (v: unknown, d = 2) => {
+    const n = asNumber(v);
+    if (n == null) return '-';
+    return `${n > 0 ? '+' : ''}${n.toFixed(d)}%`;
+  };
+  const markDev = asNumber(derivativesMetrics?.markLastDeviationPct);
+  const indexDev = asNumber(derivativesMetrics?.indexLastDeviationPct);
+  const perpBasis = asNumber(derivativesMetrics?.perpBasis);
+  const perpBasisPct = perpBasis == null ? null : perpBasis * 100;
   return (
     <div className="border-b border-zinc-800/50 hover:bg-zinc-900/30 transition-colors">
       {/* Main Row - Fixed Height & Width */}
       <div
-        className="grid gap-0 px-5 items-center cursor-pointer select-none h-14"
+        className="grid gap-0 px-5 items-center cursor-pointer select-none h-16"
         style={{ gridTemplateColumns: 'minmax(140px, 1fr) 110px 130px 90px 90px 90px 90px 90px 120px' }}
         onClick={() => setExpanded(!expanded)}
       >
@@ -121,7 +160,7 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
         </div>
 
         {/* Price */}
-        <div className="text-right font-mono text-sm text-zinc-200">
+        <div className="text-right font-mono text-base text-zinc-100 font-semibold">
           {legacyMetrics.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
         </div>
 
@@ -131,10 +170,10 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
             <>
               <span className="font-mono text-xs text-white font-bold">{(openInterest.openInterest / 1_000_000).toFixed(2)}M</span>
               <div className="flex items-center gap-1 text-[9px] font-mono tracking-tighter">
-                <span className={openInterest.oiChangeAbs >= 0 ? 'text-green-500' : 'text-red-500'}>
+                <span className={openInterest.oiChangeAbs >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
                   {openInterest.oiChangeAbs >= 0 ? '+' : ''}{(openInterest.oiChangeAbs / 1000).toFixed(1)}k
                 </span>
-                <span className="text-zinc-600">({openInterest.oiChangePct.toFixed(2)}%)</span>
+                <span className="text-zinc-500">({openInterest.oiChangePct.toFixed(2)}%)</span>
               </div>
             </>
           ) : (
@@ -172,8 +211,8 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
         <div className="flex items-center justify-center">
           {data.signalDisplay?.signal ? (
             <div className={`px-2 py-0.5 rounded text-[10px] font-bold border flex flex-col items-center ${data.signalDisplay.signal.includes('LONG')
-              ? 'bg-green-900/20 text-green-400 border-green-800/30'
-              : 'bg-red-900/20 text-red-400 border-red-800/30'
+              ? 'bg-emerald-900/20 text-emerald-300 border-emerald-700/30'
+              : 'bg-rose-900/20 text-rose-300 border-rose-700/30'
               }`}>
               {data.signalDisplay.signal.split('_')[0]}
               <span className="text-[8px] opacity-70">SCR: {data.signalDisplay.score}</span>
@@ -188,7 +227,7 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
 
       {/* Expanded Content */}
       {expanded && (
-        <div className="bg-zinc-950/30 border-t border-zinc-800 p-6 animate-in fade-in slide-in-from-top-2 duration-200">
+        <div className="bg-zinc-950/40 border-t border-zinc-800 p-6 animate-in fade-in slide-in-from-top-2 duration-200">
           <div className="space-y-8">
 
 
@@ -205,13 +244,13 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
                   <div className="space-y-2">
                     <div className="flex justify-between items-center text-xs">
                       <span className="text-zinc-500">Aggressive Buy</span>
-                      <span className="font-mono font-bold text-green-400">
+                      <span className="font-mono font-bold text-emerald-300">
                         {(data.timeAndSales.aggressiveBuyVolume / 1000).toFixed(1)}k
                       </span>
                     </div>
                     <div className="flex justify-between items-center text-xs">
                       <span className="text-zinc-500">Aggressive Sell</span>
-                      <span className="font-mono font-bold text-red-400">
+                      <span className="font-mono font-bold text-rose-300">
                         {(data.timeAndSales.aggressiveSellVolume / 1000).toFixed(1)}k
                       </span>
                     </div>
@@ -301,6 +340,193 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
                       ))}
                     </tbody>
                   </table>
+                </div>
+              </div>
+            </div>
+
+            {/* 3. Advanced Microstructure */}
+            <div className="space-y-3">
+              <h3 className="text-[10px] font-bold uppercase tracking-widest text-zinc-400 flex items-center gap-2">
+                <span className="w-1 h-1 bg-zinc-400 rounded-full"></span>
+                Advanced Microstructure
+              </h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                <div className="bg-gradient-to-br from-zinc-900/90 to-zinc-950 border border-zinc-800 rounded-lg p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-2">Liquidity</div>
+                  <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
+                    <div>
+                      <div className="text-zinc-500">MicroPx</div>
+                      <div className="text-zinc-100">{fmt(liquidityMetrics?.microPrice, 2)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Wall Z</div>
+                      <div className={posNegClass(asNumber(liquidityMetrics?.liquidityWallScore) || 0)}>{fmtSigned(liquidityMetrics?.liquidityWallScore, 2)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Void</div>
+                      <div className="text-zinc-200">{fmt(liquidityMetrics?.voidGapScore, 2)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Convexity</div>
+                      <div className={posNegClass(asNumber(liquidityMetrics?.bookConvexity) || 0)}>{fmtSigned(liquidityMetrics?.bookConvexity, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Slip Buy</div>
+                      <div className="text-zinc-200">{fmtPct(liquidityMetrics?.expectedSlippageBuy, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Slip Sell</div>
+                      <div className="text-zinc-200">{fmtPct(liquidityMetrics?.expectedSlippageSell, 3)}</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-gradient-to-br from-zinc-900/90 to-zinc-950 border border-zinc-800 rounded-lg p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-2">Passive Flow</div>
+                  <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
+                    <div>
+                      <div className="text-zinc-500">Bid Add/s</div>
+                      <div className="text-emerald-300">{fmt(passiveFlowMetrics?.bidAddRate, 2)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Ask Add/s</div>
+                      <div className="text-rose-300">{fmt(passiveFlowMetrics?.askAddRate, 2)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Bid Cxl/s</div>
+                      <div className="text-zinc-200">{fmt(passiveFlowMetrics?.bidCancelRate, 2)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Ask Cxl/s</div>
+                      <div className="text-zinc-200">{fmt(passiveFlowMetrics?.askCancelRate, 2)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Spoof</div>
+                      <div className={posNegClass(asNumber(passiveFlowMetrics?.spoofScore) || 0)}>{fmt(passiveFlowMetrics?.spoofScore, 2)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Refresh/s</div>
+                      <div className="text-zinc-200">{fmt(passiveFlowMetrics?.refreshRate, 2)}</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-gradient-to-br from-zinc-900/90 to-zinc-950 border border-zinc-800 rounded-lg p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-2">Derivatives</div>
+                  <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
+                    <div>
+                      <div className="text-zinc-500">Mark Dev</div>
+                      <div className={posNegClass(markDev || 0)}>{fmtPct(markDev, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Index Dev</div>
+                      <div className={posNegClass(indexDev || 0)}>{fmtPct(indexDev, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Basis</div>
+                      <div className={posNegClass(perpBasisPct || 0)}>{fmtPct(perpBasisPct, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Basis Z</div>
+                      <div className={posNegClass(asNumber(derivativesMetrics?.perpBasisZScore) || 0)}>{fmtSigned(derivativesMetrics?.perpBasisZScore, 2)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Liq Proxy</div>
+                      <div className={posNegClass(asNumber(derivativesMetrics?.liquidationProxyScore) || 0)}>{fmt(derivativesMetrics?.liquidationProxyScore, 2)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Resiliency</div>
+                      <div className="text-zinc-200">{fmt(liquidityMetrics?.resiliencyMs, 0)} ms</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-gradient-to-br from-zinc-900/90 to-zinc-950 border border-zinc-800 rounded-lg p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-2">Toxicity</div>
+                  <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
+                    <div>
+                      <div className="text-zinc-500">VPIN</div>
+                      <div className="text-zinc-100">{fmt(toxicityMetrics?.vpinApprox, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Signed Ratio</div>
+                      <div className="text-zinc-100">{fmt(toxicityMetrics?.signedVolumeRatio, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Impact/Ntl</div>
+                      <div className={posNegClass(asNumber(toxicityMetrics?.priceImpactPerSignedNotional) || 0)}>{fmtSigned(toxicityMetrics?.priceImpactPerSignedNotional, 6)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Trade/Book</div>
+                      <div className="text-zinc-100">{fmt(toxicityMetrics?.tradeToBookRatio, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Burst Persist</div>
+                      <div className="text-zinc-100">{fmt(toxicityMetrics?.burstPersistenceScore, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Eff. Spread</div>
+                      <div className="text-zinc-100">{fmtPct(liquidityMetrics?.effectiveSpread, 3)}</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-gradient-to-br from-zinc-900/90 to-zinc-950 border border-zinc-800 rounded-lg p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-2">Regime</div>
+                  <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
+                    <div>
+                      <div className="text-zinc-500">RV 1m</div>
+                      <div className="text-zinc-100">{fmt(regimeMetrics?.realizedVol1m, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">RV 5m</div>
+                      <div className="text-zinc-100">{fmt(regimeMetrics?.realizedVol5m, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">RV 15m</div>
+                      <div className="text-zinc-100">{fmt(regimeMetrics?.realizedVol15m, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Vol of Vol</div>
+                      <div className="text-zinc-100">{fmt(regimeMetrics?.volOfVol, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Chop</div>
+                      <div className="text-zinc-100">{fmt(regimeMetrics?.chopScore, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Trendiness</div>
+                      <div className="text-zinc-100">{fmt(regimeMetrics?.trendinessScore, 3)}</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-gradient-to-br from-zinc-900/90 to-zinc-950 border border-zinc-800 rounded-lg p-3">
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-2">Cross Market</div>
+                  <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
+                    <div>
+                      <div className="text-zinc-500">Enabled</div>
+                      <div className={enableCrossMarketConfirmation ? 'text-emerald-300' : 'text-zinc-500'}>
+                        {enableCrossMarketConfirmation ? 'ON' : 'OFF'}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Spot-Perp</div>
+                      <div className={posNegClass(asNumber(crossMarketMetrics?.spotPerpDivergence) || 0)}>{fmtPct(crossMarketMetrics?.spotPerpDivergence, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Beta BTC</div>
+                      <div className="text-zinc-100">{fmt(crossMarketMetrics?.betaToBTC, 3)}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500">Beta ETH</div>
+                      <div className="text-zinc-100">{fmt(crossMarketMetrics?.betaToETH, 3)}</div>
+                    </div>
+                    <div className="col-span-2">
+                      <div className="text-zinc-500">Venue Imbalance Diff</div>
+                      <div className={posNegClass(asNumber(crossMarketMetrics?.crossVenueImbalanceDiff) || 0)}>{fmtSigned(crossMarketMetrics?.crossVenueImbalanceDiff, 3)}</div>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>

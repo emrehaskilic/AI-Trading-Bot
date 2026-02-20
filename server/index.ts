@@ -68,6 +68,11 @@ import { MonteCarloSimulator, calculateRiskOfRuin, generateRandomTrades } from '
 import { WalkForwardAnalyzer } from './backtesting/WalkForwardAnalyzer';
 import { MarketDataValidator } from './connectors/MarketDataValidator';
 import { MarketDataMonitor } from './connectors/MarketDataMonitor';
+import {
+    AdvancedMicrostructureMetrics,
+    AdvancedMicrostructureBundle,
+} from './metrics/AdvancedMicrostructureMetrics';
+import { SpotReferenceMonitor, SpotReferenceMetrics } from './metrics/SpotReferenceMonitor';
 
 // =============================================================================
 // Configuration
@@ -111,6 +116,10 @@ const DEPTH_LEVELS = Number(process.env.DEPTH_LEVELS || 20);
 const DEPTH_STREAM_MODE = String(process.env.DEPTH_STREAM_MODE || 'diff').toLowerCase(); // diff | partial
 const WS_UPDATE_SPEED_RAW = String(process.env.WS_UPDATE_SPEED || '250ms');
 const WS_UPDATE_SPEED = normalizeWsUpdateSpeed(WS_UPDATE_SPEED_RAW);
+const BINANCE_REST_TIMEOUT_MS = Math.max(1000, Number(process.env.BINANCE_REST_TIMEOUT_MS || 8000));
+const BINANCE_EXCHANGE_INFO_TIMEOUT_MS = Math.max(1000, Number(process.env.BINANCE_EXCHANGE_INFO_TIMEOUT_MS || BINANCE_REST_TIMEOUT_MS));
+const BINANCE_SNAPSHOT_TIMEOUT_MS = Math.max(1000, Number(process.env.BINANCE_SNAPSHOT_TIMEOUT_MS || BINANCE_REST_TIMEOUT_MS));
+const SYMBOLS_ENDPOINT_TIMEOUT_MS = Math.max(1000, Number(process.env.SYMBOLS_ENDPOINT_TIMEOUT_MS || 3500));
 const BLOCKED_TELEMETRY_INTERVAL_MS = Number(process.env.BLOCKED_TELEMETRY_INTERVAL_MS || 1000);
 const MIN_RESYNC_INTERVAL_MS = 15000;
 const GRACE_PERIOD_MS = 5000;
@@ -123,6 +132,7 @@ const AI_TREND_BOOTSTRAP_DEFAULT_HOURS = Math.max(1, Number(process.env.AI_TREND
 const AI_TREND_BOOTSTRAP_MAX_HOURS = 12;
 const AI_TREND_BOOTSTRAP_MIN_BARS = 120;
 const STRATEGY_EVAL_MIN_INTERVAL_MS = Math.max(50, Number(process.env.STRATEGY_EVAL_MIN_INTERVAL_MS || 200));
+const ENABLE_CROSS_MARKET_CONFIRMATION = parseEnvFlag(process.env.ENABLE_CROSS_MARKET_CONFIRMATION);
 
 // [PHASE 3] Execution Flags
 let KILL_SWITCH = false;
@@ -243,12 +253,14 @@ const absorptionMap = new Map<string, AbsorptionDetector>();
 const absorptionResult = new Map<string, number>();
 const legacyMap = new Map<string, LegacyCalculator>();
 const orderbookIntegrityMap = new Map<string, OrderbookIntegrityMonitor>();
+const advancedMicroMap = new Map<string, AdvancedMicrostructureMetrics>();
 
 // Monitor Caches
 const lastOpenInterest = new Map<string, OpenInterestMetrics>();
 const lastFunding = new Map<string, FundingMetrics>();
 const oiMonitors = new Map<string, OpenInterestMonitor>();
 const fundingMonitors = new Map<string, FundingMonitor>();
+const spotReferenceMonitors = new Map<string, SpotReferenceMonitor>();
 
 // [PHASE 1 & 2] New Maps
 const backfillMap = new Map<string, KlineBackfill>();
@@ -372,6 +384,47 @@ function pruneWindow(values: number[], windowMs: number, now: number): void {
 function countWindow(values: number[], windowMs: number, now: number): number {
     pruneWindow(values, windowMs, now);
     return values.length;
+}
+
+async function fetchWithTimeout(url: string, timeoutMs: number): Promise<globalThis.Response> {
+    const controller = new AbortController();
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    const deadlineMs = Math.max(1000, timeoutMs);
+    const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+            controller.abort();
+            reject(new Error(`fetch_timeout_${deadlineMs}`));
+        }, deadlineMs);
+    });
+    try {
+        return await Promise.race([
+            fetch(url, { signal: controller.signal }),
+            timeoutPromise,
+        ]);
+    } finally {
+        if (timeoutHandle) {
+            clearTimeout(timeoutHandle);
+        }
+    }
+}
+
+function buildSymbolFallbackList(): string[] {
+    const seeds = new Set<string>([
+        'BTCUSDT',
+        'ETHUSDT',
+        'SOLUSDT',
+        'BNBUSDT',
+        ...Array.from(activeSymbols || []),
+        ...dryRunSession.getActiveSymbols(),
+    ]);
+    const cached = exchangeInfoCache?.data?.symbols;
+    if (Array.isArray(cached)) {
+        for (const symbol of cached) {
+            const normalized = String(symbol || '').toUpperCase();
+            if (normalized) seeds.add(normalized);
+        }
+    }
+    return Array.from(seeds).sort();
 }
 
 interface KlineSample1m {
@@ -602,6 +655,10 @@ const getTaS = (s: string) => { if (!timeAndSalesMap.has(s)) timeAndSalesMap.set
 const getCvd = (s: string) => { if (!cvdMap.has(s)) cvdMap.set(s, new CvdCalculator()); return cvdMap.get(s)!; };
 const getAbs = (s: string) => { if (!absorptionMap.has(s)) absorptionMap.set(s, new AbsorptionDetector()); return absorptionMap.get(s)!; };
 const getLegacy = (s: string) => { if (!legacyMap.has(s)) legacyMap.set(s, new LegacyCalculator(s)); return legacyMap.get(s)!; };
+const getAdvancedMicro = (s: string) => {
+    if (!advancedMicroMap.has(s)) advancedMicroMap.set(s, new AdvancedMicrostructureMetrics(s));
+    return advancedMicroMap.get(s)!;
+};
 const getIntegrity = (s: string) => {
     if (!orderbookIntegrityMap.has(s)) {
         orderbookIntegrityMap.set(s, new OrderbookIntegrityMonitor(s));
@@ -613,8 +670,18 @@ const getIntegrity = (s: string) => {
 const getBackfill = (s: string) => { if (!backfillMap.has(s)) backfillMap.set(s, new KlineBackfill(s, BINANCE_REST_BASE)); return backfillMap.get(s)!; };
 const getOICalc = (s: string) => { if (!oiCalculatorMap.has(s)) oiCalculatorMap.set(s, new OICalculator(s, BINANCE_REST_BASE)); return oiCalculatorMap.get(s)!; };
 const getStrategy = (s: string) => { if (!strategyMap.has(s)) strategyMap.set(s, new NewStrategyV11({}, decisionLog)); return strategyMap.get(s)!; };
+const getSpotReference = (s: string) => {
+    if (!spotReferenceMonitors.has(s)) {
+        const monitor = new SpotReferenceMonitor(s);
+        monitor.start();
+        spotReferenceMonitors.set(s, monitor);
+    }
+    return spotReferenceMonitors.get(s)!;
+};
 
 function ensureMonitors(symbol: string) {
+    getAdvancedMicro(symbol);
+
     const backfill = getBackfill(symbol);
     const backfillState = backfill.getState();
     const lastBackfillAttempt = backfillLastAttemptMs.get(symbol) || 0;
@@ -652,6 +719,10 @@ function ensureMonitors(symbol: string) {
         m.start();
         fundingMonitors.set(symbol, m);
     }
+
+    if (ENABLE_CROSS_MARKET_CONFIRMATION) {
+        getSpotReference(symbol);
+    }
 }
 
 // =============================================================================
@@ -662,9 +733,10 @@ async function fetchExchangeInfo() {
     if (exchangeInfoCache && (Date.now() - exchangeInfoCache.timestamp < EXCHANGE_INFO_TTL_MS)) {
         return exchangeInfoCache.data;
     }
+    const fallbackSymbols = buildSymbolFallbackList();
     try {
         log('EXCHANGE_INFO_REQ', { url: `${BINANCE_REST_BASE}/fapi/v1/exchangeInfo` });
-        const res = await fetch(`${BINANCE_REST_BASE}/fapi/v1/exchangeInfo`);
+        const res = await fetchWithTimeout(`${BINANCE_REST_BASE}/fapi/v1/exchangeInfo`, BINANCE_EXCHANGE_INFO_TIMEOUT_MS);
         if (!res.ok) throw new Error(`Status ${res.status}`);
         const data: any = await res.json();
         const symbols = data.symbols
@@ -674,7 +746,7 @@ async function fetchExchangeInfo() {
         return exchangeInfoCache.data;
     } catch (e: any) {
         log('EXCHANGE_INFO_ERROR', { error: e.message });
-        return exchangeInfoCache?.data || { symbols: [] };
+        return exchangeInfoCache?.data || { symbols: fallbackSymbols };
     }
 }
 
@@ -701,7 +773,10 @@ async function fetchSnapshot(symbol: string, trigger: string, force = false) {
 
     try {
         log('SNAPSHOT_REQ', { symbol, trigger });
-        const res = await fetch(`${BINANCE_REST_BASE}/fapi/v1/depth?symbol=${symbol}&limit=1000`);
+        const res = await fetchWithTimeout(
+            `${BINANCE_REST_BASE}/fapi/v1/depth?symbol=${symbol}&limit=1000`,
+            BINANCE_SNAPSHOT_TIMEOUT_MS
+        );
 
         meta.lastSnapshotHttpStatus = res.status;
 
@@ -1004,6 +1079,13 @@ async function processDepthQueue(symbol: string) {
             const cvd = getCvd(symbol);
             const abs = getAbs(symbol);
             const leg = getLegacy(symbol);
+            const advancedMicro = getAdvancedMicro(symbol);
+            const top50 = getTopLevels(ob, 50);
+            advancedMicro.onDepthSnapshot({
+                timestampMs: Number(update.eventTimeMs || now),
+                bids: top50.bids,
+                asks: top50.asks,
+            });
             const absVal = absorptionResult.get(symbol) ?? 0;
             broadcastMetrics(symbol, ob, tas, cvd, absVal, leg, update.eventTimeMs || 0, null, 'depth');
 
@@ -1219,10 +1301,21 @@ async function processSymbolEvent(s: string, d: any) {
         const cvd = getCvd(s);
         const abs = getAbs(s);
         const leg = getLegacy(s);
+        const advancedMicro = getAdvancedMicro(s);
 
         tas.addTrade({ price: p, quantity: q, side, timestamp: t });
         cvd.addTrade({ price: p, quantity: q, side, timestamp: t });
         leg.addTrade({ price: p, quantity: q, side, timestamp: t });
+        const bestBidForTrade = bestBid(ob);
+        const bestAskForTrade = bestAsk(ob);
+        const midForTrade = (bestBidForTrade && bestAskForTrade) ? (bestBidForTrade + bestAskForTrade) / 2 : null;
+        advancedMicro.onTrade({
+            timestampMs: Number(t || now),
+            price: p,
+            quantity: q,
+            side,
+            midPrice: midForTrade,
+        });
 
         const levelSize = getLevelSize(ob, p) || 0;
         const absVal = abs.addTrade(s, p, side, t, levelSize);
@@ -1297,6 +1390,46 @@ async function processSymbolEvent(s: string, d: any) {
             latencyTracker.record('strategy_calc_ms', Date.now() - calcStart);
         }
 
+        const oiPanel = getOICalc(s).getMetrics();
+        const resolvedOI = oiMetrics
+            ? {
+                currentOI: oiMetrics.openInterest,
+                oiChangeAbs: oiMetrics.oiChangeAbs,
+                oiChangePct: oiMetrics.oiChangePct,
+                lastUpdated: oiMetrics.lastUpdated,
+            }
+            : {
+                currentOI: oiPanel.currentOI,
+                oiChangeAbs: oiPanel.oiChangeAbs,
+                oiChangePct: oiPanel.oiChangePct,
+                lastUpdated: oiPanel.lastUpdated,
+            };
+        advancedMicro.onDerivativesSnapshot({
+            timestampMs: Number(t || now),
+            funding: lastFunding.get(s) || null,
+            openInterest: resolvedOI,
+            lastPrice: p,
+        });
+        const spotMetrics: SpotReferenceMetrics | null = ENABLE_CROSS_MARKET_CONFIRMATION
+            ? getSpotReference(s).getMetrics()
+            : null;
+        const btcRefRet = advancedMicroMap.get('BTCUSDT')?.getLatestReturn() ?? null;
+        const ethRefRet = advancedMicroMap.get('ETHUSDT')?.getLatestReturn() ?? null;
+        advancedMicro.updateCrossMarket({
+            timestampMs: Number(t || now),
+            enableCrossMarketConfirmation: ENABLE_CROSS_MARKET_CONFIRMATION,
+            btcReturn: btcRefRet,
+            ethReturn: ethRefRet,
+            spotReference: spotMetrics
+                ? {
+                    timestampMs: spotMetrics.lastUpdated,
+                    midPrice: spotMetrics.midPrice,
+                    imbalance10: spotMetrics.imbalance10,
+                }
+                : null,
+        });
+        const advancedBundle = advancedMicro.getMetrics(Number(t || now));
+
         // [DRY RUN INTEGRATION]
         const isDryRunTracked = dryRunSession.isTrackingSymbol(s);
         const aiActive = aiDryRun.isActive() && aiDryRun.isTrackingSymbol(s);
@@ -1307,9 +1440,6 @@ async function processSymbolEvent(s: string, d: any) {
                 const riskState = dryRunSession.getAIDryRunRiskState(s, snapshotTs);
                 const executionState = dryRunSession.getAIDryRunExecutionState(s, snapshotTs);
                 const blockedReasons: string[] = [];
-                if (!decision.gatePassed) blockedReasons.push('GATE_NOT_PASSED');
-                if (spreadPct != null && spreadPct > 0.6) blockedReasons.push('SPREAD_TOO_WIDE');
-                if (tasMetrics && (tasMetrics.printsPerSecond < 0.25 || tasMetrics.tradeCount < 4)) blockedReasons.push('ACTIVITY_WEAK');
 
                 void aiDryRun.onMetrics({
                     symbol: s,
@@ -1342,6 +1472,13 @@ async function processSymbolEvent(s: string, d: any) {
                         burstCount: tasMetrics?.consecutiveBurst?.count || 0,
                         burstSide: tasMetrics?.consecutiveBurst?.side || null,
                     },
+                    liquidityMetrics: advancedBundle.liquidityMetrics,
+                    passiveFlowMetrics: advancedBundle.passiveFlowMetrics,
+                    derivativesMetrics: advancedBundle.derivativesMetrics,
+                    toxicityMetrics: advancedBundle.toxicityMetrics,
+                    regimeMetrics: advancedBundle.regimeMetrics,
+                    crossMarketMetrics: advancedBundle.crossMarketMetrics,
+                    enableCrossMarketConfirmation: advancedBundle.enableCrossMarketConfirmation,
                     openInterest: { oiChangePct: oiMetrics ? oiMetrics.oiChangePct : null },
                     absorption: { value: absVal, side: absVal ? side : null },
                     volatility: backfill.getState().atr || 0,
@@ -1379,7 +1516,9 @@ async function processSymbolEvent(s: string, d: any) {
             t,
             decision,
             'trade',
-            shouldEvaluateStrategy ? { tasMetrics, legacyMetrics: legMetrics } : undefined
+            shouldEvaluateStrategy
+                ? { tasMetrics, legacyMetrics: legMetrics, advancedBundle }
+                : { advancedBundle }
         );
     }
 }
@@ -1413,7 +1552,7 @@ function broadcastMetrics(
     eventTimeMs: number,
     decision: any = null,
     reason: 'depth' | 'trade' = 'trade',
-    precomputed?: { tasMetrics?: any; cvdMetrics?: any[]; legacyMetrics?: any }
+    precomputed?: { tasMetrics?: any; cvdMetrics?: any[]; legacyMetrics?: any; advancedBundle?: AdvancedMicrostructureBundle }
 ) {
     const THROTTLE_MS = 250; // 4Hz max per symbol
     const meta = getMeta(s);
@@ -1447,12 +1586,60 @@ function broadcastMetrics(
 
     const oiM = getOICalc(s).getMetrics();
     const oiLegacy = leg.getOpenInterestMetrics();
+    const resolvedOpenInterest = oiLegacy ? {
+        openInterest: oiLegacy.openInterest,
+        oiChangeAbs: oiLegacy.oiChangeAbs,
+        oiChangePct: oiLegacy.oiChangePct,
+        oiDeltaWindow: oiLegacy.oiDeltaWindow,
+        lastUpdated: oiLegacy.lastUpdated,
+        source: oiLegacy.source,
+        stabilityMsg: oiM.stabilityMsg
+    } : {
+        openInterest: oiM.currentOI,
+        oiChangeAbs: oiM.oiChangeAbs,
+        oiChangePct: oiM.oiChangePct,
+        oiDeltaWindow: oiM.oiChangeAbs,
+        lastUpdated: oiM.lastUpdated,
+        source: 'real',
+        stabilityMsg: oiM.stabilityMsg
+    };
     const bf = getBackfill(s).getState();
     const integrity = getIntegrity(s).getStatus(now);
     const aiTrend = aiDryRun.getTrendStatus(s, now);
     const tf1m = cvdM.find((x: any) => x.timeframe === '1m') || null;
     const tf5m = cvdM.find((x: any) => x.timeframe === '5m') || null;
     const tf15m = cvdM.find((x: any) => x.timeframe === '15m') || null;
+    const advancedMicro = getAdvancedMicro(s);
+    advancedMicro.onDerivativesSnapshot({
+        timestampMs: Number(eventTimeMs || now),
+        funding: lastFunding.get(s) || null,
+        openInterest: {
+            currentOI: resolvedOpenInterest.openInterest,
+            oiChangeAbs: resolvedOpenInterest.oiChangeAbs,
+            oiChangePct: resolvedOpenInterest.oiChangePct,
+            lastUpdated: resolvedOpenInterest.lastUpdated,
+        },
+        lastPrice: mid,
+    });
+    const spotMetrics: SpotReferenceMetrics | null = ENABLE_CROSS_MARKET_CONFIRMATION
+        ? getSpotReference(s).getMetrics()
+        : null;
+    const btcRefRet = advancedMicroMap.get('BTCUSDT')?.getLatestReturn() ?? null;
+    const ethRefRet = advancedMicroMap.get('ETHUSDT')?.getLatestReturn() ?? null;
+    advancedMicro.updateCrossMarket({
+        timestampMs: Number(eventTimeMs || now),
+        enableCrossMarketConfirmation: ENABLE_CROSS_MARKET_CONFIRMATION,
+        btcReturn: btcRefRet,
+        ethReturn: ethRefRet,
+        spotReference: spotMetrics
+            ? {
+                timestampMs: spotMetrics.lastUpdated,
+                midPrice: spotMetrics.midPrice,
+                imbalance10: spotMetrics.imbalance10,
+            }
+            : null,
+    });
+    const advancedBundle = precomputed?.advancedBundle ?? advancedMicro.getMetrics(now);
 
     const payload: any = {
         type: 'metrics',
@@ -1468,23 +1655,7 @@ function broadcastMetrics(
             tradeCounts: cvd.getTradeCounts()
         },
         absorption: absVal,
-        openInterest: oiLegacy ? {
-            openInterest: oiLegacy.openInterest,
-            oiChangeAbs: oiLegacy.oiChangeAbs,
-            oiChangePct: oiLegacy.oiChangePct,
-            oiDeltaWindow: oiLegacy.oiDeltaWindow,
-            lastUpdated: oiLegacy.lastUpdated,
-            source: oiLegacy.source,
-            stabilityMsg: oiM.stabilityMsg
-        } : {
-            openInterest: oiM.currentOI,
-            oiChangeAbs: oiM.oiChangeAbs,
-            oiChangePct: oiM.oiChangePct,
-            oiDeltaWindow: oiM.oiChangeAbs,
-            lastUpdated: oiM.lastUpdated,
-            source: 'real',
-            stabilityMsg: oiM.stabilityMsg
-        },
+        openInterest: resolvedOpenInterest,
         funding: lastFunding.get(s) || null,
         aiTrend: aiTrend ? {
             side: aiTrend.side,
@@ -1510,6 +1681,13 @@ function broadcastMetrics(
             breakoutScore: decision?.dfsPercentile || 0,
             volatilityIndex: bf.atr
         },
+        liquidityMetrics: advancedBundle.liquidityMetrics,
+        passiveFlowMetrics: advancedBundle.passiveFlowMetrics,
+        derivativesMetrics: advancedBundle.derivativesMetrics,
+        toxicityMetrics: advancedBundle.toxicityMetrics,
+        regimeMetrics: advancedBundle.regimeMetrics,
+        crossMarketMetrics: advancedBundle.crossMarketMetrics,
+        enableCrossMarketConfirmation: advancedBundle.enableCrossMarketConfirmation,
         bids, asks,
         bestBid: bestBidPx,
         bestAsk: bestAskPx,
@@ -1593,6 +1771,7 @@ function broadcastMetrics(
 // =============================================================================
 
 const app = express();
+app.set('etag', false);
 app.use(express.json());
 app.use(requestLogger);
 
@@ -1622,6 +1801,12 @@ const corsOptions = {
     allowedHeaders: ['Content-Type', 'Authorization'],
 };
 app.use(cors(corsOptions));
+app.use('/api', (_req, res, next) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    next();
+});
 app.use('/api', apiKeyMiddleware);
 app.get(
     ['/health-report.json', '/health_check_result.json', '/server/health-report.json'],
@@ -1741,7 +1926,15 @@ app.get('/api/exchange-info', async (req, res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
-    res.json(await fetchExchangeInfo());
+    const fallbackSymbols = buildSymbolFallbackList();
+    const info = await Promise.race([
+        fetchExchangeInfo(),
+        new Promise<{ symbols: string[] }>((resolve) => {
+            setTimeout(() => resolve({ symbols: fallbackSymbols }), SYMBOLS_ENDPOINT_TIMEOUT_MS);
+        }),
+    ]);
+    const symbols = Array.isArray(info?.symbols) && info.symbols.length > 0 ? info.symbols : fallbackSymbols;
+    res.json({ symbols });
 });
 
 app.get('/api/testnet/exchange-info', async (req, res) => {
@@ -1853,11 +2046,22 @@ app.post('/api/execution/refresh', async (req, res) => {
 
 app.get('/api/dry-run/symbols', async (req, res) => {
     try {
-        const info = await fetchExchangeInfo();
-        const symbols = Array.isArray(info?.symbols) ? info.symbols : [];
+        // Prevent 304/empty-body cache flows on symbol bootstrap requests.
+        res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.set('Pragma', 'no-cache');
+        res.set('Expires', '0');
+
+        const fallbackSymbols = buildSymbolFallbackList();
+        const info = await Promise.race([
+            fetchExchangeInfo(),
+            new Promise<{ symbols: string[] }>((resolve) => {
+                setTimeout(() => resolve({ symbols: fallbackSymbols }), SYMBOLS_ENDPOINT_TIMEOUT_MS);
+            }),
+        ]);
+        const symbols = Array.isArray(info?.symbols) && info.symbols.length > 0 ? info.symbols : fallbackSymbols;
         res.json({ ok: true, symbols });
     } catch (e: any) {
-        res.status(500).json({ ok: false, error: e?.message || 'dry_run_symbols_failed', symbols: [] });
+        res.status(200).json({ ok: true, symbols: buildSymbolFallbackList(), degraded: true });
     }
 });
 
@@ -1887,6 +2091,7 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
         const apiKey = String(req.body?.apiKey || '').trim();
         const model = String(req.body?.model || '').trim();
         const localOnly = Boolean(req.body?.localOnly) || !apiKey || !model;
+        const extraUserPrompt = String(req.body?.extraUserPrompt ?? req.body?.customPrompt ?? '').trim();
         const aiGridProfile = String(req.body?.aiGridProfile ?? req.body?.gridProfile ?? '').trim().toLowerCase();
         const normalizedGridProfile: 'safe' | 'balanced' | 'aggressive' | undefined = aiGridProfile === 'safe' || aiGridProfile === 'balanced' || aiGridProfile === 'aggressive'
             ? aiGridProfile
@@ -1938,6 +2143,7 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
             temperature: Number(req.body?.temperature ?? 0),
             maxOutputTokens: Number(req.body?.maxOutputTokens ?? 256),
             localOnly,
+            extraUserPrompt,
             bootstrapTrendBySymbol,
         });
 

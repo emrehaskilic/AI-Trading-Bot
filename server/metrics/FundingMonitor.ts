@@ -12,6 +12,9 @@ export interface FundingMetrics {
   rate: number;
   timeToFundingMs: number;
   trend: 'up' | 'down' | 'flat';
+  source?: 'real' | 'mock';
+  markPrice?: number | null;
+  indexPrice?: number | null;
 }
 
 type FundingListener = (metrics: FundingMetrics) => void;
@@ -43,7 +46,13 @@ export class FundingMonitor {
     }
   }
 
-  public update(rate: number, nextFundingTime: number) {
+  public update(
+    rate: number,
+    nextFundingTime: number,
+    markPrice: number | null = null,
+    indexPrice: number | null = null,
+    source: 'real' | 'mock' = 'mock'
+  ) {
     let trend: 'up' | 'down' | 'flat' = 'flat';
     if (this.lastRate !== null) {
       if (rate > this.lastRate) trend = 'up';
@@ -52,7 +61,7 @@ export class FundingMonitor {
     this.lastRate = rate;
     const now = Date.now();
     const timeToFundingMs = Math.max(0, nextFundingTime - now);
-    const metrics: FundingMetrics = { symbol: this.symbol, rate, timeToFundingMs, trend };
+    const metrics: FundingMetrics = { symbol: this.symbol, rate, timeToFundingMs, trend, source, markPrice, indexPrice };
     this.listeners.forEach(l => l(metrics));
   }
 
@@ -71,8 +80,16 @@ export class FundingMonitor {
       if (data && typeof data.lastFundingRate === 'string' && typeof data.nextFundingTime === 'number') {
         const rate = parseFloat(data.lastFundingRate);
         const nextFundingTime = data.nextFundingTime;
+        const markPrice = typeof data.markPrice === 'string' ? parseFloat(data.markPrice) : null;
+        const indexPrice = typeof data.indexPrice === 'string' ? parseFloat(data.indexPrice) : null;
         if (!isNaN(rate) && nextFundingTime > 0) {
-          this.update(rate, nextFundingTime);
+          this.update(
+            rate,
+            nextFundingTime,
+            Number.isFinite(markPrice as number) ? Number(markPrice) : null,
+            Number.isFinite(indexPrice as number) ? Number(indexPrice) : null,
+            'real'
+          );
         }
       }
     } catch (e) {

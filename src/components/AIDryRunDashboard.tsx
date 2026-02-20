@@ -3,6 +3,7 @@ import SymbolRow from './SymbolRow';
 import MobileSymbolCard from './MobileSymbolCard';
 import { useTelemetrySocket } from '../services/useTelemetrySocket';
 import { withProxyApiKey } from '../services/proxyAuth';
+import { getProxyApiBase } from '../services/proxyBase';
 import { MetricsMessage } from '../types/metrics';
 
 interface DryRunConsoleLog {
@@ -114,8 +115,6 @@ interface DryRunStatus {
   }>;
 }
 
-type AIGridProfile = 'safe' | 'balanced' | 'aggressive';
-
 interface AIDryRunStatus {
   active: boolean;
   model: string | null;
@@ -124,9 +123,12 @@ interface AIDryRunStatus {
   maxOutputTokens: number;
   apiKeySet: boolean;
   localOnly?: boolean;
+  extraUserPromptSet?: boolean;
   lastError: string | null;
   symbols: string[];
 }
+
+type AIGridProfile = 'safe' | 'balanced' | 'aggressive';
 
 const DEFAULT_STATUS: DryRunStatus = {
   running: false,
@@ -182,8 +184,7 @@ const MODEL_OPTIONS = [
 ];
 
 const AIDryRunDashboard: React.FC = () => {
-  const hostname = window.location.hostname;
-  const proxyUrl = (import.meta as any).env?.VITE_PROXY_API || `http://${hostname}:8787`;
+  const proxyUrl = getProxyApiBase();
   const fetchWithAuth = (url: string, init?: RequestInit) => fetch(url, withProxyApiKey(init));
 
   const [availablePairs, setAvailablePairs] = useState<string[]>([]);
@@ -202,10 +203,13 @@ const AIDryRunDashboard: React.FC = () => {
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState('gemini-2.5-flash');
   const [customModel, setCustomModel] = useState('');
+  const [extraUserPrompt, setExtraUserPrompt] = useState('');
   const [gridProfile, setGridProfile] = useState<AIGridProfile>('balanced');
   const [isApplyingGridProfile, setIsApplyingGridProfile] = useState(false);
   const [localMode, setLocalMode] = useState(false);
   const localModeManualOverrideRef = useRef(false);
+  const hasAppliedInitialConfigRef = useRef(false);
+  const prevRunningRef = useRef(false);
   const [apiKeyStatus, setApiKeyStatus] = useState<'idle' | 'validating' | 'valid' | 'invalid'>('idle');
   const [apiKeyError, setApiKeyError] = useState<string | null>(null);
   const [lastMetricsUpdateMs, setLastMetricsUpdateMs] = useState(0);
@@ -226,10 +230,20 @@ const AIDryRunDashboard: React.FC = () => {
   useEffect(() => {
     const loadPairs = async () => {
       setIsLoadingPairs(true);
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), 8000);
       try {
-        const res = await fetchWithAuth(`${proxyUrl}/api/dry-run/symbols`);
+        const res = await fetchWithAuth(`${proxyUrl}/api/dry-run/symbols`, { signal: controller.signal, cache: 'no-store' });
+        if (!res.ok) {
+          throw new Error(`symbols_http_${res.status}`);
+        }
         const data = await res.json();
-        const pairs = Array.isArray(data?.symbols) ? data.symbols : [];
+        const pairs = Array.isArray(data?.symbols)
+          ? data.symbols.filter((p: unknown): p is string => typeof p === 'string' && p.length > 0)
+          : [];
+        if (pairs.length === 0) {
+          throw new Error('symbols_empty');
+        }
         setAvailablePairs(pairs);
         if (pairs.length > 0) {
           setSelectedPairs((prev) => {
@@ -239,8 +253,15 @@ const AIDryRunDashboard: React.FC = () => {
           });
         }
       } catch {
-        setAvailablePairs(['BTCUSDT', 'ETHUSDT', 'SOLUSDT']);
+        const fallbackPairs = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+        setAvailablePairs(fallbackPairs);
+        setSelectedPairs((prev) => {
+          const valid = prev.filter((s) => fallbackPairs.includes(s));
+          if (valid.length > 0) return valid;
+          return [fallbackPairs[0]];
+        });
       } finally {
+        window.clearTimeout(timer);
         setIsLoadingPairs(false);
       }
     };
@@ -253,7 +274,7 @@ const AIDryRunDashboard: React.FC = () => {
 
     const poll = async () => {
       try {
-        const res = await fetchWithAuth(`${proxyUrl}/api/ai-dry-run/status`);
+        const res = await fetchWithAuth(`${proxyUrl}/api/ai-dry-run/status`, { cache: 'no-store' });
         const data = await res.json();
         if (!active) return;
         if (res.ok && data?.status) {
@@ -274,13 +295,18 @@ const AIDryRunDashboard: React.FC = () => {
               }
             }
           }
+          const transitionedToStopped = prevRunningRef.current && !next.running;
+          const shouldApplyServerConfig =
+            Boolean(next.config) && (!hasAppliedInitialConfigRef.current || transitionedToStopped);
           if (next.running && next.symbols.length > 0) {
             setSelectedPairs(next.symbols);
-          } else if (!next.running && next.config) {
+          } else if (!next.running && next.config && shouldApplyServerConfig) {
             setStartBalance(String(next.config.walletBalanceStartUsdt));
             setInitialMargin(String(next.config.initialMarginUsdt));
             setLeverage(String(next.config.leverage));
+            hasAppliedInitialConfigRef.current = true;
           }
+          prevRunningRef.current = Boolean(next.running);
         }
       } catch {
         // keep last known state
@@ -330,6 +356,7 @@ const AIDryRunDashboard: React.FC = () => {
           apiKey: localMode ? '' : apiKey.trim(),
           model: localMode ? '' : resolvedModel,
           localOnly: localMode,
+          extraUserPrompt: extraUserPrompt.trim(),
           aiGridProfile: gridProfile,
         }),
       });
@@ -402,7 +429,7 @@ const AIDryRunDashboard: React.FC = () => {
     setActionError(null);
     setIsRefreshingPositions(true);
     try {
-      const res = await fetchWithAuth(`${proxyUrl}/api/ai-dry-run/status`);
+      const res = await fetchWithAuth(`${proxyUrl}/api/ai-dry-run/status`, { cache: 'no-store' });
       const data = await res.json();
       if (!res.ok || !data?.status) {
         throw new Error(data?.error || 'ai_dry_run_status_failed');
@@ -728,6 +755,21 @@ const AIDryRunDashboard: React.FC = () => {
             </div>
           </div>
 
+          <label className="text-xs text-zinc-500">
+            Additional AI Prompt (Optional)
+            <textarea
+              value={extraUserPrompt}
+              disabled={status.running}
+              onChange={(e) => setExtraUserPrompt(e.target.value)}
+              placeholder="Example: Kisa surede yuksek kar hedefle."
+              rows={3}
+              className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm"
+            />
+            <div className="text-[11px] text-zinc-500 mt-1">
+              Bu metin, metrik tabanli ana prompta eklenir.
+            </div>
+          </label>
+
           <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
             <button
               onClick={startDryRun}
@@ -943,14 +985,15 @@ const AIDryRunDashboard: React.FC = () => {
           )}
         </div>
 
-        <div className="bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden shadow-2xl">
-          <div className="px-4 py-3 text-xs uppercase tracking-wider text-zinc-500 border-b border-zinc-800">
-            Live Orderflow Metrics (Selected Pairs)
+        <div className="bg-gradient-to-br from-zinc-900 to-zinc-950 border border-zinc-800 rounded-lg overflow-hidden shadow-2xl">
+          <div className="px-4 py-3 flex items-center justify-between text-xs uppercase tracking-wider text-zinc-400 border-b border-zinc-800 bg-zinc-900/70">
+            <span>Live Orderflow Metrics (Selected Pairs)</span>
+            <span className="text-[10px] normal-case tracking-normal text-zinc-500">Click any row to expand details</span>
           </div>
           <div className="hidden md:block overflow-x-auto">
             <div className="min-w-[1100px]">
               <div
-                className="grid gap-0 px-5 py-4 text-[11px] font-bold text-zinc-500 uppercase tracking-widest bg-zinc-900 border-b border-zinc-800"
+                className="grid gap-0 px-5 py-4 text-[11px] font-bold text-zinc-400 uppercase tracking-widest bg-zinc-900 border-b border-zinc-800"
                 style={{ gridTemplateColumns: 'minmax(140px, 1fr) 110px 130px 90px 90px 90px 90px 90px 120px' }}
               >
                 <div>Symbol / Trend</div>
@@ -963,7 +1006,7 @@ const AIDryRunDashboard: React.FC = () => {
                 <div className="text-center">CVD Slope</div>
                 <div className="text-center">Signal</div>
               </div>
-              <div className="bg-black/20 divide-y divide-zinc-900">
+              <div className="bg-black/30 divide-y divide-zinc-900">
                 {activeMetricSymbols.map((symbol) => {
                   const msg: MetricsMessage | undefined = marketData[symbol];
                   if (!msg) {

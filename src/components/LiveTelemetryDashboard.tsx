@@ -85,15 +85,27 @@ export const Dashboard: React.FC = () => {
   useEffect(() => {
     const fetchPairs = async () => {
       try {
-        const res = await fetchWithAuth(`${proxyUrl}/api/exchange-info`);
+        const res = await fetchWithAuth(`${proxyUrl}/api/exchange-info`, { cache: 'no-store' });
+        if (!res.ok) {
+          throw new Error(`exchange_info_http_${res.status}`);
+        }
         const data = await res.json();
-        const pairs = Array.isArray(data?.symbols) ? data.symbols : [];
+        const pairs = Array.isArray(data?.symbols)
+          ? data.symbols.filter((p: unknown): p is string => typeof p === 'string' && p.length > 0)
+          : [];
+        if (pairs.length === 0) {
+          throw new Error('exchange_info_empty');
+        }
         setAvailablePairs(pairs);
         if (pairs.length > 0 && selectedPairs.length === 0) {
           setSelectedPairs([pairs[0]]);
         }
       } catch {
-        setAvailablePairs([]);
+        const fallbackPairs = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+        setAvailablePairs(fallbackPairs);
+        if (selectedPairs.length === 0) {
+          setSelectedPairs([fallbackPairs[0]]);
+        }
       } finally {
         setIsLoadingPairs(false);
       }
@@ -105,7 +117,7 @@ export const Dashboard: React.FC = () => {
   useEffect(() => {
     const pollStatus = async () => {
       try {
-        const res = await fetchWithAuth(`${proxyUrl}/api/execution/status`);
+        const res = await fetchWithAuth(`${proxyUrl}/api/execution/status`, { cache: 'no-store' });
         const data = (await res.json()) as ExecutionStatus;
         setExecutionStatus(data);
 
@@ -500,10 +512,10 @@ export const Dashboard: React.FC = () => {
           </div>
         </div>
 
-        <div className="border border-zinc-800 rounded-xl overflow-hidden bg-zinc-900/80 shadow-2xl">
+        <div className="border border-zinc-800 rounded-xl overflow-hidden bg-gradient-to-br from-zinc-900 to-zinc-950 shadow-2xl">
           <div className="overflow-x-auto">
             <div className="min-w-[1100px]">
-              <div className="grid gap-0 px-5 py-4 text-[11px] font-bold text-zinc-500 uppercase tracking-widest bg-zinc-900 border-b border-zinc-800" style={{ gridTemplateColumns: 'minmax(140px, 1fr) 110px 130px 90px 90px 90px 90px 90px 120px' }}>
+              <div className="grid gap-0 px-5 py-4 text-[11px] font-bold text-zinc-400 uppercase tracking-widest bg-zinc-900 border-b border-zinc-800" style={{ gridTemplateColumns: 'minmax(140px, 1fr) 110px 130px 90px 90px 90px 90px 90px 120px' }}>
                 <div>Symbol</div>
                 <div className="text-right">Price</div>
                 <div className="text-right">OI / Change</div>
@@ -514,7 +526,7 @@ export const Dashboard: React.FC = () => {
                 <div className="text-center">CVD Slope</div>
                 <div className="text-center">Signal</div>
               </div>
-              <div className="bg-black/20 divide-y divide-zinc-900">
+              <div className="bg-black/30 divide-y divide-zinc-900">
                 {activeSymbols.length === 0 ? (
                   <div className="px-5 py-6 text-xs text-zinc-600 italic">
                     Select at least one symbol to start streaming telemetry.

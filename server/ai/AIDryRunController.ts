@@ -24,8 +24,10 @@ const clamp = (value: number, min: number, max: number) => Math.max(min, Math.mi
 const DEFAULT_MIN_HOLD_MS = Math.max(5_000, Number(process.env.AI_MIN_HOLD_MS || 180_000));
 const DEFAULT_FLIP_COOLDOWN_MS = Math.max(2_000, Number(process.env.AI_FLIP_COOLDOWN_MS || 240_000));
 const DEFAULT_MIN_ADD_GAP_MS = Math.max(1_000, Number(process.env.AI_MIN_ADD_GAP_MS || 60_000));
-const DEFAULT_MAX_DECISION_INTERVAL_MS = 2_500;
-const DEFAULT_MIN_DECISION_INTERVAL_MS = 500;
+const DEFAULT_MAX_DECISION_INTERVAL_MS = 1_000;
+const DEFAULT_MIN_DECISION_INTERVAL_MS = 100;
+const DEFAULT_DECISION_INTERVAL_MS = 250;
+const AI_UNRESTRICTED_MODE = true;
 const DEFAULT_ADD_MARGIN_USAGE_CAP = clamp(Number(process.env.AI_ADD_MARGIN_USAGE_CAP || 0.65), 0.3, 0.98);
 const DEFAULT_ADD_MIN_UPNL_PCT = clamp(Number(process.env.AI_ADD_MIN_UPNL_PCT || 0.003), 0, 0.05);
 const DEFAULT_PULLBACK_ADD_MAX_ADVERSE_PCT = clamp(Number(process.env.AI_PULLBACK_ADD_MAX_ADVERSE_PCT || 0.0075), 0, 0.05);
@@ -59,6 +61,7 @@ const DEFAULT_FALLBACK_MODELS = String(process.env.AI_FALLBACK_MODELS || 'gemini
   .split(',')
   .map((m) => m.trim())
   .filter(Boolean);
+const MAX_EXTRA_PROMPT_CHARS = Math.max(0, Math.trunc(Number(process.env.AI_EXTRA_PROMPT_MAX_CHARS || 2000)));
 const PLAN_VERSION = 1 as const;
 
 const normalizeSide = (raw?: string | null): StrategySide | null => {
@@ -197,23 +200,33 @@ export class AIDryRunController {
     temperature?: number;
     maxOutputTokens?: number;
     localOnly?: boolean;
+    extraUserPrompt?: string;
     bootstrapTrendBySymbol?: Record<string, { bias: 'LONG' | 'SHORT' | null; strength?: number; asOfMs?: number }>;
   }): void {
     const symbols = input.symbols.map((s) => s.toUpperCase()).filter(Boolean);
     const apiKey = String(input.apiKey || '').trim();
     const model = String(input.model || '').trim();
     const localOnly = Boolean(input.localOnly) || !apiKey || !model;
+    const rawExtraUserPrompt = String(input.extraUserPrompt || '').trim();
+    const extraUserPrompt = rawExtraUserPrompt
+      ? rawExtraUserPrompt.slice(0, MAX_EXTRA_PROMPT_CHARS)
+      : undefined;
     this.symbols = new Set(symbols);
     this.config = {
       apiKey,
       model,
-      decisionIntervalMs: clamp(Number(input.decisionIntervalMs ?? 2000), DEFAULT_MIN_DECISION_INTERVAL_MS, DEFAULT_MAX_DECISION_INTERVAL_MS),
+      decisionIntervalMs: clamp(
+        Number(input.decisionIntervalMs ?? DEFAULT_DECISION_INTERVAL_MS),
+        DEFAULT_MIN_DECISION_INTERVAL_MS,
+        DEFAULT_MAX_DECISION_INTERVAL_MS
+      ),
       temperature: Number.isFinite(input.temperature as number) ? Number(input.temperature) : 0,
       maxOutputTokens: Math.max(128, Number(input.maxOutputTokens ?? 512)),
       localOnly,
       minHoldMs: DEFAULT_MIN_HOLD_MS,
       flipCooldownMs: DEFAULT_FLIP_COOLDOWN_MS,
       minAddGapMs: DEFAULT_MIN_ADD_GAP_MS,
+      extraUserPrompt,
     };
     this.active = true;
     this.lastError = null;
@@ -247,7 +260,12 @@ export class AIDryRunController {
         asOfMs: Math.max(0, Number(seed.asOfMs || Date.now())),
       });
     }
-    this.log?.('AI_DRY_RUN_START', { symbols, model: this.config.model || null, localOnly });
+    this.log?.('AI_DRY_RUN_START', {
+      symbols,
+      model: this.config.model || null,
+      localOnly,
+      extraUserPromptSet: Boolean(this.config.extraUserPrompt),
+    });
   }
 
   stop(): void {
@@ -280,6 +298,7 @@ export class AIDryRunController {
       maxOutputTokens: this.config?.maxOutputTokens ?? 0,
       apiKeySet: Boolean(this.config?.apiKey),
       localOnly: Boolean(this.config?.localOnly),
+      extraUserPromptSet: Boolean(this.config?.extraUserPrompt),
       lastError: this.lastError,
       symbols: [...this.symbols],
       telemetry: { ...this.telemetry },
@@ -327,8 +346,12 @@ export class AIDryRunController {
 
     const runtime = this.getRuntimeState(snapshot.symbol, nowMs);
     const runtimeContext = this.buildRuntimeContext(snapshot, runtime, nowMs);
-    const preGuard = this.guardrails.evaluate(snapshot, runtimeContext, null);
-    const blockedReasons = [...new Set([...(snapshot.blockedReasons || []), ...preGuard.blockedReasons])];
+    const preGuard = AI_UNRESTRICTED_MODE
+      ? this.emptyGuardrailResult()
+      : this.guardrails.evaluate(snapshot, runtimeContext, null);
+    const blockedReasons = AI_UNRESTRICTED_MODE
+      ? [...new Set([...(snapshot.blockedReasons || [])])]
+      : [...new Set([...(snapshot.blockedReasons || []), ...preGuard.blockedReasons])];
     const microAlpha = this.computeMicroAlphaContext(snapshot);
     const trend = this.updateTrendState(runtime, snapshot, microAlpha, nowMs);
     const enrichedSnapshot = this.enrichSnapshot(snapshot, runtime, blockedReasons, runtimeContext, trend);
@@ -358,8 +381,10 @@ export class AIDryRunController {
     this.pending.add(snapshot.symbol);
     try {
       let proposedPlan: AIDecisionPlan;
-      if (this.config.localOnly || !this.config.apiKey || !this.config.model) {
-        proposedPlan = this.buildSafeHoldPlan(promptNonce, 'LOCAL_ONLY');
+      const canCallModel = !this.config.localOnly && Boolean(this.config.apiKey) && Boolean(this.config.model);
+      if (!canCallModel) {
+        proposedPlan = this.buildAutonomousMetricsPlan(enrichedSnapshot, promptNonce, microAlpha);
+        this.lastError = null;
       } else {
         const prompt = this.buildPrompt(enrichedSnapshot, promptNonce, microAlpha);
         const resolved = await this.resolvePlanWithFallback(prompt, promptNonce, snapshot.symbol);
@@ -367,7 +392,7 @@ export class AIDryRunController {
         if (!plan) {
           this.telemetry.invalidLLMResponses += 1;
           this.lastError = resolved.error || 'ai_invalid_or_unparseable_response';
-          proposedPlan = this.buildSafeHoldPlan(promptNonce, 'INVALID_AI_RESPONSE');
+          proposedPlan = this.buildAutonomousMetricsPlan(enrichedSnapshot, promptNonce, microAlpha);
         } else {
           proposedPlan = plan;
           this.lastError = null;
@@ -375,8 +400,12 @@ export class AIDryRunController {
       }
 
       const orchestratedPlan = this.orchestratePlan(enrichedSnapshot, proposedPlan, microAlpha, trend, runtime);
-      const postGuard = this.guardrails.evaluate(enrichedSnapshot, runtimeContext, orchestratedPlan);
-      const resolvedPlan = this.applyGuardrails(enrichedSnapshot, orchestratedPlan, postGuard);
+      const postGuard = AI_UNRESTRICTED_MODE
+        ? this.emptyGuardrailResult()
+        : this.guardrails.evaluate(enrichedSnapshot, runtimeContext, orchestratedPlan);
+      const resolvedPlan = AI_UNRESTRICTED_MODE
+        ? orchestratedPlan
+        : this.applyGuardrails(enrichedSnapshot, orchestratedPlan, postGuard);
       const decision = this.buildDecision(enrichedSnapshot, resolvedPlan, {
         promptNonce,
         blockedReasons: postGuard.blockedReasons,
@@ -428,14 +457,11 @@ export class AIDryRunController {
       this.lastError = error?.message || 'ai_decision_failed';
       this.telemetry.invalidLLMResponses += 1;
       this.log?.('AI_DRY_RUN_ERROR', { symbol: snapshot.symbol, error: this.lastError });
-      const forced = this.guardrails.evaluate(enrichedSnapshot, runtimeContext, null).forcedAction;
-      const safePlan = forced
-        ? this.planFromForcedAction(promptNonce, forced)
-        : this.buildSafeHoldPlan(promptNonce, 'INVALID_AI_RESPONSE');
-      const safeDecision = this.buildDecision(enrichedSnapshot, safePlan, {
+      const fallbackPlan = this.buildAutonomousMetricsPlan(enrichedSnapshot, promptNonce, microAlpha);
+      const safeDecision = this.buildDecision(enrichedSnapshot, fallbackPlan, {
         promptNonce,
-        blockedReasons: forced ? ['RISK_LOCK'] : ['COOLDOWN_ACTIVE'],
-        forcedAction: forced,
+        blockedReasons: [],
+        forcedAction: null,
         microAlpha,
         snapshotHash,
       });
@@ -545,6 +571,13 @@ export class AIDryRunController {
       executionState: snapshot.executionState,
       market: snapshot.market,
       trades: snapshot.trades,
+      liquidityMetrics: snapshot.liquidityMetrics,
+      passiveFlowMetrics: snapshot.passiveFlowMetrics,
+      derivativesMetrics: snapshot.derivativesMetrics,
+      toxicityMetrics: snapshot.toxicityMetrics,
+      regimeMetrics: snapshot.regimeMetrics,
+      crossMarketMetrics: snapshot.crossMarketMetrics,
+      enableCrossMarketConfirmation: snapshot.enableCrossMarketConfirmation,
       openInterest: snapshot.openInterest,
       absorption: snapshot.absorption,
       volatility: snapshot.volatility,
@@ -552,43 +585,39 @@ export class AIDryRunController {
       microAlpha,
     };
 
-    return [
-      'You are the autonomous decision authority for a futures paper-trading system.',
+    const lines = [
+      'You are an autonomous futures paper-trading decision engine.',
       'Return exactly one JSON object and no markdown.',
+      'Act immediately from the current snapshot and live orderflow metrics.',
+      'If flat, prefer ENTER right now instead of waiting.',
+      'If in position, continuously decide MANAGE (add/reduce) or EXIT using metrics only.',
+      'Use LIMIT order style only.',
       '',
-      'Hard rules:',
+      'Hard output rules:',
       '- Echo the nonce exactly.',
       '- version must be 1.',
       '- intent must be one of HOLD, ENTER, MANAGE, EXIT.',
       '- ENTER requires side LONG or SHORT.',
-      '- side must be null when intent is HOLD unless explicitly needed for context.',
-      '- sizeMultiplier must stay in [0.1, 2.0].',
-      '- maxAdds must stay in [0, 5].',
-      '- reducePct is null or in [0.1, 1.0].',
+      '- side must be null only for HOLD.',
       '- explanationTags max length is 5.',
-      '- Keep numbers short (max 4 decimal places).',
-      '- HOLD is preferred when edge is weak, costs are high, or direction is not clear.',
-      '- Avoid overtrading and avoid frequent flips.',
-      '- If flat, open ENTER only when expected edge clearly exceeds costs.',
-      '- Directional evidence means at least 2 of these align with a side: sign(delta1s+delta5s), sign(cvdSlope), sign(obiDeep), absorption side.',
-      '- If executionState.trendBias is LONG/SHORT and executionState.trendIntact=true, do not open opposite direction entries.',
-      '- If a position is open, request full EXIT only when executionState.trendBias is opposite to position side and trendIntact=true.',
-      '- If executionState.bootstrapPhaseMsRemaining > 0 and trendBias exists, prefer that side for first entry if edge is sufficient.',
-      '- If executionState.bootstrapWarmupMsRemaining > 0 and position is flat, keep HOLD until warmup is complete.',
-      '- During intact trend, avoid REDUCE/EXIT. Prefer HOLD or MANAGE add-on in pullbacks.',
-      '- Use microAlpha.expectedEdgeBps and microAlpha.tradableFlow as primary gating for ENTER decisions.',
-      '- If microAlpha.expectedEdgeBps < 0, prefer HOLD unless forced risk management is needed.',
-      '',
-      'You should manage full lifecycle: entry, add, reduce, exit.',
-      'Prefer add-on when winner conditions hold, or when trend is intact and price is in pullback/reclaim zone.',
-      'Over-trading is penalized: do not churn entries without clear edge.',
+      '- Keep numeric values short (max 4 decimals).',
       '',
       'JSON schema fields:',
-      '{"version":1,"nonce":"...","intent":"HOLD|ENTER|MANAGE|EXIT","side":"LONG|SHORT|null","urgency":"LOW|MED|HIGH","entryStyle":"LIMIT|MARKET_SMALL|HYBRID","sizeMultiplier":0.1,"maxAdds":0,"addRule":"WINNER_ONLY|TREND_INTACT|NEVER","addTrigger":{"minUnrealizedPnlPct":0.003,"trendIntact":true,"obiSupportMin":0.1,"deltaConfirm":true},"reducePct":null,"invalidationHint":"VWAP|ATR|OBI_FLIP|ABSORPTION_BREAK|NONE","explanationTags":["TREND_INTACT"],"confidence":0.0}',
+      '{"version":1,"nonce":"...","intent":"HOLD|ENTER|MANAGE|EXIT","side":"LONG|SHORT|null","urgency":"LOW|MED|HIGH","entryStyle":"LIMIT","sizeMultiplier":0.1,"maxAdds":0,"addRule":"WINNER_ONLY|TREND_INTACT|NEVER","addTrigger":{"minUnrealizedPnlPct":0.003,"trendIntact":true,"obiSupportMin":0.1,"deltaConfirm":true},"reducePct":null,"invalidationHint":"VWAP|ATR|OBI_FLIP|ABSORPTION_BREAK|NONE","explanationTags":["TREND_INTACT"],"confidence":0.0}',
       '',
       'Snapshot:',
       JSON.stringify(payload),
-    ].join('\n');
+    ];
+
+    if (this.config?.extraUserPrompt) {
+      lines.push(
+        '',
+        'User additional instruction (high priority):',
+        this.config.extraUserPrompt
+      );
+    }
+
+    return lines.join('\n');
   }
 
   private buildResponseSchema(): Record<string, unknown> {
@@ -602,7 +631,7 @@ export class AIDryRunController {
         intent: { type: 'STRING', enum: ['HOLD', 'ENTER', 'MANAGE', 'EXIT'] },
         side: { type: 'STRING', enum: ['LONG', 'SHORT'] },
         urgency: { type: 'STRING', enum: ['LOW', 'MED', 'HIGH'] },
-        entryStyle: { type: 'STRING', enum: ['LIMIT', 'MARKET_SMALL', 'HYBRID'] },
+        entryStyle: { type: 'STRING', enum: ['LIMIT'] },
         sizeMultiplier: { type: 'NUMBER' },
         maxAdds: { type: 'NUMBER' },
         addRule: { type: 'STRING', enum: ['WINNER_ONLY', 'TREND_INTACT', 'NEVER'] },
@@ -671,24 +700,36 @@ export class AIDryRunController {
     const entryStyle = this.parseEntryStyle(parsed.entryStyle);
     const addRule = this.parseAddRule(parsed.addRule);
     const invalidationHint = this.parseInvalidationHint(parsed.invalidationHint);
-    const confidence = clampPlanNumber(Number(parsed.confidence ?? 0.35), 0, 1);
-    const sizeMultiplier = clampPlanNumber(Number(parsed.sizeMultiplier ?? 1), 0.1, 2);
-    const maxAdds = clamp(Math.trunc(Number(parsed.maxAdds ?? 0)), 0, 5);
+    const confidence = AI_UNRESTRICTED_MODE
+      ? this.toFiniteNumber(parsed.confidence, 0.35)
+      : clampPlanNumber(Number(parsed.confidence ?? 0.35), 0, 1);
+    const sizeMultiplier = AI_UNRESTRICTED_MODE
+      ? this.toPositiveNumber(parsed.sizeMultiplier, 1)
+      : clampPlanNumber(Number(parsed.sizeMultiplier ?? 1), 0.1, 2);
+    const maxAdds = AI_UNRESTRICTED_MODE
+      ? this.toIntegerNumber(parsed.maxAdds, 0)
+      : clamp(Math.trunc(Number(parsed.maxAdds ?? 0)), 0, 5);
 
     const addTriggerInput = parsed.addTrigger && typeof parsed.addTrigger === 'object'
       ? parsed.addTrigger as Record<string, unknown>
       : {};
     const addTrigger = {
-      minUnrealizedPnlPct: clampPlanNumber(Number(addTriggerInput.minUnrealizedPnlPct ?? DEFAULT_ADD_MIN_UPNL_PCT), -0.05, 0.05),
+      minUnrealizedPnlPct: AI_UNRESTRICTED_MODE
+        ? this.toFiniteNumber(addTriggerInput.minUnrealizedPnlPct, DEFAULT_ADD_MIN_UPNL_PCT)
+        : clampPlanNumber(Number(addTriggerInput.minUnrealizedPnlPct ?? DEFAULT_ADD_MIN_UPNL_PCT), -0.05, 0.05),
       trendIntact: Boolean(addTriggerInput.trendIntact),
-      obiSupportMin: clampPlanNumber(Number(addTriggerInput.obiSupportMin ?? 0.1), -1, 1),
+      obiSupportMin: AI_UNRESTRICTED_MODE
+        ? this.toFiniteNumber(addTriggerInput.obiSupportMin, 0.1)
+        : clampPlanNumber(Number(addTriggerInput.obiSupportMin ?? 0.1), -1, 1),
       deltaConfirm: Boolean(addTriggerInput.deltaConfirm),
     };
 
     const reduceRaw = parsed.reducePct;
     const reducePct = reduceRaw == null
       ? null
-      : clampPlanNumber(Number(reduceRaw), 0.1, 1);
+      : AI_UNRESTRICTED_MODE
+        ? this.toPositiveNumber(reduceRaw, 1)
+        : clampPlanNumber(Number(reduceRaw), 0.1, 1);
 
     const explanationTags = Array.isArray(parsed.explanationTags)
       ? parsed.explanationTags.map(toTag).filter((v): v is AIExplanationTag => Boolean(v)).slice(0, 5)
@@ -822,7 +863,7 @@ export class AIDryRunController {
       intent,
       side,
       urgency: 'MED',
-      entryStyle: 'HYBRID',
+      entryStyle: 'LIMIT',
       sizeMultiplier: 0.5,
       maxAdds: 1,
       addRule: 'WINNER_ONLY',
@@ -1086,6 +1127,10 @@ export class AIDryRunController {
     trend: TrendStateView,
     runtime: RuntimeState
   ): AIDecisionPlan {
+    if (AI_UNRESTRICTED_MODE) {
+      return this.orchestrateUnrestrictedPlan(snapshot, plan, microAlpha);
+    }
+
     const flat = !snapshot.position;
     const holdStreak = Number(snapshot.executionState.holdStreak || 0);
     const blocked = Array.isArray(snapshot.blockedReasons) && snapshot.blockedReasons.length > 0;
@@ -1382,6 +1427,246 @@ export class AIDryRunController {
     return plan;
   }
 
+  private resolveMetricsSide(snapshot: AIMetricsSnapshot, microAlpha: MicroAlphaContext): 'LONG' | 'SHORT' {
+    if (microAlpha.sideBias) {
+      return microAlpha.sideBias;
+    }
+    const directional =
+      Number(snapshot.market.delta1s || 0)
+      + Number(snapshot.market.delta5s || 0)
+      + Number(snapshot.market.cvdSlope || 0)
+      + Number(snapshot.market.obiDeep || 0);
+    return directional >= 0 ? 'LONG' : 'SHORT';
+  }
+
+  private buildAutonomousMetricsPlan(
+    snapshot: AIMetricsSnapshot,
+    nonce: string,
+    microAlpha: MicroAlphaContext
+  ): AIDecisionPlan {
+    const signalSide = this.resolveMetricsSide(snapshot, microAlpha);
+    const signalStrength = clamp(Number(microAlpha.signalStrength || 0), 0, 1);
+    const upnl = Number(snapshot.position?.unrealizedPnlPct || 0);
+    const position = snapshot.position;
+
+    if (!position) {
+      return {
+        version: PLAN_VERSION,
+        nonce,
+        intent: 'ENTER',
+        side: signalSide,
+        urgency: signalStrength >= 0.65 ? 'HIGH' : signalStrength >= 0.35 ? 'MED' : 'LOW',
+        entryStyle: 'LIMIT',
+        sizeMultiplier: clampPlanNumber(0.8 + (signalStrength * 0.7), 0.2, 2),
+        maxAdds: 5,
+        addRule: 'TREND_INTACT',
+        addTrigger: {
+          minUnrealizedPnlPct: -0.02,
+          trendIntact: true,
+          obiSupportMin: 0,
+          deltaConfirm: false,
+        },
+        reducePct: null,
+        invalidationHint: 'NONE',
+        explanationTags: [signalSide === 'LONG' ? 'OBI_UP' : 'OBI_DOWN', 'DELTA_BURST'],
+        confidence: clampPlanNumber(0.4 + (signalStrength * 0.5), 0.2, 0.99),
+      };
+    }
+
+    const sameSide = position.side === signalSide;
+    if (sameSide) {
+      const shouldTakeProfit = upnl >= 0.004 && signalStrength < 0.2;
+      if (shouldTakeProfit) {
+        return {
+          version: PLAN_VERSION,
+          nonce,
+          intent: 'MANAGE',
+          side: position.side,
+          urgency: 'MED',
+          entryStyle: 'LIMIT',
+          sizeMultiplier: 0.2,
+          maxAdds: 0,
+          addRule: 'NEVER',
+          addTrigger: {
+            minUnrealizedPnlPct: 0,
+            trendIntact: false,
+            obiSupportMin: 0,
+            deltaConfirm: false,
+          },
+          reducePct: 0.35,
+          invalidationHint: 'NONE',
+          explanationTags: ['TREND_BROKEN'],
+          confidence: 0.8,
+        };
+      }
+
+      const shouldAdd = signalStrength >= 0.25;
+      if (shouldAdd) {
+        return {
+          version: PLAN_VERSION,
+          nonce,
+          intent: 'MANAGE',
+          side: position.side,
+          urgency: signalStrength >= 0.65 ? 'HIGH' : 'MED',
+          entryStyle: 'LIMIT',
+          sizeMultiplier: clampPlanNumber(0.45 + (signalStrength * 0.6), 0.2, 1.6),
+          maxAdds: 5,
+          addRule: 'TREND_INTACT',
+          addTrigger: {
+            minUnrealizedPnlPct: -0.02,
+            trendIntact: true,
+            obiSupportMin: 0,
+            deltaConfirm: false,
+          },
+          reducePct: null,
+          invalidationHint: 'NONE',
+          explanationTags: ['TREND_INTACT'],
+          confidence: clampPlanNumber(0.45 + (signalStrength * 0.45), 0.2, 0.95),
+        };
+      }
+
+      return {
+        version: PLAN_VERSION,
+        nonce,
+        intent: 'HOLD',
+        side: null,
+        urgency: 'LOW',
+        entryStyle: 'LIMIT',
+        sizeMultiplier: 0.1,
+        maxAdds: 0,
+        addRule: 'NEVER',
+        addTrigger: {
+          minUnrealizedPnlPct: 0,
+          trendIntact: false,
+          obiSupportMin: 0,
+          deltaConfirm: false,
+        },
+        reducePct: null,
+        invalidationHint: 'NONE',
+        explanationTags: ['TREND_INTACT'],
+        confidence: 0.35,
+      };
+    }
+
+    if (upnl > 0 || signalStrength >= 0.35) {
+      return {
+        version: PLAN_VERSION,
+        nonce,
+        intent: 'EXIT',
+        side: null,
+        urgency: signalStrength >= 0.65 ? 'HIGH' : 'MED',
+        entryStyle: 'LIMIT',
+        sizeMultiplier: 0.1,
+        maxAdds: 0,
+        addRule: 'NEVER',
+        addTrigger: {
+          minUnrealizedPnlPct: 0,
+          trendIntact: false,
+          obiSupportMin: 0,
+          deltaConfirm: false,
+        },
+        reducePct: null,
+        invalidationHint: 'NONE',
+        explanationTags: ['TREND_BROKEN'],
+        confidence: 0.9,
+      };
+    }
+
+    return {
+      version: PLAN_VERSION,
+      nonce,
+      intent: 'MANAGE',
+      side: position.side,
+      urgency: 'MED',
+      entryStyle: 'LIMIT',
+      sizeMultiplier: 0.2,
+      maxAdds: 0,
+      addRule: 'NEVER',
+      addTrigger: {
+        minUnrealizedPnlPct: 0,
+        trendIntact: false,
+        obiSupportMin: 0,
+        deltaConfirm: false,
+      },
+      reducePct: 0.5,
+      invalidationHint: 'NONE',
+      explanationTags: ['TREND_BROKEN'],
+      confidence: 0.7,
+    };
+  }
+
+  private orchestrateUnrestrictedPlan(
+    snapshot: AIMetricsSnapshot,
+    plan: AIDecisionPlan,
+    microAlpha: MicroAlphaContext
+  ): AIDecisionPlan {
+    const fallback = this.buildAutonomousMetricsPlan(snapshot, plan.nonce, microAlpha);
+    const normalized: AIDecisionPlan = {
+      ...plan,
+      entryStyle: 'LIMIT',
+      urgency: plan.urgency || 'MED',
+      sizeMultiplier: this.toPositiveNumber(plan.sizeMultiplier, 1),
+      maxAdds: this.toIntegerNumber(plan.maxAdds, 0),
+      addRule: plan.addRule || 'TREND_INTACT',
+      addTrigger: {
+        minUnrealizedPnlPct: this.toFiniteNumber(plan.addTrigger?.minUnrealizedPnlPct, -0.02),
+        trendIntact: Boolean(plan.addTrigger?.trendIntact ?? true),
+        obiSupportMin: this.toFiniteNumber(plan.addTrigger?.obiSupportMin, 0),
+        deltaConfirm: Boolean(plan.addTrigger?.deltaConfirm ?? false),
+      },
+      reducePct: plan.reducePct == null ? null : this.toPositiveNumber(plan.reducePct, 1),
+      explanationTags: Array.isArray(plan.explanationTags) ? plan.explanationTags.slice(0, 5) : [],
+      confidence: this.toFiniteNumber(plan.confidence, 0.5),
+    };
+
+    if (!snapshot.position) {
+      if (normalized.intent !== 'ENTER') {
+        return fallback;
+      }
+      if (!normalized.side) {
+        normalized.side = this.resolveMetricsSide(snapshot, microAlpha);
+      }
+      if (!normalized.side) {
+        return fallback;
+      }
+      normalized.entryStyle = 'LIMIT';
+      return normalized;
+    }
+
+    if (normalized.intent === 'HOLD') {
+      return fallback;
+    }
+
+    if (normalized.intent === 'ENTER' && normalized.side) {
+      if (snapshot.position.side === normalized.side) {
+        return {
+          ...normalized,
+          intent: 'MANAGE',
+          side: snapshot.position.side,
+          reducePct: null,
+          addRule: 'TREND_INTACT',
+          maxAdds: Math.max(1, normalized.maxAdds),
+          entryStyle: 'LIMIT',
+        };
+      }
+      return {
+        ...normalized,
+        intent: 'EXIT',
+        side: null,
+        reducePct: null,
+        addRule: 'NEVER',
+        maxAdds: 0,
+        entryStyle: 'LIMIT',
+      };
+    }
+
+    if (normalized.intent === 'ENTER' && !normalized.side) {
+      return fallback;
+    }
+
+    return normalized;
+  }
+
   private buildProbeEnterPlan(nonce: string, microAlpha: MicroAlphaContext, forcedSide?: StrategySide | null): AIDecisionPlan {
     const side: 'LONG' | 'SHORT' = forcedSide === 'SHORT' || microAlpha.sideBias === 'SHORT' ? 'SHORT' : 'LONG';
     const sizeMultiplier = clampPlanNumber(DEFAULT_PROBE_SIZE_MULT + (microAlpha.signalStrength * 0.35), 0.1, 1.2);
@@ -1454,9 +1739,7 @@ export class AIDryRunController {
   }
 
   private deriveEntryStyle(expectedEdgeBps: number, spreadBps: number): AIEntryStyle {
-    if (spreadBps >= 7) return 'LIMIT';
-    if (expectedEdgeBps >= 5.5) return 'MARKET_SMALL';
-    return 'HYBRID';
+    return 'LIMIT';
   }
 
   private pushTag(tags: AIExplanationTag[] | undefined, tag: AIExplanationTag): AIExplanationTag[] {
@@ -1466,11 +1749,42 @@ export class AIDryRunController {
     return next.slice(0, 5);
   }
 
+  private toFiniteNumber(value: unknown, fallback: number): number {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  private toPositiveNumber(value: unknown, fallback: number): number {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return fallback;
+    return n;
+  }
+
+  private toIntegerNumber(value: unknown, fallback: number): number {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.trunc(n);
+  }
+
+  private emptyGuardrailResult(): ReturnType<SafetyGuardrails['evaluate']> {
+    return {
+      blockedReasons: [],
+      blockEntry: false,
+      blockAdd: false,
+      blockFlip: false,
+      forcedAction: null,
+    };
+  }
+
   private applyGuardrails(
     snapshot: AIMetricsSnapshot,
     plan: AIDecisionPlan,
     guardrails: ReturnType<SafetyGuardrails['evaluate']>
   ): AIDecisionPlan {
+    if (AI_UNRESTRICTED_MODE) {
+      return { ...plan, entryStyle: 'LIMIT' };
+    }
+
     if (guardrails.forcedAction) {
       if (guardrails.forcedAction.intent === 'EXIT') {
         this.telemetry.forcedExits += 1;
@@ -1533,7 +1847,9 @@ export class AIDryRunController {
         side,
         reason: 'ENTRY_TR',
         expectedPrice: snapshot.market.price,
-        sizeMultiplier: clampPlanNumber(Number(plan.sizeMultiplier ?? 1), 0.1, 2),
+        sizeMultiplier: AI_UNRESTRICTED_MODE
+          ? this.toPositiveNumber(plan.sizeMultiplier, 1)
+          : clampPlanNumber(Number(plan.sizeMultiplier ?? 1), 0.1, 2),
         metadata: { ai: true, plan, context },
       });
     } else if (plan.intent === 'MANAGE') {
@@ -1541,7 +1857,9 @@ export class AIDryRunController {
         actions.push({
           type: StrategyActionType.REDUCE,
           reason: 'REDUCE_SOFT',
-          reducePct: clampPlanNumber(plan.reducePct, 0.1, 1),
+          reducePct: AI_UNRESTRICTED_MODE
+            ? this.toPositiveNumber(plan.reducePct, 1)
+            : clampPlanNumber(plan.reducePct, 0.1, 1),
           metadata: { ai: true, plan, context },
         });
       } else if (this.shouldAllowAdd(snapshot, plan)) {
@@ -1550,13 +1868,10 @@ export class AIDryRunController {
           side: snapshot.position?.side,
           reason: 'AI_ADD',
           expectedPrice: snapshot.market.price,
-          sizeMultiplier: clampPlanNumber(Number(plan.sizeMultiplier ?? 0.5), 0.1, 2),
-          metadata: {
-            ai: true,
-            plan,
-            context,
-            incrementalRiskCapPct: 0.25,
-          },
+          sizeMultiplier: AI_UNRESTRICTED_MODE
+            ? this.toPositiveNumber(plan.sizeMultiplier, 0.5)
+            : clampPlanNumber(Number(plan.sizeMultiplier ?? 0.5), 0.1, 2),
+          metadata: { ai: true, plan, context },
         });
       } else {
         actions.push({
@@ -1570,7 +1885,9 @@ export class AIDryRunController {
         actions.push({
           type: StrategyActionType.REDUCE,
           reason: 'REDUCE_SOFT',
-          reducePct: clampPlanNumber(plan.reducePct, 0.1, 1),
+          reducePct: AI_UNRESTRICTED_MODE
+            ? this.toPositiveNumber(plan.reducePct, 1)
+            : clampPlanNumber(plan.reducePct, 0.1, 1),
           metadata: { ai: true, plan, context },
         });
       } else {
@@ -1648,6 +1965,9 @@ export class AIDryRunController {
     const position = snapshot.position;
     if (!position) return false;
     if (plan.addRule === 'NEVER') return false;
+    if (AI_UNRESTRICTED_MODE) {
+      return true;
+    }
     if (position.addsUsed >= plan.maxAdds) return false;
     if (!snapshot.decision.gatePassed) return false;
 
@@ -1815,9 +2135,7 @@ export class AIDryRunController {
   }
 
   private parseEntryStyle(raw: unknown): AIEntryStyle {
-    const value = String(raw || '').trim().toUpperCase();
-    if (value === 'LIMIT' || value === 'MARKET_SMALL' || value === 'HYBRID') return value;
-    return 'HYBRID';
+    return 'LIMIT';
   }
 
   private parseAddRule(raw: unknown): AIAddRule {
@@ -1875,6 +2193,9 @@ export class AIDryRunController {
   private computeAdaptiveDecisionInterval(snapshot: AIMetricsSnapshot): number {
     if (!this.config) return 1000;
     const base = clamp(this.config.decisionIntervalMs, DEFAULT_MIN_DECISION_INTERVAL_MS, DEFAULT_MAX_DECISION_INTERVAL_MS);
+    if (AI_UNRESTRICTED_MODE) {
+      return base;
+    }
     const prints = snapshot.trades.printsPerSecond;
     const burst = snapshot.trades.burstCount;
     const tradeCount = snapshot.trades.tradeCount;

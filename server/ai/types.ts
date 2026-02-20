@@ -1,4 +1,12 @@
 import { StrategyRegime, StrategySide } from '../types/strategy';
+import type {
+  CrossMarketMetrics,
+  DerivativesMetrics,
+  LiquidityMetrics,
+  PassiveFlowMetrics,
+  RegimeMetrics,
+  ToxicityMetrics,
+} from '../metrics/AdvancedMicrostructureMetrics';
 
 export type AIDecisionIntent = 'HOLD' | 'ENTER' | 'MANAGE' | 'EXIT';
 export type AIDecisionSide = 'LONG' | 'SHORT';
@@ -50,6 +58,7 @@ export type AIDryRunConfig = {
   minHoldMs: number;
   flipCooldownMs: number;
   minAddGapMs: number;
+  extraUserPrompt?: string;
 };
 
 export type AIDecisionTelemetry = {
@@ -83,6 +92,7 @@ export type AIDryRunStatus = {
   maxOutputTokens: number;
   apiKeySet: boolean;
   localOnly: boolean;
+  extraUserPromptSet: boolean;
   lastError: string | null;
   symbols: string[];
   telemetry: AIDecisionTelemetry;
@@ -153,6 +163,13 @@ export type AIMetricsSnapshot = {
     burstCount: number;
     burstSide: 'buy' | 'sell' | null;
   };
+  liquidityMetrics: LiquidityMetrics;
+  passiveFlowMetrics: PassiveFlowMetrics;
+  derivativesMetrics: DerivativesMetrics;
+  toxicityMetrics: ToxicityMetrics;
+  regimeMetrics: RegimeMetrics;
+  crossMarketMetrics: CrossMarketMetrics | null;
+  enableCrossMarketConfirmation: boolean;
   openInterest: {
     oiChangePct: number | null;
   };
