@@ -200,17 +200,12 @@ export class AIDryRunController {
     temperature?: number;
     maxOutputTokens?: number;
     localOnly?: boolean;
-    extraUserPrompt?: string;
     bootstrapTrendBySymbol?: Record<string, { bias: 'LONG' | 'SHORT' | null; strength?: number; asOfMs?: number }>;
   }): void {
     const symbols = input.symbols.map((s) => s.toUpperCase()).filter(Boolean);
     const apiKey = String(input.apiKey || '').trim();
     const model = String(input.model || '').trim();
     const localOnly = Boolean(input.localOnly) || !apiKey || !model;
-    const rawExtraUserPrompt = String(input.extraUserPrompt || '').trim();
-    const extraUserPrompt = rawExtraUserPrompt
-      ? rawExtraUserPrompt.slice(0, MAX_EXTRA_PROMPT_CHARS)
-      : undefined;
     this.symbols = new Set(symbols);
     this.config = {
       apiKey,
@@ -226,7 +221,6 @@ export class AIDryRunController {
       minHoldMs: DEFAULT_MIN_HOLD_MS,
       flipCooldownMs: DEFAULT_FLIP_COOLDOWN_MS,
       minAddGapMs: DEFAULT_MIN_ADD_GAP_MS,
-      extraUserPrompt,
     };
     this.active = true;
     this.lastError = null;
@@ -264,7 +258,6 @@ export class AIDryRunController {
       symbols,
       model: this.config.model || null,
       localOnly,
-      extraUserPromptSet: Boolean(this.config.extraUserPrompt),
     });
   }
 
@@ -298,7 +291,6 @@ export class AIDryRunController {
       maxOutputTokens: this.config?.maxOutputTokens ?? 0,
       apiKeySet: Boolean(this.config?.apiKey),
       localOnly: Boolean(this.config?.localOnly),
-      extraUserPromptSet: Boolean(this.config?.extraUserPrompt),
       lastError: this.lastError,
       symbols: [...this.symbols],
       telemetry: { ...this.telemetry },
@@ -608,15 +600,6 @@ export class AIDryRunController {
       'Snapshot:',
       JSON.stringify(payload),
     ];
-
-    if (this.config?.extraUserPrompt) {
-      lines.push(
-        '',
-        'User additional instruction (high priority):',
-        this.config.extraUserPrompt
-      );
-    }
-
     return lines.join('\n');
   }
 

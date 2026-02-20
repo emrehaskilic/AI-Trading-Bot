@@ -58,7 +58,6 @@ export type AIDryRunConfig = {
   minHoldMs: number;
   flipCooldownMs: number;
   minAddGapMs: number;
-  extraUserPrompt?: string;
 };
 
 export type AIDecisionTelemetry = {
@@ -92,7 +91,6 @@ export type AIDryRunStatus = {
   maxOutputTokens: number;
   apiKeySet: boolean;
   localOnly: boolean;
-  extraUserPromptSet: boolean;
   lastError: string | null;
   symbols: string[];
   telemetry: AIDecisionTelemetry;

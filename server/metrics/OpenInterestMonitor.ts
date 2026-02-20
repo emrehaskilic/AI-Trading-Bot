@@ -29,7 +29,7 @@ export class OpenInterestMonitor {
   private lastFetchTime = 0;
   private lastBaselineUpdate = 0;
   private readonly FETCH_INTERVAL_MS = 10_000;    // Poll every 10 seconds for smoothness
-  private readonly WINDOW_MS = 60_000;            // 60 second delta window
+  private readonly WINDOW_MS = 300_000;            // 5 minute delta window (300s)
   private readonly listeners: Set<OpenInterestListener> = new Set();
 
   constructor(symbol: string) {
@@ -46,6 +46,7 @@ export class OpenInterestMonitor {
     if (now - this.lastFetchTime < this.FETCH_INTERVAL_MS && this.currentOI > 0) {
       return;
     }
+    this.lastFetchTime = now; // Prevent concurrent fetches and spam
 
     try {
       const response = await fetch(
@@ -133,7 +134,7 @@ export class OpenInterestMonitor {
 
     return {
       openInterest: this.currentOI,
-      oiChangeAbs: oiDeltaWindow, // User wants this to be the 60s change
+      oiChangeAbs: oiDeltaWindow, // User wants this to be the delta change
       oiChangePct: oiChangePct,
       oiDeltaWindow: oiDeltaWindow,
       lastUpdated: this.lastFetchTime || Date.now(),

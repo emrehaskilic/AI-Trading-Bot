@@ -112,7 +112,7 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
       : trendSide === 'LONG'
         ? 'bg-green-900/25 text-green-300 border-green-700/40'
         : trendSide === 'SHORT'
-        ? 'bg-red-900/25 text-red-300 border-red-700/40'
+          ? 'bg-red-900/25 text-red-300 border-red-700/40'
           : 'bg-zinc-800 text-zinc-300 border-zinc-700';
   const posNegClass = (n: number) => (n > 0 ? 'text-emerald-300' : n < 0 ? 'text-rose-300' : 'text-zinc-200');
   const asNumber = (v: unknown): number | null => (Number.isFinite(Number(v)) ? Number(v) : null);
@@ -130,6 +130,11 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
     const n = asNumber(v);
     if (n == null) return '-';
     return `${n > 0 ? '+' : ''}${n.toFixed(d)}%`;
+  };
+  const formatVol = (v: number) => {
+    if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+    if (v >= 1e3) return (v / 1e3).toFixed(1) + 'k';
+    return v.toFixed(2);
   };
   const markDev = asNumber(derivativesMetrics?.markLastDeviationPct);
   const indexDev = asNumber(derivativesMetrics?.indexLastDeviationPct);
@@ -168,10 +173,10 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
         <div className="flex flex-col items-end justify-center pr-2">
           {openInterest ? (
             <>
-              <span className="font-mono text-xs text-white font-bold">{(openInterest.openInterest / 1_000_000).toFixed(2)}M</span>
+              <span className="font-mono text-xs text-white font-bold">{formatVol(openInterest.openInterest)}</span>
               <div className="flex items-center gap-1 text-[9px] font-mono tracking-tighter">
                 <span className={openInterest.oiChangeAbs >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                  {openInterest.oiChangeAbs >= 0 ? '+' : ''}{(openInterest.oiChangeAbs / 1000).toFixed(1)}k
+                  {openInterest.oiChangeAbs >= 0 ? '+' : ''}{formatVol(openInterest.oiChangeAbs)}
                 </span>
                 <span className="text-zinc-500">({openInterest.oiChangePct.toFixed(2)}%)</span>
               </div>
@@ -245,13 +250,13 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
                     <div className="flex justify-between items-center text-xs">
                       <span className="text-zinc-500">Aggressive Buy</span>
                       <span className="font-mono font-bold text-emerald-300">
-                        {(data.timeAndSales.aggressiveBuyVolume / 1000).toFixed(1)}k
+                        {formatVol(data.timeAndSales.aggressiveBuyVolume)}
                       </span>
                     </div>
                     <div className="flex justify-between items-center text-xs">
                       <span className="text-zinc-500">Aggressive Sell</span>
                       <span className="font-mono font-bold text-rose-300">
-                        {(data.timeAndSales.aggressiveSellVolume / 1000).toFixed(1)}k
+                        {formatVol(data.timeAndSales.aggressiveSellVolume)}
                       </span>
                     </div>
                   </div>
@@ -326,8 +331,8 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
                           <td className="px-4 py-3 text-center">
                             <div className="flex flex-col items-center gap-1">
                               <span className={`text-[9px] px-1.5 py-0.5 rounded border ${row.state === 'Extreme' ? 'bg-red-900/20 text-red-400 border-red-800/30' :
-                                  row.state === 'High Vol' ? 'bg-yellow-900/20 text-yellow-500 border-yellow-800/30' :
-                                    'bg-zinc-800/50 text-zinc-500 border-zinc-700/30'
+                                row.state === 'High Vol' ? 'bg-yellow-900/20 text-yellow-500 border-yellow-800/30' :
+                                  'bg-zinc-800/50 text-zinc-500 border-zinc-700/30'
                                 }`}>
                                 {row.state}
                               </span>

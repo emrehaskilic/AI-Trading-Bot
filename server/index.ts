@@ -2091,11 +2091,6 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
         const apiKey = String(req.body?.apiKey || '').trim();
         const model = String(req.body?.model || '').trim();
         const localOnly = Boolean(req.body?.localOnly) || !apiKey || !model;
-        const extraUserPrompt = String(req.body?.extraUserPrompt ?? req.body?.customPrompt ?? '').trim();
-        const aiGridProfile = String(req.body?.aiGridProfile ?? req.body?.gridProfile ?? '').trim().toLowerCase();
-        const normalizedGridProfile: 'safe' | 'balanced' | 'aggressive' | undefined = aiGridProfile === 'safe' || aiGridProfile === 'balanced' || aiGridProfile === 'aggressive'
-            ? aiGridProfile
-            : undefined;
 
         const info = await fetchExchangeInfo();
         const symbols = Array.isArray(info?.symbols) ? info.symbols : [];
@@ -2132,7 +2127,6 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
             fundingIntervalMs: Number(req.body?.fundingIntervalMs ?? (8 * 60 * 60 * 1000)),
             heartbeatIntervalMs: Number(req.body?.heartbeatIntervalMs ?? 10_000),
             debugAggressiveEntry: false,
-            aiGridProfile: normalizedGridProfile,
         });
 
         aiDryRun.start({
@@ -2143,7 +2137,6 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
             temperature: Number(req.body?.temperature ?? 0),
             maxOutputTokens: Number(req.body?.maxOutputTokens ?? 256),
             localOnly,
-            extraUserPrompt,
             bootstrapTrendBySymbol,
         });
 
@@ -2176,16 +2169,6 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
         });
     } catch (e: any) {
         res.status(500).json({ ok: false, error: e?.message || 'ai_dry_run_start_failed' });
-    }
-});
-
-app.post('/api/ai-dry-run/grid-profile', (req, res) => {
-    try {
-        const profile = String(req.body?.profile ?? req.body?.aiGridProfile ?? '').trim().toLowerCase();
-        const grid = dryRunSession.setAIGridProfile(profile);
-        res.json({ ok: true, grid, status: dryRunSession.getStatus(), ai: aiDryRun.getStatus() });
-    } catch (e: any) {
-        res.status(400).json({ ok: false, error: e?.message || 'ai_grid_profile_update_failed' });
     }
 });
 
@@ -2855,3 +2838,4 @@ server.listen(PORT, HOST, () => log('SERVER_UP', { port: PORT, host: HOST }));
 orchestrator.start().catch((e) => {
     log('ORCHESTRATOR_START_ERROR', { error: e.message });
 });
+// trigger restart

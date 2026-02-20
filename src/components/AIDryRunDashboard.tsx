@@ -27,7 +27,6 @@ interface DryRunStatus {
     fundingIntervalMs: number;
     heartbeatIntervalMs: number;
     debugAggressiveEntry: boolean;
-    aiGridProfile?: 'safe' | 'balanced' | 'aggressive';
   } | null;
   summary: {
     totalEquity: number;
@@ -123,12 +122,9 @@ interface AIDryRunStatus {
   maxOutputTokens: number;
   apiKeySet: boolean;
   localOnly?: boolean;
-  extraUserPromptSet?: boolean;
   lastError: string | null;
   symbols: string[];
 }
-
-type AIGridProfile = 'safe' | 'balanced' | 'aggressive';
 
 const DEFAULT_STATUS: DryRunStatus = {
   running: false,
@@ -203,9 +199,6 @@ const AIDryRunDashboard: React.FC = () => {
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState('gemini-2.5-flash');
   const [customModel, setCustomModel] = useState('');
-  const [extraUserPrompt, setExtraUserPrompt] = useState('');
-  const [gridProfile, setGridProfile] = useState<AIGridProfile>('balanced');
-  const [isApplyingGridProfile, setIsApplyingGridProfile] = useState(false);
   const [localMode, setLocalMode] = useState(false);
   const localModeManualOverrideRef = useRef(false);
   const hasAppliedInitialConfigRef = useRef(false);
@@ -282,10 +275,6 @@ const AIDryRunDashboard: React.FC = () => {
           const nextAi = (data?.ai || null) as AIDryRunStatus | null;
           setStatus(next);
           setAiStatus(nextAi);
-          const profileFromServer = next.config?.aiGridProfile;
-          if (profileFromServer === 'safe' || profileFromServer === 'balanced' || profileFromServer === 'aggressive') {
-            setGridProfile(profileFromServer);
-          }
           if (nextAi && typeof nextAi.localOnly === 'boolean') {
             const shouldApplyServerLocalOnly = next.running || !localModeManualOverrideRef.current;
             if (shouldApplyServerLocalOnly) {
@@ -356,20 +345,13 @@ const AIDryRunDashboard: React.FC = () => {
           apiKey: localMode ? '' : apiKey.trim(),
           model: localMode ? '' : resolvedModel,
           localOnly: localMode,
-          extraUserPrompt: extraUserPrompt.trim(),
-          aiGridProfile: gridProfile,
         }),
       });
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data?.error || 'ai_dry_run_start_failed');
       }
-      const nextStatus = (data?.status || DEFAULT_STATUS) as DryRunStatus;
-      setStatus(nextStatus);
-      const nextProfile = nextStatus.config?.aiGridProfile;
-      if (nextProfile === 'safe' || nextProfile === 'balanced' || nextProfile === 'aggressive') {
-        setGridProfile(nextProfile);
-      }
+      setStatus((data?.status || DEFAULT_STATUS) as DryRunStatus);
       const nextAi = (data?.ai || null) as AIDryRunStatus | null;
       setAiStatus(nextAi);
       if (nextAi && typeof nextAi.localOnly === 'boolean') {
@@ -387,12 +369,7 @@ const AIDryRunDashboard: React.FC = () => {
       const res = await fetchWithAuth(`${proxyUrl}/api/ai-dry-run/stop`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || 'ai_dry_run_stop_failed');
-      const nextStatus = (data?.status || DEFAULT_STATUS) as DryRunStatus;
-      setStatus(nextStatus);
-      const nextProfile = nextStatus.config?.aiGridProfile;
-      if (nextProfile === 'safe' || nextProfile === 'balanced' || nextProfile === 'aggressive') {
-        setGridProfile(nextProfile);
-      }
+      setStatus((data?.status || DEFAULT_STATUS) as DryRunStatus);
       const nextAi = (data?.ai || null) as AIDryRunStatus | null;
       setAiStatus(nextAi);
       if (nextAi && typeof nextAi.localOnly === 'boolean') {
@@ -409,12 +386,7 @@ const AIDryRunDashboard: React.FC = () => {
       const res = await fetchWithAuth(`${proxyUrl}/api/ai-dry-run/reset`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || 'ai_dry_run_reset_failed');
-      const nextStatus = (data?.status || DEFAULT_STATUS) as DryRunStatus;
-      setStatus(nextStatus);
-      const nextProfile = nextStatus.config?.aiGridProfile;
-      if (nextProfile === 'safe' || nextProfile === 'balanced' || nextProfile === 'aggressive') {
-        setGridProfile(nextProfile);
-      }
+      setStatus((data?.status || DEFAULT_STATUS) as DryRunStatus);
       const nextAi = (data?.ai || null) as AIDryRunStatus | null;
       setAiStatus(nextAi);
       if (nextAi && typeof nextAi.localOnly === 'boolean') {
@@ -438,43 +410,10 @@ const AIDryRunDashboard: React.FC = () => {
       const nextAi = (data?.ai || null) as AIDryRunStatus | null;
       setStatus(next);
       setAiStatus(nextAi);
-      const nextProfile = next.config?.aiGridProfile;
-      if (nextProfile === 'safe' || nextProfile === 'balanced' || nextProfile === 'aggressive') {
-        setGridProfile(nextProfile);
-      }
     } catch (e: any) {
       setActionError(e?.message || 'ai_dry_run_status_failed');
     } finally {
       setIsRefreshingPositions(false);
-    }
-  };
-
-  const applyGridProfile = async (profile: AIGridProfile) => {
-    setGridProfile(profile);
-    if (!status.running) return;
-    setActionError(null);
-    setIsApplyingGridProfile(true);
-    try {
-      const res = await fetchWithAuth(`${proxyUrl}/api/ai-dry-run/grid-profile`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data?.error || 'ai_grid_profile_update_failed');
-      }
-      if (data?.status) {
-        setStatus(data.status as DryRunStatus);
-      }
-      const nextAi = (data?.ai || null) as AIDryRunStatus | null;
-      if (nextAi) {
-        setAiStatus(nextAi);
-      }
-    } catch (e: any) {
-      setActionError(e?.message || 'ai_grid_profile_update_failed');
-    } finally {
-      setIsApplyingGridProfile(false);
     }
   };
 
@@ -541,7 +480,6 @@ const AIDryRunDashboard: React.FC = () => {
             {aiStatus?.model && (
               <span className="text-zinc-500 ml-2">AI: {aiStatus.model}</span>
             )}
-            <span className="text-zinc-500 ml-2">GRID: {gridProfile.toUpperCase()}</span>
             {effectiveLocalMode && (
               <span className="text-zinc-500 ml-2">MODE: LOCAL_POLICY</span>
             )}
@@ -715,60 +653,6 @@ const AIDryRunDashboard: React.FC = () => {
               />
             </label>
           )}
-
-          <div className="text-xs text-zinc-500">
-            AI Grid Profile
-            <div className="mt-2 grid grid-cols-1 md:grid-cols-3 gap-2">
-              <button
-                onClick={() => void applyGridProfile('safe')}
-                disabled={isApplyingGridProfile}
-                className={`px-3 py-2 rounded text-xs font-bold border transition-colors disabled:opacity-60 ${gridProfile === 'safe'
-                  ? 'bg-emerald-700 text-white border-emerald-600'
-                  : 'bg-zinc-900 text-zinc-200 border-zinc-700 hover:bg-zinc-800'
-                  }`}
-              >
-                SAFE
-              </button>
-              <button
-                onClick={() => void applyGridProfile('balanced')}
-                disabled={isApplyingGridProfile}
-                className={`px-3 py-2 rounded text-xs font-bold border transition-colors disabled:opacity-60 ${gridProfile === 'balanced'
-                  ? 'bg-amber-700 text-white border-amber-600'
-                  : 'bg-zinc-900 text-zinc-200 border-zinc-700 hover:bg-zinc-800'
-                  }`}
-              >
-                BALANCED
-              </button>
-              <button
-                onClick={() => void applyGridProfile('aggressive')}
-                disabled={isApplyingGridProfile}
-                className={`px-3 py-2 rounded text-xs font-bold border transition-colors disabled:opacity-60 ${gridProfile === 'aggressive'
-                  ? 'bg-red-700 text-white border-red-600'
-                  : 'bg-zinc-900 text-zinc-200 border-zinc-700 hover:bg-zinc-800'
-                  }`}
-              >
-                AGGRESSIVE
-              </button>
-            </div>
-            <div className="text-[11px] text-zinc-500 mt-1">
-              Tek tikla profil sec. Calisirken secersen profil aninda uygulanir.
-            </div>
-          </div>
-
-          <label className="text-xs text-zinc-500">
-            Additional AI Prompt (Optional)
-            <textarea
-              value={extraUserPrompt}
-              disabled={status.running}
-              onChange={(e) => setExtraUserPrompt(e.target.value)}
-              placeholder="Example: Kisa surede yuksek kar hedefle."
-              rows={3}
-              className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm"
-            />
-            <div className="text-[11px] text-zinc-500 mt-1">
-              Bu metin, metrik tabanli ana prompta eklenir.
-            </div>
-          </label>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
             <button
