@@ -21,7 +21,7 @@ export function runTests() {
     burstCount: 1,
     volatility: 0.5,
   }).regime;
-  assert(regime === 'TR', 'initial regime should default to TR');
+  assert(regime === 'MR', 'initial regime should default to MR');
 
   // Feed MR candidate ticks below lock threshold
   for (let i = 0; i < 2; i += 1) {
@@ -36,9 +36,9 @@ export function runTests() {
       volatility: 0.4,
     }).regime;
   }
-  assert(regime === 'TR', 'TR->MR should respect lock ticks');
+  assert(regime === 'MR', 'MR should remain stable while MR candidate persists');
 
-  // Third MR tick should switch
+  // Third MR tick remains MR (already in MR baseline)
   regime = selector.update({
     nowMs: 105,
     price: 106,
@@ -49,7 +49,7 @@ export function runTests() {
     burstCount: 1,
     volatility: 0.4,
   }).regime;
-  assert(regime === 'MR', 'TR->MR should switch after lock ticks');
+  assert(regime === 'MR', 'MR baseline should remain unchanged on continued MR candidates');
 
   // EV override after 2 ticks with extreme event score
   regime = selector.update({

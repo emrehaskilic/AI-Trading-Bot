@@ -264,7 +264,10 @@ const DEFAULT_LARGE_LOSS_ALERT = Number(process.env.DRY_RUN_LARGE_LOSS_USDT || 5
 const DEFAULT_LIMIT_STRATEGY = String(process.env.DRY_RUN_LIMIT_STRATEGY || 'MARKET').toUpperCase();
 const DEFAULT_PERF_SAMPLE_MS = Number(process.env.DRY_RUN_PERF_SAMPLE_MS || 2000);
 const DEFAULT_TRADE_LOG_ENABLED = String(process.env.DRY_RUN_TRADE_LOGS || 'true').toLowerCase();
-const DEFAULT_TRADE_LOG_DIR = String(process.env.DRY_RUN_LOG_DIR || path.join(process.cwd(), 'server', 'logs', 'dryrun'));
+const DEFAULT_SERVER_ROOT = path.basename(process.cwd()).toLowerCase() === 'server'
+  ? process.cwd()
+  : path.join(process.cwd(), 'server');
+const DEFAULT_TRADE_LOG_DIR = String(process.env.DRY_RUN_LOG_DIR || path.join(DEFAULT_SERVER_ROOT, 'logs', 'dryrun'));
 const DEFAULT_TRADE_LOG_QUEUE = Number(process.env.DRY_RUN_LOG_QUEUE_LIMIT || 10000);
 const DEFAULT_TRADE_LOG_DROP = Number(process.env.DRY_RUN_LOG_DROP_THRESHOLD || 2000);
 const DEFAULT_SNAPSHOT_LOG_MS = Number(process.env.DRY_RUN_SNAPSHOT_LOG_MS || 30_000);
@@ -800,6 +803,7 @@ export class DryRunSessionService {
       const actionSide = action.side || null;
       const desiredOrderSide = actionSide === 'LONG' ? 'BUY' : actionSide === 'SHORT' ? 'SELL' : null;
       const aiPlan = this.extractAIPlan(action.metadata);
+      const aiPolicyAction = Boolean((action.metadata as Record<string, unknown> | undefined)?.aiPolicy) || this.isAIAutonomousRun();
       const entryStyle = this.normalizeAIEntryStyle(aiPlan?.entryStyle);
       const urgencyLevel = this.normalizeAIUrgency(aiPlan?.urgency);
       const spreadPct = this.computeSpreadPct(session.lastOrderBook);
@@ -807,8 +811,17 @@ export class DryRunSessionService {
       const laddersRequested = Math.max(0, Math.min(5, Math.trunc(Number(aiPlan?.maxAdds ?? 2))));
 
       if (action.type === StrategyActionType.ENTRY && desiredOrderSide) {
-        // AI decided to ENTRY. Handle existing position if any.
+        // AI policy path must never auto-close just to reverse.
         if (position && position.side !== actionSide) {
+          if (aiPolicyAction) {
+            this.addConsoleLog(
+              'WARN',
+              normalized,
+              `AI reversal blocked without direction lock confirmation: ${position.side} -> ${actionSide}`,
+              session.lastEventTimestampMs
+            );
+            continue;
+          }
           const closeQty = roundTo(position.qty, 6);
           if (closeQty > 0) {
             const closeOrder = this.buildAiLimitOrder(
@@ -832,19 +845,27 @@ export class DryRunSessionService {
           });
           if (sizing.qty > 0) {
             session.engine.setLeverageOverride(sizing.leverage);
-            const addOrders = this.limitStrategy.buildEntryOrders({
-              side: desiredOrderSide,
-              qty: sizing.qty,
-              markPrice: referencePrice,
-              orderBook: session.lastOrderBook,
-              entryStyle: 'LIMIT',
-              urgencyLevel,
-              spreadPct,
-              volatility,
-              ladderCount: laddersRequested,
-            });
-            for (const order of addOrders) {
-              queueOrder({ ...order, reasonCode: 'AI_ADD' });
+            if (aiPolicyAction) {
+              if (!this.isAiExecutionHealthy(session)) continue;
+              if (this.hasLiveWorkingOrderForSide(session, desiredOrderSide)) continue;
+              const addOrder = this.buildAiPostOnlyEntryOrder(session, desiredOrderSide, sizing.qty, 'AI_ADD');
+              if (!addOrder) continue;
+              queueOrder(addOrder);
+            } else {
+              const addOrders = this.limitStrategy.buildEntryOrders({
+                side: desiredOrderSide,
+                qty: sizing.qty,
+                markPrice: referencePrice,
+                orderBook: session.lastOrderBook,
+                entryStyle: 'LIMIT',
+                urgencyLevel,
+                spreadPct,
+                volatility,
+                ladderCount: laddersRequested,
+              });
+              for (const order of addOrders) {
+                queueOrder({ ...order, reasonCode: 'AI_ADD' });
+              }
             }
             session.addOnState.count += 1;
             session.addOnState.lastAddOnTs = decisionTs;
@@ -860,19 +881,27 @@ export class DryRunSessionService {
         });
         if (!(sizing.qty > 0)) continue;
         session.engine.setLeverageOverride(sizing.leverage);
-        const entryOrders = this.limitStrategy.buildEntryOrders({
-          side: desiredOrderSide,
-          qty: sizing.qty,
-          markPrice: referencePrice,
-          orderBook: session.lastOrderBook,
-          entryStyle,
-          urgencyLevel,
-          spreadPct,
-          volatility,
-          ladderCount: laddersRequested,
-        });
-        for (const order of entryOrders) {
-          queueOrder({ ...order, reasonCode: 'AI_ENTRY' });
+        if (aiPolicyAction) {
+          if (!this.isAiExecutionHealthy(session)) continue;
+          if (this.hasLiveWorkingOrderForSide(session, desiredOrderSide)) continue;
+          const entryOrder = this.buildAiPostOnlyEntryOrder(session, desiredOrderSide, sizing.qty, 'AI_ENTRY');
+          if (!entryOrder) continue;
+          queueOrder(entryOrder);
+        } else {
+          const entryOrders = this.limitStrategy.buildEntryOrders({
+            side: desiredOrderSide,
+            qty: sizing.qty,
+            markPrice: referencePrice,
+            orderBook: session.lastOrderBook,
+            entryStyle,
+            urgencyLevel,
+            spreadPct,
+            volatility,
+            ladderCount: laddersRequested,
+          });
+          for (const order of entryOrders) {
+            queueOrder({ ...order, reasonCode: 'AI_ENTRY' });
+          }
         }
         session.lastEntryEventTs = decisionTs;
         this.addConsoleLog('INFO', normalized, `AI entry ${actionSide} ${sizing.qty} @ ~${referencePrice}`, session.lastEventTimestampMs);
@@ -889,19 +918,27 @@ export class DryRunSessionService {
         });
         if (!(sizing.qty > 0)) continue;
         session.engine.setLeverageOverride(sizing.leverage);
-        const addOrders = this.limitStrategy.buildEntryOrders({
-          side: currentSide,
-          qty: sizing.qty,
-          markPrice: referencePrice,
-          orderBook: session.lastOrderBook,
-          entryStyle,
-          urgencyLevel,
-          spreadPct,
-          volatility,
-          ladderCount: laddersRequested,
-        });
-        for (const order of addOrders) {
-          queueOrder({ ...order, reasonCode: 'AI_ADD' });
+        if (aiPolicyAction) {
+          if (!this.isAiExecutionHealthy(session)) continue;
+          if (this.hasLiveWorkingOrderForSide(session, currentSide)) continue;
+          const addOrder = this.buildAiPostOnlyEntryOrder(session, currentSide, sizing.qty, 'AI_ADD');
+          if (!addOrder) continue;
+          queueOrder(addOrder);
+        } else {
+          const addOrders = this.limitStrategy.buildEntryOrders({
+            side: currentSide,
+            qty: sizing.qty,
+            markPrice: referencePrice,
+            orderBook: session.lastOrderBook,
+            entryStyle,
+            urgencyLevel,
+            spreadPct,
+            volatility,
+            ladderCount: laddersRequested,
+          });
+          for (const order of addOrders) {
+            queueOrder({ ...order, reasonCode: 'AI_ADD' });
+          }
         }
         session.addOnState.count += 1;
         session.addOnState.lastAddOnTs = decisionTs;
@@ -2022,6 +2059,63 @@ export class DryRunSessionService {
     };
   }
 
+  private buildAiPostOnlyEntryOrder(
+    session: SymbolSession,
+    side: 'BUY' | 'SELL',
+    qty: number,
+    reasonCode: DryRunReasonCode
+  ): DryRunOrderRequest | null {
+    if (!(qty > 0)) return null;
+    if (!this.isAiExecutionHealthy(session)) return null;
+
+    const bestBid = Number(session.lastOrderBook.bids?.[0]?.price || 0);
+    const bestAsk = Number(session.lastOrderBook.asks?.[0]?.price || 0);
+    const bidQty = Number(session.lastOrderBook.bids?.[0]?.qty || 0);
+    const askQty = Number(session.lastOrderBook.asks?.[0]?.qty || 0);
+    if (!(bestBid > 0) || !(bestAsk > 0)) return null;
+
+    const microprice = (bidQty > 0 && askQty > 0)
+      ? ((bestAsk * bidQty) + (bestBid * askQty)) / (bidQty + askQty)
+      : ((bestBid + bestAsk) / 2);
+    const offsetBps = clampNumber(process.env.AI_MICROPRICE_OFFSET_BPS, 1.5, 0.1, 25);
+    const offset = offsetBps / 10_000;
+
+    const rawPrice = side === 'BUY'
+      ? Math.min(bestBid * (1 - (0.25 / 10_000)), microprice * (1 - offset))
+      : Math.max(bestAsk * (1 + (0.25 / 10_000)), microprice * (1 + offset));
+    const price = roundTo(rawPrice, 6);
+    if (!(price > 0)) return null;
+
+    const ttlMs = Math.max(250, Math.trunc(clampNumber(process.env.AI_LIMIT_TTL_MS, 2000, 250, 10_000)));
+    return {
+      side,
+      type: 'LIMIT',
+      qty: roundTo(qty, 6),
+      price,
+      timeInForce: 'GTC',
+      reduceOnly: false,
+      postOnly: true,
+      ttlMs,
+      reasonCode,
+    };
+  }
+
+  private isAiExecutionHealthy(session: SymbolSession): boolean {
+    const spreadPct = this.computeSpreadPct(session.lastOrderBook);
+    if (spreadPct == null) return false;
+    if (spreadPct > DEFAULT_MAX_SPREAD_PCT) return false;
+    const bestBidQty = Number(session.lastOrderBook.bids?.[0]?.qty || 0);
+    const bestAskQty = Number(session.lastOrderBook.asks?.[0]?.qty || 0);
+    if (!(bestBidQty > 0) || !(bestAskQty > 0)) return false;
+    return true;
+  }
+
+  private hasLiveWorkingOrderForSide(session: SymbolSession, side: 'BUY' | 'SELL'): boolean {
+    const hasOpen = session.lastState.openLimitOrders.some((o) => o.side === side && !o.reduceOnly);
+    if (hasOpen) return true;
+    return session.manualOrders.some((o) => o.side === side && o.type === 'LIMIT' && !o.reduceOnly);
+  }
+
   private extractAIPlan(metadata?: Record<string, unknown>): AIIntentMetadata | null {
     if (!metadata || typeof metadata !== 'object') return null;
     const candidate = (metadata as AIActionMetadata).plan;
@@ -2065,18 +2159,29 @@ export class DryRunSessionService {
   ): { qty: number; leverage: number } {
     if (!this.config || !(price > 0)) return { qty: 0, leverage: session.dynamicLeverage || 1 };
     const leverage = session.dynamicLeverage || this.config.leverage || 1;
+    const maxNotional = Math.max(0, Number(this.config.initialMarginUsdt || 0) * Math.max(1, leverage));
+    if (!(maxNotional > 0)) return { qty: 0, leverage };
 
     const rawMultiplier = Number(sizeMultiplier || 1);
     const normalizedMultiplier = this.isAIAutonomousRun()
-      ? (Number.isFinite(rawMultiplier) && rawMultiplier > 0 ? rawMultiplier : 1)
+      ? clampNumber(rawMultiplier, 1, 0.05, 4)
       : Math.max(0.05, Math.min(2, rawMultiplier));
-    const baseMarginUsdt = Math.max(1, Number(this.config.initialMarginUsdt || 0));
-    const targetMargin = baseMarginUsdt * normalizedMultiplier;
-    const targetNotional = Math.max(0, targetMargin * leverage);
-    const desiredNotional = options?.mode === 'ADD'
-      ? targetNotional
-      : Math.max(targetNotional, baseMarginUsdt * leverage);
-    const openingNotional = Math.max(0, desiredNotional);
+    const baseEntryPct = clampNumber(process.env.AI_BASE_ENTRY_PCT, 0.35, 0.25, 0.55);
+    const baseNotional = maxNotional * baseEntryPct;
+    const requestedNotional = Math.max(0, baseNotional * normalizedMultiplier);
+
+    const currentNotional = session.lastState.position
+      ? Math.max(0, Number(session.lastState.position.qty || 0) * price)
+      : 0;
+    const availableNotional = options?.mode === 'ADD'
+      ? Math.max(0, maxNotional - currentNotional)
+      : maxNotional;
+    const incrementalCapPct = Number.isFinite(options?.incrementalRiskCapPct as number)
+      ? clampNumber(options?.incrementalRiskCapPct, 1, 0.05, 1)
+      : 1;
+    const cappedByIncremental = maxNotional * incrementalCapPct;
+    const openingNotional = Math.max(0, Math.min(requestedNotional, availableNotional, cappedByIncremental));
+
     const qty = roundTo(Math.max(0, openingNotional / price), 6);
     return { qty, leverage };
   }

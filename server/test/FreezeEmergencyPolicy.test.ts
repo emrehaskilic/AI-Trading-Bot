@@ -55,7 +55,7 @@ const engine = new DecisionEngine({
 });
 
 export function runTests() {
-  // 1) Missing exec metrics => FREEZE and no emergency panic exit
+  // Legacy freeze/emergency branches were removed; decisions are strategy-driven.
   {
     const state = baseState();
     state.position = {
@@ -84,11 +84,11 @@ export function runTests() {
       state,
     });
 
-    assert(actions.every((a) => a.reason !== 'emergency_exit_exec_quality'), 'panic emergency exit must be forbidden');
-    assert(actions.some((a) => a.type === 'NOOP' && a.reason === 'freeze_active'), 'freeze should block normal exits');
+    assert(actions.every((a) => !String(a.reason || '').startsWith('emergency_exit_')), 'legacy emergency-exit reasons must not be emitted');
+    assert(actions.some((a) => a.type === 'EXIT_MARKET' && a.reason === 'REDUCE_SOFT'), 'position management should remain strategy-driven');
   }
 
-  // 2) BAD exec quality without guards => FREEZE, no exit
+  // 2) Bad exec metadata does not force legacy freeze outcomes.
   {
     const state = baseState();
     state.position = {
@@ -118,11 +118,11 @@ export function runTests() {
       state,
     });
 
-    assert(actions.some((a) => a.type === 'NOOP' && a.reason === 'freeze_active'), 'bad quality should freeze strategy exits');
-    assert(!actions.some((a) => a.type === 'EXIT_MARKET'), 'no emergency exit without hard guards');
+    assert(actions.every((a) => !String(a.reason || '').startsWith('emergency_exit_')), 'legacy emergency-exit reasons must remain disabled');
+    assert(actions.some((a) => a.type === 'NOOP' && a.reason === 'no_action'), 'engine should return no_action when strategy has no signal');
   }
 
-  // 3) Liquidation risk => emergency exit allowed
+  // 3) Margin ratio does not trigger deprecated liquidation emergency path here.
   {
     const state = baseState();
     state.position = {
@@ -152,10 +152,11 @@ export function runTests() {
       state,
     });
 
-    assert(actions.some((a) => a.type === 'EXIT_MARKET' && a.reason === 'emergency_exit_liquidation_risk'), 'liquidation risk must allow emergency exit');
+    assert(actions.every((a) => !String(a.reason || '').startsWith('emergency_exit_')), 'deprecated liquidation emergency exit must not be emitted');
+    assert(actions.some((a) => a.type === 'NOOP' && a.reason === 'no_action'), 'engine should remain on no_action in absence of strategy trigger');
   }
 
-  // 4) Hard stop => emergency exit allowed
+  // 4) Large drawdown does not use deprecated hard-stop emergency reason.
   {
     const state = baseState();
     state.position = {
@@ -185,6 +186,7 @@ export function runTests() {
       state,
     });
 
-    assert(actions.some((a) => a.type === 'EXIT_MARKET' && a.reason === 'emergency_exit_hard_stop'), 'hard stop must allow emergency exit');
+    assert(actions.every((a) => !String(a.reason || '').startsWith('emergency_exit_')), 'deprecated hard-stop emergency exit must not be emitted');
+    assert(actions.some((a) => a.type === 'EXIT_MARKET' && a.reason === 'REDUCE_SOFT'), 'drawdown should still allow strategy reduction');
   }
 }

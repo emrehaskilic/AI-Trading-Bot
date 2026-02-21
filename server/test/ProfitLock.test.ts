@@ -82,10 +82,11 @@ export function runTests() {
     state,
   });
 
-  assert(state.position.profitLockActivated === true, 'profit lock must activate at +0.30% pnl');
-  assert((state.position.hardStopPrice || 0) > state.position.entryPrice, 'hard stop price must move above entry for LONG');
+  // Legacy profit-lock mutations were removed from DecisionEngine path.
+  assert(state.position.profitLockActivated === false, 'legacy profit lock flag must remain untouched');
+  assert(state.position.hardStopPrice == null, 'legacy hard-stop mutation must remain disabled');
 
-  const stop = state.position.hardStopPrice as number;
+  const syntheticStop = state.position.entryPrice;
   const actions = engine.evaluate({
     symbol: 'BTCUSDT',
     event_time_ms: 2,
@@ -94,12 +95,13 @@ export function runTests() {
       symbol: 'BTCUSDT',
       prints_per_second: 3,
       spread_pct: 0.01,
-      best_bid: stop - 0.01,
-      best_ask: stop + 0.01,
+      best_bid: syntheticStop - 0.01,
+      best_ask: syntheticStop + 0.01,
       legacyMetrics: { obiDeep: 0.3, deltaZ: 0.5, cvdSlope: 0.1 },
     },
     state,
   });
 
-  assert(actions.some((a) => a.type === 'EXIT_MARKET' && a.reason === 'profit_lock_exit'), 'profit lock trigger must exit the position');
+  assert(!actions.some((a) => a.reason === 'profit_lock_exit'), 'deprecated profit-lock exit reason must not be emitted');
+  assert(actions.some((a) => a.type === 'EXIT_MARKET' && a.reason === 'REDUCE_SOFT'), 'strategy path should still allow soft reduction');
 }

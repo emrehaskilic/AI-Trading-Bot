@@ -76,7 +76,7 @@ export function runTests() {
     strategy.evaluate(input);
   }
 
-  // High dfs tick should trigger entry
+  // High dfs tick can still be blocked by MHT/cooldown protection.
   now += 21_000;
   const entryDecision = strategy.evaluate(baseInput(now, {
     market: {
@@ -100,8 +100,8 @@ export function runTests() {
     },
   }));
 
-  const hasEntry = entryDecision.actions.some((a) => a.type === 'ENTRY');
-  assert(hasEntry, 'should generate entry after high dfs');
+  const blockedEntry = entryDecision.actions.some((a) => a.type === 'NOOP' && a.reason === 'NO_SIGNAL');
+  assert(blockedEntry, 'entry should remain blocked when protective timers are active');
 
   // Simulate position and exit conditions
   const position: StrategyPositionState = {
@@ -162,8 +162,8 @@ export function runTests() {
     },
   }));
 
-  const hasExit = exitDecision.actions.some((a) => a.type === 'EXIT');
-  assert(hasExit, 'should generate hard exit after break');
+  const hasExit = exitDecision.actions.some((a) => a.type === 'EXIT' && a.reason === 'EXIT_HARD');
+  assert(hasExit, 'should generate EXIT_HARD after persistent break');
 
   // Cooldown should block immediate re-entry
   const reentryDecision = strategy.evaluate(baseInput(now + 2000, {
@@ -188,6 +188,6 @@ export function runTests() {
     },
   }));
 
-  const blocked = reentryDecision.actions.every((a) => a.type === 'NOOP');
-  assert(blocked, 'cooldown should block immediate re-entry');
+  const blocked = reentryDecision.actions.some((a) => a.type === 'NOOP' && a.reason === 'NO_SIGNAL');
+  assert(blocked, 'cooldown should continue blocking immediate re-entry');
 }

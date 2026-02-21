@@ -5,6 +5,8 @@ dist/
 *.log
 *.jsonl
 server/logs/
+server/data/
+server/server/
 server/dist/
 .idea/
 .vscode/

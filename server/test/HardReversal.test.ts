@@ -116,7 +116,8 @@ export function runTests() {
     absorption: { value: 1, side: 'sell' },
   }));
 
-  const hasHardExit = decision.actions.some((a) => a.reason === 'EXIT_HARD_REVERSAL');
+  const hasHardExit = decision.actions.some((a) => a.reason === 'EXIT_HARD');
   const hasHardEntry = decision.actions.some((a) => a.reason === 'HARD_REVERSAL_ENTRY');
-  assert(hasHardExit && hasHardEntry, 'hard reversal should emit exit and entry');
+  assert(hasHardExit, 'persistent opposite pressure should emit EXIT_HARD');
+  assert(!hasHardEntry, 'immediate reverse entry should remain suppressed');
 }

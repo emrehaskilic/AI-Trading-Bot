@@ -38,4 +38,7 @@ export function runTests() {
   svc.submitManualTestOrder('BTCUSDT', 'BUY');
   const afterManual = svc.getStatus();
   assert(afterManual.logTail.some((l) => l.message.includes('Manual test order queued')), 'manual order log missing');
+
+  const stopped = svc.stop();
+  assert(stopped.running === false, 'session must stop cleanly');
 }

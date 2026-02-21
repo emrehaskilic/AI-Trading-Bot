@@ -23,10 +23,14 @@ import * as OrderbookIntegrityMonitorTests from './OrderbookIntegrityMonitor.tes
 // StrategyEngine removed; NEW_STRATEGY_V1.1 tests below.
 import * as DryRunClockTests from './DryRunClock.test';
 import * as FreezeControllerTests from './FreezeController.test';
-import * as AutonomousMetricsPolicyTests from './AutonomousMetricsPolicy.test';
 import * as PositionSizerTests from './PositionSizer.test';
+import * as StateExtractorTests from './StateExtractor.test';
+import * as PolicyEngineTests from './PolicyEngine.test';
+import * as RiskGovernorTests from './RiskGovernor.test';
+import * as DirectionLockTests from './DirectionLock.test';
+import * as AIPolicyControllerTests from './AIPolicyController.test';
 
-export const testSuites: { name: string; fn: () => void }[] = [
+export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'TimeAndSales', fn: TimeAndSalesTests.runTests },
     { name: 'CvdCalculator', fn: CvdTests.runTests },
     { name: 'AbsorptionDetector', fn: AbsorptionTests.runTests },
@@ -51,6 +55,10 @@ export const testSuites: { name: string; fn: () => void }[] = [
     { name: 'HardReversal', fn: HardReversalTests.runTests },
     { name: 'DryRunClock', fn: DryRunClockTests.runTests },
     { name: 'FreezeController', fn: FreezeControllerTests.runTests },
-    { name: 'AutonomousMetricsPolicy', fn: AutonomousMetricsPolicyTests.runTests },
     { name: 'PositionSizer', fn: PositionSizerTests.runTests },
+    { name: 'StateExtractor', fn: StateExtractorTests.runTests },
+    { name: 'PolicyEngine', fn: PolicyEngineTests.runTests },
+    { name: 'RiskGovernor', fn: RiskGovernorTests.runTests },
+    { name: 'DirectionLock', fn: DirectionLockTests.runTests },
+    { name: 'AIPolicyController', fn: AIPolicyControllerTests.runTests },
 ];

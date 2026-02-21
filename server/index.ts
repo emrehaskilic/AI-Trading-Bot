@@ -132,14 +132,18 @@ const AI_TREND_BOOTSTRAP_DEFAULT_HOURS = Math.max(1, Number(process.env.AI_TREND
 const AI_TREND_BOOTSTRAP_MAX_HOURS = 12;
 const AI_TREND_BOOTSTRAP_MIN_BARS = 120;
 const STRATEGY_EVAL_MIN_INTERVAL_MS = Math.max(50, Number(process.env.STRATEGY_EVAL_MIN_INTERVAL_MS || 200));
-const ENABLE_CROSS_MARKET_CONFIRMATION = parseEnvFlag(process.env.ENABLE_CROSS_MARKET_CONFIRMATION);
+// Cross-market metrics should be available out-of-the-box.
+// Explicitly set ENABLE_CROSS_MARKET_CONFIRMATION=false to disable.
+const ENABLE_CROSS_MARKET_CONFIRMATION = process.env.ENABLE_CROSS_MARKET_CONFIRMATION == null
+    ? true
+    : parseEnvFlag(process.env.ENABLE_CROSS_MARKET_CONFIRMATION);
 
 // [PHASE 3] Execution Flags
 let KILL_SWITCH = false;
 function parseEnvFlag(value: string | undefined): boolean {
     if (!value) return false;
     const normalized = value.trim().replace(/^['"]|['"]$/g, '').toLowerCase();
-    return normalized === 'true';
+    return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on';
 }
 
 const EXECUTION_ENABLED_ENV = parseEnvFlag(process.env.EXECUTION_ENABLED);
@@ -2133,7 +2137,7 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
             symbols: symbolsRequested,
             apiKey,
             model,
-            decisionIntervalMs: Number(req.body?.decisionIntervalMs ?? 2000),
+            decisionIntervalMs: Number(req.body?.decisionIntervalMs ?? 250),
             temperature: Number(req.body?.temperature ?? 0),
             maxOutputTokens: Number(req.body?.maxOutputTokens ?? 256),
             localOnly,
