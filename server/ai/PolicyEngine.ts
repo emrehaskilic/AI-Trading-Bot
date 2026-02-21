@@ -37,6 +37,7 @@ type PolicyEngineConfig = {
   temperature: number;
   maxOutputTokens: number;
   localOnly: boolean;
+  fallbackLocalOnLLMFailure?: boolean;
 };
 
 const POLICY_SCHEMA: Record<string, unknown> = {
@@ -63,6 +64,11 @@ export class PolicyEngine {
   constructor(private readonly config: PolicyEngineConfig) {}
 
   async evaluate(input: PolicyEvaluationInput): Promise<PolicyEvaluationResult> {
+    const fallbackLocalOnFailure =
+      this.config.fallbackLocalOnLLMFailure != null
+        ? Boolean(this.config.fallbackLocalOnLLMFailure)
+        : !['0', 'false', 'no', 'off'].includes(String(process.env.AI_LLM_FAILURE_USE_LOCAL_POLICY || 'true').trim().toLowerCase());
+
     if (this.config.localOnly || !this.config.apiKey || !this.config.model) {
       return this.localPolicy(input);
     }
@@ -123,14 +129,25 @@ export class PolicyEngine {
       }
     }
 
+    if (fallbackLocalOnFailure) {
+      const local = this.localPolicy(input);
+      return {
+        ...local,
+        source: 'LOCAL_POLICY',
+        error: null,
+        latencyMs: Math.max(0, Date.now() - started),
+        rawText,
+      };
+    }
+
     return this.hold(lastError || 'policy_eval_failed', Math.max(0, Date.now() - started), rawText);
   }
 
   private resolveTimeout(input: PolicyEvaluationInput): number {
     const elapsed = Math.max(0, input.timestampMs - input.startedAtMs);
     const bootWindowMs = Math.max(1_000, Number(process.env.AI_BOOT_TIMEOUT_WINDOW_MS || 20_000));
-    const bootTimeoutMs = Math.max(800, Number(process.env.AI_POLICY_TIMEOUT_BOOT_MS || 1300));
-    const steadyTimeoutMs = Math.max(500, Number(process.env.AI_POLICY_TIMEOUT_MS || 800));
+    const bootTimeoutMs = Math.max(1_000, Number(process.env.AI_POLICY_TIMEOUT_BOOT_MS || 1_800));
+    const steadyTimeoutMs = Math.max(700, Number(process.env.AI_POLICY_TIMEOUT_MS || 1_400));
     return elapsed <= bootWindowMs ? bootTimeoutMs : steadyTimeoutMs;
   }
 
@@ -278,11 +295,10 @@ export class PolicyEngine {
     const position = input.position;
 
     const canEnter =
-      state.stateConfidence >= 0.58
+      state.stateConfidence >= 0.55
       && state.executionState !== 'LOW_RESILIENCY'
       && state.toxicityState !== 'TOXIC'
-      && state.volatilityPercentile < 95
-      && state.flowState !== 'EXHAUSTION'
+      && state.volatilityPercentile < 97
       && state.directionalBias !== 'NEUTRAL';
 
     if (!position) {
@@ -304,7 +320,7 @@ export class PolicyEngine {
           decision: {
             intent: 'ENTER',
             side: entrySide,
-            riskMultiplier: state.regimeState === 'TREND' ? 0.85 : 0.6,
+            riskMultiplier: state.regimeState === 'TREND' ? 1 : 0.75,
             confidence: clamp(state.stateConfidence, 0.45, 0.95),
           },
           valid: true,
@@ -328,9 +344,8 @@ export class PolicyEngine {
     const side = position.side;
     const sameBias = state.directionalBias === side || state.directionalBias === 'NEUTRAL';
     const trendIntact =
-      state.regimeState === 'TREND'
+      (state.regimeState === 'TREND' || state.regimeState === 'TRANSITION')
       && sameBias
-      && state.flowState !== 'EXHAUSTION'
       && state.executionState !== 'LOW_RESILIENCY';
 
     const hardRisk =
@@ -359,10 +374,13 @@ export class PolicyEngine {
         ? state.cvdSlopeSign === 'DOWN' && state.oiDirection === 'DOWN'
         : state.cvdSlopeSign === 'UP' && state.oiDirection === 'UP';
     const trendBroken =
-      state.regimeState === 'VOL_EXPANSION'
-      || (opposingBias
+      (opposingBias
         && opposingPressure
-        && (state.flowState === 'EXHAUSTION' || state.regimeState === 'TRANSITION'));
+        && (
+          state.flowState === 'EXHAUSTION'
+          || state.regimeState === 'TRANSITION'
+          || state.regimeState === 'VOL_EXPANSION'
+        ));
 
     if (trendBroken) {
       return {
@@ -382,11 +400,11 @@ export class PolicyEngine {
 
     if (trendIntact) {
       const canAdd =
-        state.stateConfidence >= 0.8
+        state.stateConfidence >= 0.75
         && state.flowState === 'EXPANSION'
         && state.regimeState === 'TREND'
         && state.derivativesState === (side === 'LONG' ? 'LONG_BUILD' : 'SHORT_BUILD')
-        && state.volatilityPercentile < 85;
+        && state.volatilityPercentile < 90;
 
       if (canAdd) {
         return {

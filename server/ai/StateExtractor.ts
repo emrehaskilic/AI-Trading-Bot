@@ -163,7 +163,8 @@ export class StateExtractor {
     }
 
     const conflicting = (deltaZ > 0 && cvd < 0) || (deltaZ < 0 && cvd > 0);
-    if (conflicting || Math.abs(obi) < 0.08) {
+    const weakBookImbalance = Math.abs(obi) < 0.04 && Math.abs(deltaZ) < 1;
+    if (conflicting || weakBookImbalance) {
       return {
         state: 'EXHAUSTION',
         confidence: clamp(0.5 + Math.min(0.35, Math.abs(deltaZ) / 5), 0, 1),
@@ -255,12 +256,16 @@ export class StateExtractor {
   ): { state: ExecutionHealthState; confidence: number } {
     const resiliency = Number(snapshot.liquidityMetrics.resiliencyMs || 0);
 
-    if (resiliency >= 6_000 || expectedSlippageBps >= 14 || spreadBps >= 24) {
-      return { state: 'LOW_RESILIENCY', confidence: clamp(0.65 + Math.min(0.3, (spreadBps / 50) + (expectedSlippageBps / 30)), 0, 1) };
+    const lowBySpread = spreadBps >= 32;
+    const lowBySlip = expectedSlippageBps >= 20;
+    const lowByResiliency = resiliency >= 12_000;
+    const lowByCombo = resiliency >= 8_000 && (spreadBps >= 18 || expectedSlippageBps >= 12);
+    if (lowBySpread || lowBySlip || lowByResiliency || lowByCombo) {
+      return { state: 'LOW_RESILIENCY', confidence: clamp(0.62 + Math.min(0.33, (spreadBps / 55) + (expectedSlippageBps / 28)), 0, 1) };
     }
 
-    if (resiliency >= 2_500 || spreadBps >= 12 || expectedSlippageBps >= 8) {
-      return { state: 'WIDENING_SPREAD', confidence: clamp(0.55 + Math.min(0.25, (spreadBps / 60) + (expectedSlippageBps / 40)), 0, 1) };
+    if (resiliency >= 4_500 || spreadBps >= 10 || expectedSlippageBps >= 6) {
+      return { state: 'WIDENING_SPREAD', confidence: clamp(0.54 + Math.min(0.27, (spreadBps / 65) + (expectedSlippageBps / 42)), 0, 1) };
     }
 
     return { state: 'HEALTHY', confidence: 0.62 };

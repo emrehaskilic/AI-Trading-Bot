@@ -14,6 +14,7 @@ const DEFAULT_MAX_DECISION_INTERVAL_MS = 1000;
 const DEFAULT_DECISION_INTERVAL_MS = 250;
 const DEFAULT_STATE_CONFIDENCE_THRESHOLD = clamp(Number(process.env.AI_STATE_CONFIDENCE_THRESHOLD || 0.58), 0, 1);
 const DEFAULT_MAX_STARTUP_WARMUP_MS = Math.max(0, Math.trunc(Number(process.env.AI_MAX_STARTUP_WARMUP_MS || 2000)));
+const DEFAULT_TREND_BREAK_CONFIRM_TICKS = Math.max(1, Math.trunc(clamp(Number(process.env.AI_TREND_BREAK_CONFIRM_TICKS || 3), 1, 8)));
 
 type RuntimeSymbolState = {
   firstSeenTs: number;
@@ -24,6 +25,8 @@ type RuntimeSymbolState = {
   totalHoldMs: number;
   holdSamples: number;
   latestTrend: AITrendStatus | null;
+  trendBreakStreak: number;
+  lastTrendBreakTs: number;
 };
 
 const HARD_RISK_REASONS = new Set<string>([
@@ -31,6 +34,12 @@ const HARD_RISK_REASONS = new Set<string>([
   'SLIPPAGE_HARD_LIMIT',
   'VOL_HARD_LIMIT',
   'INVALID_NOTIONAL_LIMIT',
+]);
+
+const NON_FATAL_POLICY_ERRORS = new Set<string>([
+  'state_not_ready',
+  'state_confidence_low',
+  'startup_safety_block',
 ]);
 
 export class AIDryRunController {
@@ -187,16 +196,20 @@ export class AIDryRunController {
       const ready = this.isReadyForPolicy(snapshot);
       const hasOpenPosition = Boolean(snapshot.position);
       const confidenceEnough = deterministicState.stateConfidence >= DEFAULT_STATE_CONFIDENCE_THRESHOLD;
+      const startupExecutionPass =
+        deterministicState.executionState !== 'LOW_RESILIENCY'
+        || (deterministicState.spreadBps <= 8 && deterministicState.expectedSlippageBps <= 4);
       const startupSafetyPass =
-        deterministicState.executionState === 'HEALTHY'
+        startupExecutionPass
         && deterministicState.toxicityState !== 'TOXIC'
-        && deterministicState.volatilityPercentile < 90;
+        && deterministicState.volatilityPercentile < 97;
       const canEvaluateForEntry = confidenceEnough && startupSafetyPass;
       const canEvaluatePolicy = ready && (hasOpenPosition || canEvaluateForEntry);
 
       let policy: PolicyDecision = { intent: 'HOLD', side: null, riskMultiplier: 0.2, confidence: 0 };
-      let policySource: 'LLM' | 'LOCAL_POLICY' | 'HOLD_FALLBACK' = 'HOLD_FALLBACK';
+      let policySource: 'LLM' | 'LOCAL_POLICY' | 'HOLD_FALLBACK' = 'LOCAL_POLICY';
       let policyError: string | null = null;
+      let policyGateReason: string | null = null;
       let rawPolicyText: string | null = null;
 
       if (canEvaluatePolicy) {
@@ -218,9 +231,17 @@ export class AIDryRunController {
           this.telemetry.invalidLLMResponses += 1;
         }
       } else {
-        if (!ready) policyError = 'state_not_ready';
-        else if (!confidenceEnough) policyError = 'state_confidence_low';
-        else policyError = 'startup_safety_block';
+        policySource = 'LOCAL_POLICY';
+        policyError = null;
+        if (!ready) {
+          policyGateReason = 'state_not_ready';
+        } else if (!confidenceEnough) {
+          policyGateReason = 'state_confidence_low';
+        } else if (!startupSafetyPass) {
+          policyGateReason = 'startup_safety_block';
+        } else {
+          policyGateReason = 'policy_gate_blocked';
+        }
       }
 
       const governed = this.riskGovernor.apply({
@@ -265,18 +286,39 @@ export class AIDryRunController {
         }
       }
 
-      if (snapshot.position && (finalDecision.intent === 'REDUCE' || finalDecision.intent === 'EXIT')) {
+      if (snapshot.position) {
         const hardRisk = finalDecision.reasons.some((reason) => HARD_RISK_REASONS.has(reason));
         const trendIntact = this.isTrendIntact(snapshot.position.side, deterministicState);
-        if (!hardRisk && trendIntact) {
-          finalDecision = {
-            ...finalDecision,
-            intent: 'HOLD',
-            side: null,
-            reducePct: null,
-            reasons: [...finalDecision.reasons, 'TREND_INTACT_HOLD'],
-          };
+
+        if (trendIntact) {
+          runtime.trendBreakStreak = 0;
+          runtime.lastTrendBreakTs = 0;
+          if (!hardRisk && (finalDecision.intent === 'REDUCE' || finalDecision.intent === 'EXIT')) {
+            finalDecision = {
+              ...finalDecision,
+              intent: 'HOLD',
+              side: null,
+              reducePct: null,
+              reasons: [...finalDecision.reasons, 'TREND_INTACT_HOLD'],
+            };
+          }
+        } else {
+          runtime.trendBreakStreak += 1;
+          runtime.lastTrendBreakTs = nowMs;
+          const breakConfirmed = runtime.trendBreakStreak >= DEFAULT_TREND_BREAK_CONFIRM_TICKS;
+          if (!hardRisk && !breakConfirmed && (finalDecision.intent === 'REDUCE' || finalDecision.intent === 'EXIT')) {
+            finalDecision = {
+              ...finalDecision,
+              intent: 'HOLD',
+              side: null,
+              reducePct: null,
+              reasons: [...finalDecision.reasons, 'TREND_BREAK_AWAIT_CONFIRM'],
+            };
+          }
         }
+      } else {
+        runtime.trendBreakStreak = 0;
+        runtime.lastTrendBreakTs = 0;
       }
 
       const decision = this.buildStrategyDecision(snapshot, finalDecision, {
@@ -284,11 +326,14 @@ export class AIDryRunController {
         policy,
         policySource,
         policyError,
+        policyGateReason,
         rawPolicyText,
         confidenceEnough,
         startupSafetyPass,
         ready,
         lockEvaluation,
+        trendBreakStreak: runtime.trendBreakStreak,
+        trendBreakConfirmTicks: DEFAULT_TREND_BREAK_CONFIRM_TICKS,
       });
 
       this.dryRunSession.submitStrategyDecision(symbol, decision, nowMs);
@@ -305,7 +350,7 @@ export class AIDryRunController {
         this.telemetry.flipsCount += 1;
       }
 
-      this.lastError = policyError;
+      this.lastError = policyError && !NON_FATAL_POLICY_ERRORS.has(policyError) ? policyError : null;
       this.log?.('AI_POLICY_DECISION', {
         symbol,
         finalIntent: finalDecision.intent,
@@ -313,6 +358,7 @@ export class AIDryRunController {
         reasons: finalDecision.reasons,
         policySource,
         policyError,
+        policyGateReason,
       });
     } catch (e: any) {
       this.lastError = String(e?.message || 'ai_policy_failed');
@@ -331,11 +377,14 @@ export class AIDryRunController {
         policy: { intent: 'HOLD', side: null, confidence: 0, riskMultiplier: 0.2 },
         policySource: 'HOLD_FALLBACK',
         policyError: this.lastError,
+        policyGateReason: null,
         rawPolicyText: null,
         confidenceEnough: false,
         startupSafetyPass: false,
         ready: false,
         lockEvaluation: { blocked: false, reason: null, confirmations: 0 },
+        trendBreakStreak: 0,
+        trendBreakConfirmTicks: DEFAULT_TREND_BREAK_CONFIRM_TICKS,
       });
       this.dryRunSession.submitStrategyDecision(symbol, holdDecision, nowMs);
       this.decisionLog?.record(holdDecision.log);
@@ -361,11 +410,14 @@ export class AIDryRunController {
       policy: PolicyDecision;
       policySource: 'LLM' | 'LOCAL_POLICY' | 'HOLD_FALLBACK';
       policyError: string | null;
+      policyGateReason: string | null;
       rawPolicyText: string | null;
       confidenceEnough: boolean;
       startupSafetyPass: boolean;
       ready: boolean;
       lockEvaluation: { blocked: boolean; reason: string | null; confirmations: number };
+      trendBreakStreak: number;
+      trendBreakConfirmTicks: number;
     }
   ): StrategyDecision {
     const actions: StrategyAction[] = [];
@@ -379,6 +431,7 @@ export class AIDryRunController {
           deterministic: context.deterministicState,
           policySource: context.policySource,
           policyError: context.policyError,
+          policyGateReason: context.policyGateReason,
           policy: context.policy,
         },
       });
@@ -457,6 +510,7 @@ export class AIDryRunController {
           policy: context.policy,
           policySource: context.policySource,
           policyError: context.policyError,
+          policyGateReason: context.policyGateReason,
           policyRawText: context.rawPolicyText,
           governorReasons: governed.reasons,
           ready: context.ready,
@@ -464,6 +518,8 @@ export class AIDryRunController {
           startupSafetyPass: context.startupSafetyPass,
           directionLock: context.lockEvaluation,
           maxPositionNotional: governed.maxPositionNotional,
+          trendBreakStreak: context.trendBreakStreak,
+          trendBreakConfirmTicks: context.trendBreakConfirmTicks,
         },
       },
       dfs: snapshot.decision.dfs,
@@ -543,6 +599,8 @@ export class AIDryRunController {
         totalHoldMs: 0,
         holdSamples: 0,
         latestTrend: null,
+        trendBreakStreak: 0,
+        lastTrendBreakTs: 0,
       };
       this.runtime.set(symbol, state);
     }
