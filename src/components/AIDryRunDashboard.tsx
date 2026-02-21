@@ -342,7 +342,7 @@ const AIDryRunDashboard: React.FC = () => {
           walletBalanceStartUsdt: Number(startBalance),
           initialMarginUsdt: Number(initialMargin),
           leverage: Number(leverage),
-          debugAggressiveEntry: true,
+          debugAggressiveEntry: false,
           apiKey: localMode ? '' : apiKey.trim(),
           model: localMode ? '' : resolvedModel,
           localOnly: localMode,

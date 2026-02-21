@@ -2074,19 +2074,41 @@ export class DryRunSessionService {
     const askQty = Number(session.lastOrderBook.asks?.[0]?.qty || 0);
     if (!(bestBid > 0) || !(bestAsk > 0)) return null;
 
+    const forcePostOnly = ['1', 'true', 'yes', 'on'].includes(
+      String(process.env.AI_ENTRY_POST_ONLY || 'false').trim().toLowerCase()
+    );
+    if (!forcePostOnly) {
+      const aggressiveLimit = side === 'BUY' ? bestAsk : bestBid;
+      return {
+        side,
+        type: 'LIMIT',
+        qty: roundTo(qty, 6),
+        price: roundTo(aggressiveLimit, 6),
+        timeInForce: 'IOC',
+        reduceOnly: false,
+        postOnly: false,
+        reasonCode,
+      };
+    }
+
     const microprice = (bidQty > 0 && askQty > 0)
       ? ((bestAsk * bidQty) + (bestBid * askQty)) / (bidQty + askQty)
       : ((bestBid + bestAsk) / 2);
     const offsetBps = clampNumber(process.env.AI_MICROPRICE_OFFSET_BPS, 1.5, 0.1, 25);
     const offset = offsetBps / 10_000;
 
+    // Use touch maker price (best bid/ask) for quicker fills while staying post-only.
+    const passiveTouch = side === 'BUY' ? bestBid : bestAsk;
+    const microBiased = side === 'BUY'
+      ? microprice * (1 - offset)
+      : microprice * (1 + offset);
     const rawPrice = side === 'BUY'
-      ? Math.min(bestBid * (1 - (0.25 / 10_000)), microprice * (1 - offset))
-      : Math.max(bestAsk * (1 + (0.25 / 10_000)), microprice * (1 + offset));
+      ? Math.max(passiveTouch, Math.min(bestAsk * (1 - 1e-8), microBiased))
+      : Math.min(passiveTouch, Math.max(bestBid * (1 + 1e-8), microBiased));
     const price = roundTo(rawPrice, 6);
     if (!(price > 0)) return null;
 
-    const ttlMs = Math.max(250, Math.trunc(clampNumber(process.env.AI_LIMIT_TTL_MS, 2000, 250, 10_000)));
+    const ttlMs = Math.max(250, Math.trunc(clampNumber(process.env.AI_LIMIT_TTL_MS, 4000, 250, 10_000)));
     return {
       side,
       type: 'LIMIT',

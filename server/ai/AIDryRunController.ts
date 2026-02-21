@@ -12,7 +12,7 @@ const clamp = (value: number, min: number, max: number): number => Math.max(min,
 const DEFAULT_MIN_DECISION_INTERVAL_MS = 100;
 const DEFAULT_MAX_DECISION_INTERVAL_MS = 1000;
 const DEFAULT_DECISION_INTERVAL_MS = 250;
-const DEFAULT_STATE_CONFIDENCE_THRESHOLD = clamp(Number(process.env.AI_STATE_CONFIDENCE_THRESHOLD || 0.62), 0, 1);
+const DEFAULT_STATE_CONFIDENCE_THRESHOLD = clamp(Number(process.env.AI_STATE_CONFIDENCE_THRESHOLD || 0.58), 0, 1);
 const DEFAULT_MAX_STARTUP_WARMUP_MS = Math.max(0, Math.trunc(Number(process.env.AI_MAX_STARTUP_WARMUP_MS || 2000)));
 
 type RuntimeSymbolState = {
@@ -25,6 +25,13 @@ type RuntimeSymbolState = {
   holdSamples: number;
   latestTrend: AITrendStatus | null;
 };
+
+const HARD_RISK_REASONS = new Set<string>([
+  'DAILY_LOSS_CAP',
+  'SLIPPAGE_HARD_LIMIT',
+  'VOL_HARD_LIMIT',
+  'INVALID_NOTIONAL_LIMIT',
+]);
 
 export class AIDryRunController {
   private active = false;
@@ -188,7 +195,7 @@ export class AIDryRunController {
       const canEvaluatePolicy = ready && (hasOpenPosition || canEvaluateForEntry);
 
       let policy: PolicyDecision = { intent: 'HOLD', side: null, riskMultiplier: 0.2, confidence: 0 };
-      let policySource: 'LLM' | 'HOLD_FALLBACK' = 'HOLD_FALLBACK';
+      let policySource: 'LLM' | 'LOCAL_POLICY' | 'HOLD_FALLBACK' = 'HOLD_FALLBACK';
       let policyError: string | null = null;
       let rawPolicyText: string | null = null;
 
@@ -254,6 +261,20 @@ export class AIDryRunController {
             side: null,
             reducePct: null,
             reasons: [...governed.reasons, lockEvaluation.reason || 'DIRECTION_LOCK'],
+          };
+        }
+      }
+
+      if (snapshot.position && (finalDecision.intent === 'REDUCE' || finalDecision.intent === 'EXIT')) {
+        const hardRisk = finalDecision.reasons.some((reason) => HARD_RISK_REASONS.has(reason));
+        const trendIntact = this.isTrendIntact(snapshot.position.side, deterministicState);
+        if (!hardRisk && trendIntact) {
+          finalDecision = {
+            ...finalDecision,
+            intent: 'HOLD',
+            side: null,
+            reducePct: null,
+            reasons: [...finalDecision.reasons, 'TREND_INTACT_HOLD'],
           };
         }
       }
@@ -335,10 +356,10 @@ export class AIDryRunController {
       maxPositionNotional: number;
       reasons: string[];
     },
-    context: {
+      context: {
       deterministicState: ReturnType<StateExtractor['extract']>;
       policy: PolicyDecision;
-      policySource: 'LLM' | 'HOLD_FALLBACK';
+      policySource: 'LLM' | 'LOCAL_POLICY' | 'HOLD_FALLBACK';
       policyError: string | null;
       rawPolicyText: string | null;
       confidenceEnough: boolean;
@@ -555,6 +576,30 @@ export class AIDryRunController {
       count += runtime.holdSamples;
     }
     return count > 0 ? Number((total / count).toFixed(2)) : 0;
+  }
+
+  private isTrendIntact(
+    side: 'LONG' | 'SHORT',
+    state: ReturnType<StateExtractor['extract']>
+  ): boolean {
+    const opposingBias =
+      (side === 'LONG' && state.directionalBias === 'SHORT')
+      || (side === 'SHORT' && state.directionalBias === 'LONG');
+
+    const cvdOpposing =
+      (side === 'LONG' && state.cvdSlopeSign === 'DOWN')
+      || (side === 'SHORT' && state.cvdSlopeSign === 'UP');
+
+    const oiOpposing =
+      (side === 'LONG' && state.oiDirection === 'DOWN')
+      || (side === 'SHORT' && state.oiDirection === 'UP');
+
+    if (opposingBias) return false;
+    if (cvdOpposing && oiOpposing) return false;
+    if (state.regimeState === 'VOL_EXPANSION') return false;
+    if (state.executionState === 'LOW_RESILIENCY') return false;
+    if (state.flowState === 'EXHAUSTION') return false;
+    return true;
   }
 
   private resetTelemetry(): void {

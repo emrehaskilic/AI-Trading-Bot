@@ -234,12 +234,15 @@ export class StateExtractor {
     const impact = Math.max(0, Number(snapshot.toxicityMetrics.priceImpactPerSignedNotional || 0));
     const burst = Math.max(0, Number(snapshot.toxicityMetrics.burstPersistenceScore || 0));
 
-    if (vpin >= 0.72 || burst >= 0.85 || impact >= 0.00006) {
-      return { state: 'TOXIC', confidence: clamp(0.65 + Math.min(0.3, vpin * 0.35 + burst * 0.25), 0, 1) };
+    const toxicByFlow = vpin >= 0.88 && burst >= 0.75;
+    const toxicByBurst = burst >= 0.93;
+    const toxicByImpact = impact >= 0.00012;
+    if (toxicByFlow || toxicByBurst || toxicByImpact) {
+      return { state: 'TOXIC', confidence: clamp(0.64 + Math.min(0.3, (vpin * 0.25) + (burst * 0.2)), 0, 1) };
     }
 
-    if (vpin >= 0.5 || burst >= 0.62 || impact >= 0.00003) {
-      return { state: 'AGGRESSIVE', confidence: clamp(0.55 + Math.min(0.25, vpin * 0.2 + burst * 0.2), 0, 1) };
+    if (vpin >= 0.68 || burst >= 0.7 || impact >= 0.00005) {
+      return { state: 'AGGRESSIVE', confidence: clamp(0.55 + Math.min(0.25, (vpin * 0.2) + (burst * 0.15)), 0, 1) };
     }
 
     return { state: 'CLEAN', confidence: 0.6 };

@@ -25,7 +25,7 @@ export interface PolicyEvaluationInput {
 export interface PolicyEvaluationResult {
   decision: PolicyDecision;
   valid: boolean;
-  source: 'LLM' | 'HOLD_FALLBACK';
+  source: 'LLM' | 'LOCAL_POLICY' | 'HOLD_FALLBACK';
   error: string | null;
   latencyMs: number;
   rawText: string | null;
@@ -64,7 +64,7 @@ export class PolicyEngine {
 
   async evaluate(input: PolicyEvaluationInput): Promise<PolicyEvaluationResult> {
     if (this.config.localOnly || !this.config.apiKey || !this.config.model) {
-      return this.hold('llm_unavailable', 0, null);
+      return this.localPolicy(input);
     }
 
     const timeoutMs = this.resolveTimeout(input);
@@ -270,6 +270,167 @@ export class PolicyEngine {
       error,
       latencyMs,
       rawText,
+    };
+  }
+
+  private localPolicy(input: PolicyEvaluationInput): PolicyEvaluationResult {
+    const state = input.state;
+    const position = input.position;
+
+    const canEnter =
+      state.stateConfidence >= 0.58
+      && state.executionState !== 'LOW_RESILIENCY'
+      && state.toxicityState !== 'TOXIC'
+      && state.volatilityPercentile < 95
+      && state.flowState !== 'EXHAUSTION'
+      && state.directionalBias !== 'NEUTRAL';
+
+    if (!position) {
+      if (canEnter) {
+        const entrySide: PolicySide = state.directionalBias === 'LONG' || state.directionalBias === 'SHORT'
+          ? state.directionalBias
+          : null;
+        if (!entrySide) {
+          return {
+            decision: { ...HOLD_DECISION },
+            valid: true,
+            source: 'LOCAL_POLICY',
+            error: null,
+            latencyMs: 0,
+            rawText: null,
+          };
+        }
+        return {
+          decision: {
+            intent: 'ENTER',
+            side: entrySide,
+            riskMultiplier: state.regimeState === 'TREND' ? 0.85 : 0.6,
+            confidence: clamp(state.stateConfidence, 0.45, 0.95),
+          },
+          valid: true,
+          source: 'LOCAL_POLICY',
+          error: null,
+          latencyMs: 0,
+          rawText: null,
+        };
+      }
+
+      return {
+        decision: { ...HOLD_DECISION },
+        valid: true,
+        source: 'LOCAL_POLICY',
+        error: null,
+        latencyMs: 0,
+        rawText: null,
+      };
+    }
+
+    const side = position.side;
+    const sameBias = state.directionalBias === side || state.directionalBias === 'NEUTRAL';
+    const trendIntact =
+      state.regimeState === 'TREND'
+      && sameBias
+      && state.flowState !== 'EXHAUSTION'
+      && state.executionState !== 'LOW_RESILIENCY';
+
+    const hardRisk =
+      state.executionState === 'LOW_RESILIENCY'
+      || state.volatilityPercentile >= 97;
+
+    if (hardRisk) {
+      return {
+        decision: {
+          intent: 'REDUCE',
+          side,
+          riskMultiplier: 0.3,
+          confidence: 0.75,
+        },
+        valid: true,
+        source: 'LOCAL_POLICY',
+        error: null,
+        latencyMs: 0,
+        rawText: null,
+      };
+    }
+
+    const opposingBias = state.directionalBias !== 'NEUTRAL' && state.directionalBias !== side;
+    const opposingPressure =
+      side === 'LONG'
+        ? state.cvdSlopeSign === 'DOWN' && state.oiDirection === 'DOWN'
+        : state.cvdSlopeSign === 'UP' && state.oiDirection === 'UP';
+    const trendBroken =
+      state.regimeState === 'VOL_EXPANSION'
+      || (opposingBias
+        && opposingPressure
+        && (state.flowState === 'EXHAUSTION' || state.regimeState === 'TRANSITION'));
+
+    if (trendBroken) {
+      return {
+        decision: {
+          intent: 'EXIT',
+          side,
+          riskMultiplier: 0.4,
+          confidence: 0.7,
+        },
+        valid: true,
+        source: 'LOCAL_POLICY',
+        error: null,
+        latencyMs: 0,
+        rawText: null,
+      };
+    }
+
+    if (trendIntact) {
+      const canAdd =
+        state.stateConfidence >= 0.8
+        && state.flowState === 'EXPANSION'
+        && state.regimeState === 'TREND'
+        && state.derivativesState === (side === 'LONG' ? 'LONG_BUILD' : 'SHORT_BUILD')
+        && state.volatilityPercentile < 85;
+
+      if (canAdd) {
+        return {
+          decision: {
+            intent: 'ADD',
+            side,
+            riskMultiplier: 0.55,
+            confidence: clamp(state.stateConfidence, 0.6, 0.95),
+          },
+          valid: true,
+          source: 'LOCAL_POLICY',
+          error: null,
+          latencyMs: 0,
+          rawText: null,
+        };
+      }
+
+      return {
+        decision: {
+          intent: 'HOLD',
+          side: null,
+          riskMultiplier: 0.45,
+          confidence: clamp(state.stateConfidence, 0.5, 0.95),
+        },
+        valid: true,
+        source: 'LOCAL_POLICY',
+        error: null,
+        latencyMs: 0,
+        rawText: null,
+      };
+    }
+
+    return {
+      decision: {
+        intent: 'HOLD',
+        side: null,
+        riskMultiplier: 0.35,
+        confidence: clamp(state.stateConfidence, 0.35, 0.85),
+      },
+      valid: true,
+      source: 'LOCAL_POLICY',
+      error: null,
+      latencyMs: 0,
+      rawText: null,
     };
   }
 }
