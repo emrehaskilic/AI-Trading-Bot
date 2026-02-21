@@ -2122,7 +2122,7 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
             fundingRates,
             fundingIntervalMs: Number(req.body?.fundingIntervalMs ?? (8 * 60 * 60 * 1000)),
             heartbeatIntervalMs: Number(req.body?.heartbeatIntervalMs ?? 10_000),
-            debugAggressiveEntry: false,
+            debugAggressiveEntry: Boolean(req.body?.debugAggressiveEntry ?? true),
         });
 
         aiDryRun.start({
