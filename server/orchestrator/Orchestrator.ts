@@ -1,6 +1,6 @@
 import * as path from 'path';
 import { ExecutionConnector } from '../connectors/ExecutionConnector';
-import { ExecutionEvent, Side } from '../connectors/executionTypes';
+import { ExecutionEvent, OrderType, Side } from '../connectors/executionTypes';
 import { DryRunExecutor } from '../execution/DryRunExecutor';
 import { IExecutor } from '../execution/types';
 import { TradeLogger } from '../logger/TradeLogger';
@@ -51,6 +51,7 @@ export class Orchestrator {
   private readonly logger: OrchestratorLogger;
   private readonly orderMonitor: OrderMonitor;
   private readonly tradeLogger: TradeLogger;
+  private readonly dryRunOnly: boolean;
   private readonly fundingRateMonitor = new FundingRateMonitor();
   private readonly fundingLastUpdateBySymbol = new Map<string, number>();
   private readonly fundingRefreshMs = Number(process.env.FUNDING_REFRESH_MS || 60_000);
@@ -79,18 +80,87 @@ export class Orchestrator {
   ) {
     this.capitalSettings.leverage = Math.min(this.connector.getPreferredLeverage(), config.maxLeverage);
     this.connector.setPreferredLeverage(this.capitalSettings.leverage);
+    this.dryRunOnly = ['1', 'true', 'yes', 'on'].includes(
+      String(process.env.ORCHESTRATOR_DRY_RUN_ONLY || 'false').trim().toLowerCase()
+    );
     const latencyAlertMs = Number(process.env.EXECUTION_LATENCY_ALERT_MS || 1200);
 
     this.executor = new DryRunExecutor(async (decision) => {
-      return {
-        ok: true,
-        orderId: `dryrun-${Date.now()}`,
-        executedQuantity: decision.quantity,
-        executedPrice: decision.price,
-        fee: '0',
-        feeTier: 'MAKER',
+      if (this.dryRunOnly) {
+        return {
+          ok: true,
+          orderId: `dryrun-${Date.now()}`,
+          executedQuantity: decision.quantity,
+          executedPrice: decision.price,
+          fee: '0',
+          feeTier: 'MAKER',
+        };
+      }
+      const orderType: OrderType = (decision.type || 'LIMIT') as OrderType;
+      const quantity = Number(decision.quantity);
+      const baseClientOrderId = String(decision.clientOrderId || '').trim();
+      const clientOrderId = baseClientOrderId || `d_${Date.now()}_${Math.floor(Math.random() * 10_000)}`;
+      if (!(quantity > 0)) {
+        return { ok: false, error: 'invalid_quantity', errorType: 'PERMANENT' };
+      }
+      const request: any = {
+        symbol: String(decision.symbol || '').toUpperCase(),
+        side: decision.side,
+        type: orderType,
+        quantity,
+        reduceOnly: Boolean(decision.reduceOnly),
+        clientOrderId,
       };
+
+      if (orderType === 'LIMIT') {
+        const limitPrice = Number(decision.price);
+        if (!(limitPrice > 0)) {
+          return { ok: false, error: 'invalid_limit_price', errorType: 'PERMANENT' };
+        }
+        request.price = limitPrice;
+        request.timeInForce = decision.timeInForce || 'POST_ONLY';
+      }
+
+      if (orderType === 'STOP_MARKET' || orderType === 'TAKE_PROFIT_MARKET') {
+        const stopPrice = Number(decision.stopPrice ?? decision.price);
+        if (!(stopPrice > 0)) {
+          return { ok: false, error: 'invalid_stop_price', errorType: 'PERMANENT' };
+        }
+        request.stopPrice = stopPrice;
+      }
+
+      try {
+        const placed = await this.connector.placeOrder(request);
+        return {
+          ok: true,
+          orderId: placed.orderId,
+          executedQuantity: decision.quantity,
+          executedPrice: decision.price,
+          feeTier: orderType === 'MARKET' ? 'TAKER' : 'MAKER',
+        };
+      } catch (e: any) {
+        const message = String(e?.message || 'execution_failed');
+        const transient = /timeout|tempor|429|rate.limit|network|backoff/i.test(message);
+        return {
+          ok: false,
+          error: message,
+          errorType: transient ? 'TRANSIENT' : 'PERMANENT',
+        };
+      }
     }, undefined, {
+      classifyRetryable: (result) => {
+        if (result.ok) return false;
+        if (result.errorType === 'TRANSIENT') return true;
+        const errorText = String(result.error || '').toLowerCase();
+        return (
+          errorText.includes('timeout')
+          || errorText.includes('tempor')
+          || errorText.includes('rate limit')
+          || errorText.includes('429')
+          || errorText.includes('network')
+          || errorText.includes('backoff')
+        );
+      },
       onLatency: (latencyMs) => {
         if (!this.alertService) return;
         if (latencyMs < latencyAlertMs) return;
@@ -143,7 +213,7 @@ export class Orchestrator {
   }
 
   private isDryRunOnly(): boolean {
-    return true;
+    return this.dryRunOnly;
   }
 
   async start() {
@@ -976,11 +1046,12 @@ export class Orchestrator {
 
       let sizingQty = quantity;
       let sizingNotional = auditBase.notional;
+      const reduceOnly = Boolean(action.reduceOnly);
       try {
         const sizing = await this.connector.previewOrderSizing(symbol, side, quantity, price > 0 ? price : null);
         sizingQty = sizing.qtyRounded;
         sizingNotional = sizing.notionalUsdt;
-        if (!(sizingQty > 0) || !sizing.minNotionalOk) {
+        if (!(sizingQty > 0) || (!reduceOnly && !sizing.minNotionalOk)) {
           this.logOrderAttemptAudit({
             ...auditBase,
             qty: sizingQty,
@@ -1014,14 +1085,26 @@ export class Orchestrator {
         continue;
       }
 
-      const reduceOnly = Boolean(action.reduceOnly);
+      const orderType: OrderType = action.type === 'EXIT_MARKET' ? 'MARKET' : 'LIMIT';
+      const makerPrice = orderType === 'LIMIT' ? this.getMakerLimitPrice(symbol, side) : null;
+      const requestPrice = orderType === 'LIMIT'
+        ? (makerPrice && makerPrice > 0 ? makerPrice : price)
+        : price;
+      if (orderType === 'LIMIT' && !(requestPrice > 0)) {
+        this.logOrderAttemptAudit({ ...auditBase, reasonCode: 'RISK_BLOCK', error: 'missing_limit_price' });
+        continue;
+      }
       try {
+        const clientOrderId = `d_${Date.now()}_${Math.floor(Math.random() * 10_000)}`;
         const res = await this.executor.execute({
           symbol,
           side,
-          price: String(price),
+          type: orderType,
+          timeInForce: orderType === 'LIMIT' ? 'POST_ONLY' : undefined,
+          price: String(requestPrice > 0 ? requestPrice : 0),
           quantity: String(sizingQty),
           reduceOnly,
+          clientOrderId,
         });
         this.logOrderAttemptAudit({
           ...auditBase,

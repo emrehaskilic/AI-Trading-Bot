@@ -146,8 +146,8 @@ function parseEnvFlag(value: string | undefined): boolean {
     return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on';
 }
 
-const EXECUTION_ENABLED_ENV = parseEnvFlag(process.env.EXECUTION_ENABLED);
-let EXECUTION_ENABLED = false;
+const EXECUTION_ENABLED_DEFAULT = parseEnvFlag(process.env.EXECUTION_ENABLED);
+let EXECUTION_ENABLED = EXECUTION_ENABLED_DEFAULT;
 const EXECUTION_ENV = 'testnet';
 
 function normalizeWsUpdateSpeed(raw: string): '100ms' | '250ms' | '500ms' {
@@ -1986,15 +1986,7 @@ app.post('/api/execution/disconnect', async (req, res) => {
 
 app.post('/api/execution/enabled', async (req, res) => {
     const enabled = Boolean(req.body?.enabled);
-    if (enabled && !EXECUTION_ENABLED_ENV) {
-        res.status(409).json({
-            ok: false,
-            error: 'execution_env_disabled',
-            message: 'Set EXECUTION_ENABLED=true in the server environment and restart to enable execution.',
-        });
-        return;
-    }
-    EXECUTION_ENABLED = enabled && EXECUTION_ENABLED_ENV;
+    EXECUTION_ENABLED = enabled;
     await orchestrator.setExecutionEnabled(EXECUTION_ENABLED);
     res.json({ ok: true, status: orchestrator.getExecutionStatus(), executionEnabled: EXECUTION_ENABLED });
 });
