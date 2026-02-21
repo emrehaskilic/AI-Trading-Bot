@@ -3,7 +3,7 @@ import { useTelemetrySocket } from '../services/useTelemetrySocket';
 import { MetricsState, MetricsMessage } from '../types/metrics';
 import SymbolRow from './SymbolRow';
 import MobileSymbolCard from './MobileSymbolCard';
-import { withProxyApiKey } from '../services/proxyAuth';
+import { isViewerModeEnabled, withProxyApiKey } from '../services/proxyAuth';
 import { getProxyApiBase } from '../services/proxyBase';
 
 type ConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR';
@@ -59,6 +59,7 @@ const defaultExecutionStatus: ExecutionStatus = {
 const formatNum = (n: number, d = 2) => n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
 
 export const Dashboard: React.FC = () => {
+  const readOnlyViewer = useMemo(() => isViewerModeEnabled(), []);
   const [selectedPairs, setSelectedPairs] = useState<string[]>(['BTCUSDT']);
   const [availablePairs, setAvailablePairs] = useState<string[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
@@ -169,6 +170,7 @@ export const Dashboard: React.FC = () => {
   }, [selectedPairs, executionStatus.wallet.totalWalletUsdt]);
 
   useEffect(() => {
+    if (readOnlyViewer) return;
     const syncSelectedSymbols = async () => {
       try {
         await fetchWithAuth(`${proxyUrl}/api/execution/symbol`, {
@@ -182,7 +184,7 @@ export const Dashboard: React.FC = () => {
     };
     const timer = setTimeout(syncSelectedSymbols, 500);
     return () => clearTimeout(timer);
-  }, [proxyUrl, selectedPairs]);
+  }, [proxyUrl, selectedPairs, readOnlyViewer]);
 
   const filteredPairs = availablePairs.filter((p) => p.includes(searchTerm.toUpperCase()));
 
@@ -195,6 +197,7 @@ export const Dashboard: React.FC = () => {
   };
 
   const connectTestnet = async () => {
+    if (readOnlyViewer) return;
     setConnectionError(null);
     try {
       const res = await fetchWithAuth(`${proxyUrl}/api/execution/connect`, {
@@ -213,6 +216,7 @@ export const Dashboard: React.FC = () => {
   };
 
   const disconnectTestnet = async () => {
+    if (readOnlyViewer) return;
     setConnectionError(null);
     try {
       const res = await fetchWithAuth(`${proxyUrl}/api/execution/disconnect`, { method: 'POST' });
@@ -227,6 +231,7 @@ export const Dashboard: React.FC = () => {
   };
 
   const setExecutionEnabled = async (enabled: boolean) => {
+    if (readOnlyViewer) return;
     setConnectionError(null);
     try {
       const res = await fetchWithAuth(`${proxyUrl}/api/execution/enabled`, {
@@ -245,6 +250,7 @@ export const Dashboard: React.FC = () => {
   };
 
   const refreshWalletPnl = async () => {
+    if (readOnlyViewer) return;
     const res = await fetchWithAuth(`${proxyUrl}/api/execution/refresh`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -256,6 +262,7 @@ export const Dashboard: React.FC = () => {
   };
 
   const applyExecutionSettings = async () => {
+    if (readOnlyViewer) return;
     setSettingsError(null);
     try {
       const parsedLeverage = Number(leverageInput);
@@ -307,6 +314,9 @@ export const Dashboard: React.FC = () => {
           <div>
             <h1 className="text-2xl font-bold text-white tracking-tight">Orderflow Telemetry</h1>
             <p className="text-zinc-500 text-sm mt-1">DATA: MAINNET | EXCHANGE: TESTNET</p>
+            {readOnlyViewer && (
+              <p className="text-amber-300 text-xs mt-2 uppercase tracking-wide">Read-only external viewer mode</p>
+            )}
           </div>
           <div className="text-xs rounded border border-zinc-700 px-3 py-2 bg-zinc-900">
             <span className={statusColor}>{executionStatus.connection.state}</span>
@@ -341,6 +351,7 @@ export const Dashboard: React.FC = () => {
 
             <button
               onClick={refreshWalletPnl}
+              disabled={readOnlyViewer}
               className="w-full mt-2 px-3 py-2 bg-zinc-800 hover:bg-zinc-700 rounded text-xs font-semibold text-zinc-300 border border-zinc-700 transition-colors"
             >
               REFRESH WALLET
@@ -357,6 +368,7 @@ export const Dashboard: React.FC = () => {
                 type="password"
                 placeholder="Testnet API Key"
                 value={apiKey}
+                disabled={readOnlyViewer}
                 onChange={(e) => setApiKey(e.target.value)}
                 className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm"
               />
@@ -364,23 +376,26 @@ export const Dashboard: React.FC = () => {
                 type="password"
                 placeholder="Testnet API Secret"
                 value={apiSecret}
+                disabled={readOnlyViewer}
                 onChange={(e) => setApiSecret(e.target.value)}
                 className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm"
               />
             </div>
 
             <div className="grid grid-cols-2 gap-2">
-              <button onClick={connectTestnet} className="px-3 py-2 bg-blue-700 hover:bg-blue-600 rounded text-xs font-bold text-white shadow-lg transition-all active:scale-95">CONNECT EXCHANGE</button>
-              <button onClick={disconnectTestnet} className="px-3 py-2 bg-zinc-700 hover:bg-zinc-600 rounded text-xs font-bold text-white transition-all active:scale-95">DISCONNECT</button>
+              <button disabled={readOnlyViewer} onClick={connectTestnet} className="px-3 py-2 bg-blue-700 hover:bg-blue-600 rounded text-xs font-bold text-white shadow-lg transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">CONNECT EXCHANGE</button>
+              <button disabled={readOnlyViewer} onClick={disconnectTestnet} className="px-3 py-2 bg-zinc-700 hover:bg-zinc-600 rounded text-xs font-bold text-white transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">DISCONNECT</button>
             </div>
             <div className="grid grid-cols-2 gap-2">
               <button
+                disabled={readOnlyViewer}
                 onClick={() => setExecutionEnabled(true)}
                 className={`px-3 py-2 rounded text-xs font-bold transition-all active:scale-95 border ${executionStatus.connection.executionEnabled ? 'bg-emerald-700 border-emerald-600 text-white' : 'bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700'}`}
               >
                 ENABLE EXECUTION
               </button>
               <button
+                disabled={readOnlyViewer}
                 onClick={() => setExecutionEnabled(false)}
                 className={`px-3 py-2 rounded text-xs font-bold transition-all active:scale-95 border ${!executionStatus.connection.executionEnabled ? 'bg-amber-700 border-amber-600 text-white' : 'bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700'}`}
               >
@@ -460,6 +475,7 @@ export const Dashboard: React.FC = () => {
                     type="number"
                     min={1}
                     value={leverageInput}
+                    disabled={readOnlyViewer}
                     onChange={(e) => {
                       setLeverageInput(e.target.value);
                       setSettingsDirty(true);
@@ -468,8 +484,9 @@ export const Dashboard: React.FC = () => {
                   />
                 </label>
                 <button
+                  disabled={readOnlyViewer}
                   onClick={applyExecutionSettings}
-                  className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 rounded text-[11px] font-semibold border border-zinc-700"
+                  className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 rounded text-[11px] font-semibold border border-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   APPLY
                 </button>
@@ -488,6 +505,7 @@ export const Dashboard: React.FC = () => {
                       min={0}
                       step="0.01"
                       value={pairMarginInputs[symbol] ?? ''}
+                      disabled={readOnlyViewer}
                       onChange={(e) => {
                         const value = e.target.value;
                         setPairMarginInputs((prev) => ({ ...prev, [symbol]: value }));

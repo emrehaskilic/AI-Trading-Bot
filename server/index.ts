@@ -1802,7 +1802,7 @@ const corsOptions = {
     },
     credentials: true,
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Viewer-Token'],
 };
 app.use(cors(corsOptions));
 app.use('/api', (_req, res, next) => {

@@ -29,6 +29,23 @@ VITE_PROXY_API_KEY=your-strong-api-key
 
 `VITE_PROXY_API_KEY` must match `API_KEY_SECRET`. Frontend startup fails fast when it is missing.
 
+Read-only external viewer (optional, recommended for public links):
+
+```bash
+# server/.env
+READONLY_VIEW_TOKEN=your-long-random-view-token
+EXTERNAL_READONLY_MODE=true
+ALLOW_PUBLIC_MARKET_DATA=false
+```
+
+Viewer link format:
+
+```bash
+https://your-domain/#telemetry?viewer=1&viewerToken=your-long-random-view-token
+```
+
+`viewerToken` access is read-only only. POST/modify operations are blocked server-side.
+
 Optional dev host override (`.env.development.local`):
 
 ```bash

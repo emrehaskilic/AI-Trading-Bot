@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { MetricsMessage, MetricsState } from '../types/metrics';
-import { proxyWebSocketProtocols } from './proxyAuth';
+import { getViewerToken, proxyWebSocketProtocols } from './proxyAuth';
 import { getProxyWsBase } from './proxyBase';
 
 /**
@@ -70,7 +70,13 @@ export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
       closeActiveSocket('reconnect');
 
       const proxyWs = getProxyWsBase();
-      const url = `${proxyWs}/ws?symbols=${activeSymbols.join(',')}`;
+      const params = new URLSearchParams();
+      params.set('symbols', activeSymbols.join(','));
+      const viewerToken = getViewerToken();
+      if (viewerToken) {
+        params.set('viewerToken', viewerToken);
+      }
+      const url = `${proxyWs}/ws?${params.toString()}`;
       console.log(`[Telemetry] Connecting to WS: ${url} (attempt ${reconnectAttempts.current + 1})`);
 
       try {

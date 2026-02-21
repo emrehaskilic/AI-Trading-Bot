@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import LiveTelemetryDashboard from './LiveTelemetryDashboard';
 import DryRunDashboard from './DryRunDashboard';
 import AIDryRunDashboard from './AIDryRunDashboard';
+import { isViewerModeEnabled } from '../services/proxyAuth';
 
 type AppTab = 'telemetry' | 'dry-run' | 'ai-dry-run';
 
@@ -12,7 +13,11 @@ function tabFromHash(hash: string): AppTab {
 }
 
 const Dashboard: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<AppTab>(() => tabFromHash(window.location.hash));
+  const readonlyViewer = useMemo(() => isViewerModeEnabled(), []);
+  const [activeTab, setActiveTab] = useState<AppTab>(() => {
+    const initial = tabFromHash(window.location.hash);
+    return readonlyViewer ? 'telemetry' : initial;
+  });
 
   useEffect(() => {
     const onHashChange = () => {
@@ -22,13 +27,20 @@ const Dashboard: React.FC = () => {
     return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
 
-  const tabs = useMemo<Array<{ id: AppTab; label: string }>>(() => ([
-    { id: 'telemetry', label: 'Live Telemetry' },
-    { id: 'dry-run', label: 'Dry Run' },
-    { id: 'ai-dry-run', label: 'AI Dry Run' },
-  ]), []);
+  const tabs = useMemo<Array<{ id: AppTab; label: string }>>(() => (
+    readonlyViewer
+      ? [{ id: 'telemetry', label: 'Live Telemetry' }]
+      : [
+          { id: 'telemetry', label: 'Live Telemetry' },
+          { id: 'dry-run', label: 'Dry Run' },
+          { id: 'ai-dry-run', label: 'AI Dry Run' },
+        ]
+  ), [readonlyViewer]);
 
   const setTab = (tab: AppTab) => {
+    if (readonlyViewer && tab !== 'telemetry') {
+      return;
+    }
     setActiveTab(tab);
     const hash = tab === 'dry-run'
       ? '#dry-run'
@@ -61,6 +73,11 @@ const Dashboard: React.FC = () => {
             ))}
           </div>
         </div>
+        {readonlyViewer && (
+          <div className="max-w-7xl mx-auto px-6 pb-3 text-[11px] uppercase tracking-wide text-amber-300">
+            Read-only external viewer mode aktif
+          </div>
+        )}
       </div>
 
       {activeTab === 'dry-run'
