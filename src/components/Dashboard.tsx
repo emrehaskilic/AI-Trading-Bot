@@ -21,11 +21,12 @@ const Dashboard: React.FC = () => {
 
   useEffect(() => {
     const onHashChange = () => {
-      setActiveTab(tabFromHash(window.location.hash));
+      const next = tabFromHash(window.location.hash);
+      setActiveTab(readonlyViewer ? 'telemetry' : next);
     };
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
-  }, []);
+  }, [readonlyViewer]);
 
   const tabs = useMemo<Array<{ id: AppTab; label: string }>>(() => (
     readonlyViewer
@@ -80,11 +81,20 @@ const Dashboard: React.FC = () => {
         )}
       </div>
 
-      {activeTab === 'dry-run'
-        ? <DryRunDashboard />
-        : activeTab === 'ai-dry-run'
-          ? <AIDryRunDashboard />
-          : <LiveTelemetryDashboard />}
+      <div className={activeTab === 'telemetry' ? 'block' : 'hidden'}>
+        <LiveTelemetryDashboard />
+      </div>
+
+      {!readonlyViewer && (
+        <>
+          <div className={activeTab === 'dry-run' ? 'block' : 'hidden'}>
+            <DryRunDashboard />
+          </div>
+          <div className={activeTab === 'ai-dry-run' ? 'block' : 'hidden'}>
+            <AIDryRunDashboard />
+          </div>
+        </>
+      )}
     </div>
   );
 };

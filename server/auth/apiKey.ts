@@ -145,6 +145,22 @@ export function apiKeyMiddleware(req: Request, res: Response, next: NextFunction
         return;
     }
 
+    // External read-only mode: allow unauthenticated reads for monitoring links.
+    if (EXTERNAL_READONLY_MODE && isReadOnlyMethod(req.method)) {
+        next();
+        return;
+    }
+
+    // External read-only mode: block all write methods from non-local clients.
+    if (EXTERNAL_READONLY_MODE && !isReadOnlyMethod(req.method)) {
+        res.status(403).json({
+            ok: false,
+            error: 'external_readonly_mode',
+            message: 'External access is read-only.',
+        });
+        return;
+    }
+
     if (isViewerTokenValid(req)) {
         if (!isReadOnlyMethod(req.method)) {
             res.status(403).json({
@@ -173,19 +189,14 @@ export function apiKeyMiddleware(req: Request, res: Response, next: NextFunction
         return;
     }
 
-    if (EXTERNAL_READONLY_MODE && !isReadOnlyMethod(req.method)) {
-        res.status(403).json({
-            ok: false,
-            error: 'external_readonly_mode',
-            message: 'External access is read-only.',
-        });
-        return;
-    }
-
     next();
 }
 
 export function validateWebSocketApiKey(req: IncomingMessage): { ok: boolean; reason?: string } {
+    if (EXTERNAL_READONLY_MODE) {
+        // Telemetry WS is read-only, so allow external viewers without token.
+        return { ok: true };
+    }
     if (isLocalRequest(req)) {
         return { ok: true };
     }
