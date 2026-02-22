@@ -179,22 +179,22 @@ export class StateExtractor {
     const chop = Number(snapshot.regimeMetrics.chopScore || 0);
     const volOfVol = Number(snapshot.regimeMetrics.volOfVol || 0);
 
-    if (volPercentile >= 90 || volOfVol >= 0.08) {
+    if (volPercentile >= 96 || volOfVol >= 0.11) {
       return {
         state: 'VOL_EXPANSION',
-        confidence: clamp(0.6 + Math.min(0.35, ((volPercentile - 90) / 10) + (volOfVol * 1.2)), 0, 1),
+        confidence: clamp(0.58 + Math.min(0.34, ((volPercentile - 96) / 4) + (volOfVol * 0.9)), 0, 1),
       };
     }
 
-    if (trend >= 0.58 && trend > chop + 0.08) {
-      return { state: 'TREND', confidence: clamp(0.55 + (trend - chop), 0, 1) };
+    if (trend >= 0.24 && trend > chop + 0.03) {
+      return { state: 'TREND', confidence: clamp(0.52 + (trend - chop) * 1.1, 0, 1) };
     }
 
-    if (chop >= 0.58 && chop > trend + 0.08) {
-      return { state: 'CHOP', confidence: clamp(0.55 + (chop - trend), 0, 1) };
+    if (chop >= 0.35 && chop > trend + 0.05) {
+      return { state: 'CHOP', confidence: clamp(0.52 + (chop - trend) * 1.1, 0, 1) };
     }
 
-    return { state: 'TRANSITION', confidence: 0.5 };
+    return { state: 'TRANSITION', confidence: 0.52 };
   }
 
   private classifyDerivatives(snapshot: AIMetricsSnapshot): { state: DerivativesState; confidence: number } {
@@ -206,28 +206,31 @@ export class StateExtractor {
       return { state: 'SQUEEZE_RISK', confidence: clamp(0.6 + Math.min(0.35, liqProxy * 0.5), 0, 1) };
     }
 
-    if (oiChange <= -0.12) {
+    if (oiChange <= -0.0015) {
       return {
         state: 'DELEVERAGING',
-        confidence: clamp(0.55 + Math.min(0.35, Math.abs(oiChange) / 1.4), 0, 1),
+        confidence: clamp(0.54 + Math.min(0.32, Math.abs(oiChange) / 0.012), 0, 1),
       };
     }
 
-    if (oiChange >= 0.08 && delta >= 0) {
+    if (oiChange >= 0.0012 && delta >= 0) {
       return {
         state: 'LONG_BUILD',
-        confidence: clamp(0.55 + Math.min(0.35, (oiChange / 1.2) + (Math.abs(delta) / 4_000)), 0, 1),
+        confidence: clamp(0.54 + Math.min(0.3, (oiChange / 0.01) + (Math.abs(delta) / 6_000)), 0, 1),
       };
     }
 
-    if (oiChange >= 0.08 && delta < 0) {
+    if (oiChange >= 0.0012 && delta < 0) {
       return {
         state: 'SHORT_BUILD',
-        confidence: clamp(0.55 + Math.min(0.35, (oiChange / 1.2) + (Math.abs(delta) / 4_000)), 0, 1),
+        confidence: clamp(0.54 + Math.min(0.3, (oiChange / 0.01) + (Math.abs(delta) / 6_000)), 0, 1),
       };
     }
 
-    return { state: 'DELEVERAGING', confidence: 0.45 };
+    if (delta >= 0) {
+      return { state: 'LONG_BUILD', confidence: 0.48 };
+    }
+    return { state: 'SHORT_BUILD', confidence: 0.48 };
   }
 
   private classifyToxicity(snapshot: AIMetricsSnapshot): { state: ToxicityState; confidence: number } {

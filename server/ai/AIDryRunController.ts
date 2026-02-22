@@ -16,11 +16,11 @@ const isEnabled = (value: string | undefined, fallback: boolean): boolean => {
 const DEFAULT_MIN_DECISION_INTERVAL_MS = 100;
 const DEFAULT_MAX_DECISION_INTERVAL_MS = 1000;
 const DEFAULT_DECISION_INTERVAL_MS = 250;
-const DEFAULT_STATE_CONFIDENCE_THRESHOLD = clamp(Number(process.env.AI_STATE_CONFIDENCE_THRESHOLD || 0.58), 0, 1);
+const DEFAULT_STATE_CONFIDENCE_THRESHOLD = clamp(Number(process.env.AI_STATE_CONFIDENCE_THRESHOLD || 0.5), 0, 1);
 const DEFAULT_MAX_STARTUP_WARMUP_MS = Math.max(0, Math.trunc(Number(process.env.AI_MAX_STARTUP_WARMUP_MS || 2000)));
 const DEFAULT_TREND_BREAK_CONFIRM_TICKS = Math.max(1, Math.trunc(clamp(Number(process.env.AI_TREND_BREAK_CONFIRM_TICKS || 6), 1, 12)));
 const DEFAULT_MIN_REDUCE_GAP_MS = Math.max(0, Math.trunc(Number(process.env.AI_MIN_REDUCE_GAP_MS || 30_000)));
-const REENTRY_COOLDOWN_BARS = Math.max(0, Math.trunc(Number(process.env.AI_REENTRY_COOLDOWN_BARS || 1)));
+const REENTRY_COOLDOWN_BARS = Math.max(0, Math.trunc(Number(process.env.AI_REENTRY_COOLDOWN_BARS || 0)));
 
 const STRICT_3M_MODE_ENABLED = isEnabled(process.env.AI_STRICT_3M_TREND_MODE, true);
 const BAR_MS = Math.max(1, Math.trunc(Number(process.env.AI_BAR_INTERVAL_MS || 180_000)));
@@ -770,9 +770,9 @@ export class AIDryRunController {
     const sideStrength = this.sideStrengthPct(side, dfsPct);
     if (state.regimeState !== 'TREND') return false;
     if (state.directionalBias !== side) return false;
-    if (state.volatilityPercentile >= 95) return false;
+    if (state.volatilityPercentile >= 96) return false;
     if (state.executionState !== 'HEALTHY') return false;
-    if (sideStrength <= 65) return false;
+    if (sideStrength <= 58) return false;
     if (this.isOpposingPressure(side, state)) return false;
     if (this.isCvdOpposingAccelerating(side, Number(snapshot.market.cvdSlope || 0), runtime.lastCvdSlope)) return false;
     return true;
@@ -814,9 +814,8 @@ export class AIDryRunController {
         return hold();
       }
       if (state.flowState === 'EXHAUSTION') return hold();
-      if (state.derivativesState === 'DELEVERAGING') return hold();
       if (state.toxicityState === 'TOXIC') return hold();
-      if (state.volatilityPercentile >= 92) return hold();
+      if (state.volatilityPercentile >= 95) return hold();
       if (runtime.lastCloseBarId === barId && runtime.lastClosedSide && runtime.lastClosedSide !== trendSide) return hold();
       if (runtime.lastClosedSide && runtime.lastClosedSide !== trendSide) {
         const reversalStrength = this.sideStrengthPct(trendSide, dfsPct);
@@ -863,14 +862,19 @@ export class AIDryRunController {
 
     const reverseAddBlockActive = runtime.lastReversalEntryBarId >= 0 && (barId - runtime.lastReversalEntryBarId) < REVERSE_ADD_BLOCK_BARS;
     const exposureRoom = currentNotional < (maxExposureNotional - 1e-6);
+    const sideStrength = this.sideStrengthPct(side, dfsPct);
+    const prevStrength = this.sideStrengthPct(side, runtime.lastDfsPct);
+    const cvdAligned =
+      (side === 'LONG' && Number(snapshot.market.cvdSlope || 0) > 0)
+      || (side === 'SHORT' && Number(snapshot.market.cvdSlope || 0) < 0);
 
     if (Number(position.unrealizedPnlPct || 0) < 0) {
       const directionalAligned = state.directionalBias === side;
       const canDca =
         directionalAligned
         && state.flowState === 'ABSORPTION'
-        && state.derivativesState !== 'DELEVERAGING'
-        && state.volatilityPercentile < 90
+        && state.derivativesState !== 'SQUEEZE_RISK'
+        && state.volatilityPercentile < 92
         && !slippageHard
         && !toxicityHard
         && runtime.dcaCount < DCA_MAX_COUNT
@@ -888,22 +892,43 @@ export class AIDryRunController {
       }
     }
 
+    const pullbackAddEligible =
+      state.regimeState === 'TREND'
+      && state.directionalBias === side
+      && state.flowState === 'ABSORPTION'
+      && cvdAligned
+      && state.derivativesState !== 'SQUEEZE_RISK'
+      && state.volatilityPercentile < 93
+      && sideStrength >= 58
+      && sideStrength >= (prevStrength - 5)
+      && Number(position.unrealizedPnlPct || 0) >= -0.01
+      && runtime.pyramidCount < PYRAMID_MAX_COUNT
+      && (runtime.lastPyramidBarId < 0 || (barId - runtime.lastPyramidBarId) >= PYRAMID_BAR_GAP)
+      && !reverseAddBlockActive
+      && exposureRoom
+      && executionHealthyForOpen;
+
+    if (pullbackAddEligible) {
+      return {
+        intent: 'ADD',
+        side,
+        riskMultiplier: 0.2,
+        confidence: clamp(state.stateConfidence, 0.54, 0.94),
+      };
+    }
+
     if (Number(position.unrealizedPnlPct || 0) > 0) {
       const derivativesSideBuild = state.derivativesState === (side === 'LONG' ? 'LONG_BUILD' : 'SHORT_BUILD');
-      const cvdAligned =
-        (side === 'LONG' && Number(snapshot.market.cvdSlope || 0) > 0)
-        || (side === 'SHORT' && Number(snapshot.market.cvdSlope || 0) < 0);
-      const prevStrength = this.sideStrengthPct(side, runtime.lastDfsPct);
-      const currStrength = this.sideStrengthPct(side, dfsPct);
-      const dfsIncreasing = currStrength > (prevStrength + 0.5);
+      const currStrength = sideStrength;
+      const dfsSupportive = currStrength >= Math.max(58, prevStrength - 2);
 
       const canPyramid =
         state.regimeState === 'TREND'
         && state.flowState === 'EXPANSION'
-        && dfsIncreasing
+        && dfsSupportive
         && cvdAligned
         && derivativesSideBuild
-        && state.volatilityPercentile < 90
+        && state.volatilityPercentile < 92
         && runtime.pyramidCount < PYRAMID_MAX_COUNT
         && (runtime.lastPyramidBarId < 0 || (barId - runtime.lastPyramidBarId) >= PYRAMID_BAR_GAP)
         && !reverseAddBlockActive
@@ -929,10 +954,10 @@ export class AIDryRunController {
   ): StrategySide | null {
     const bias = state.directionalBias;
     if (state.regimeState !== 'TREND') return null;
-    if (state.volatilityPercentile >= 95) return null;
+    if (state.volatilityPercentile >= 96) return null;
     if (bias !== 'LONG' && bias !== 'SHORT') return null;
     const strength = this.sideStrengthPct(bias, dfsPct);
-    return strength > 65 ? bias : null;
+    return strength > 58 ? bias : null;
   }
 
   private isReverseExitSignal(
