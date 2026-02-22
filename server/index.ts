@@ -1647,6 +1647,32 @@ function broadcastMetrics(
             : null,
     });
     const advancedBundle = precomputed?.advancedBundle ?? advancedMicro.getMetrics(now);
+    const strategyPosition = dryRunSession.getStrategyPosition(s);
+    const hasOpenStrategyPosition = Boolean(
+        strategyPosition
+        && (strategyPosition.side === 'LONG' || strategyPosition.side === 'SHORT')
+        && Number(strategyPosition.qty || 0) > 0
+    );
+    const trendSignal = aiTrend?.side === 'LONG' || aiTrend?.side === 'SHORT'
+        ? `TREND_${aiTrend.side}`
+        : null;
+    const entryAction = Array.isArray(decision?.actions)
+        ? decision.actions.find((action: any) => action?.type === 'ENTRY' || action?.type === 'ADD')
+        : null;
+    const entrySignal = entryAction?.side === 'LONG' || entryAction?.side === 'SHORT'
+        ? `ENTRY_${entryAction.side}`
+        : null;
+    const signal = hasOpenStrategyPosition
+        ? `POSITION_${strategyPosition!.side}`
+        : (trendSignal || entrySignal || null);
+    const signalScore = hasOpenStrategyPosition
+        ? 100
+        : trendSignal
+            ? Math.round(clampNumber(Number(aiTrend?.score || 0) * 100, 0, 100))
+            : Math.round(clampNumber(Number(decision?.dfsPercentile || 0) * 100, 0, 100));
+    const signalVeto = signal
+        ? null
+        : (bf.vetoReason || (aiTrend ? 'TREND_NEUTRAL' : 'NO_SIGNAL'));
 
     const payload: any = {
         type: 'metrics',
@@ -1672,17 +1698,30 @@ function broadcastMetrics(
             breakConfirm: aiTrend.breakConfirm,
             source: aiTrend.source,
         } : null,
+        strategyPosition: hasOpenStrategyPosition
+            ? {
+                side: strategyPosition!.side,
+                qty: Number(strategyPosition!.qty || 0),
+                entryPrice: Number(strategyPosition!.entryPrice || 0),
+                unrealizedPnlPct: Number(strategyPosition!.unrealizedPnlPct || 0),
+                addsUsed: Number(strategyPosition!.addsUsed || 0),
+                timeInPositionMs: Number(strategyPosition!.timeInPositionMs || 0),
+            }
+            : null,
         legacyMetrics: legacyM,
         orderbookIntegrity: integrity,
-        signalDisplay: decision
-            ? {
-                regime: decision.regime,
-                dfsPercentile: decision.dfsPercentile,
-                actions: decision.actions,
-                reasons: decision.reasons,
-                gatePassed: decision.gatePassed,
-            }
-            : { signal: null, score: 0, vetoReason: bf.vetoReason || 'NO_SIGNAL', candidate: null },
+        signalDisplay: {
+            signal,
+            score: signalScore,
+            confidence: signalScore >= 75 ? 'HIGH' : signalScore >= 50 ? 'MEDIUM' : 'LOW',
+            vetoReason: signalVeto,
+            candidate: null,
+            regime: decision?.regime ?? null,
+            dfsPercentile: decision?.dfsPercentile ?? null,
+            actions: decision?.actions ?? [],
+            reasons: decision?.reasons ?? [],
+            gatePassed: Boolean(decision?.gatePassed),
+        },
         advancedMetrics: {
             sweepFadeScore: decision?.dfsPercentile || 0,
             breakoutScore: decision?.dfsPercentile || 0,

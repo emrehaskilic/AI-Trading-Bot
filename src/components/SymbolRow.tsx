@@ -27,6 +27,7 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
     bids,
     asks,
     aiTrend,
+    strategyPosition,
     liquidityMetrics,
     passiveFlowMetrics,
     derivativesMetrics,
@@ -102,18 +103,34 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
     if (hours > 0) return `${hours}h ${mins}m`;
     return `${mins}m`;
   };
+  const positionSide = strategyPosition?.side ?? null;
   const trendSide = aiTrend?.side ?? null;
+  const effectiveSide = positionSide || trendSide;
   const trendScorePct = aiTrend ? Math.round(Math.max(0, Math.min(1, Number(aiTrend.score || 0))) * 100) : null;
-  const trendLabel = trendSide || 'NEUTRAL';
-  const trendClass = !aiTrend
-    ? 'bg-zinc-800 text-zinc-500 border-zinc-700'
-    : !aiTrend.intact
-      ? 'bg-amber-900/30 text-amber-300 border-amber-700/40'
-      : trendSide === 'LONG'
-        ? 'bg-green-900/25 text-green-300 border-green-700/40'
-        : trendSide === 'SHORT'
-          ? 'bg-red-900/25 text-red-300 border-red-700/40'
-          : 'bg-zinc-800 text-zinc-300 border-zinc-700';
+  const trendDisplayScore = positionSide ? 100 : (trendScorePct ?? 0);
+  const trendLabel = effectiveSide || 'NEUTRAL';
+  const trendClass = positionSide
+    ? (positionSide === 'LONG'
+      ? 'bg-green-900/35 text-green-200 border-green-700/50'
+      : 'bg-red-900/35 text-red-200 border-red-700/50')
+    : !aiTrend
+      ? 'bg-zinc-800 text-zinc-500 border-zinc-700'
+      : !aiTrend.intact
+        ? 'bg-amber-900/30 text-amber-300 border-amber-700/40'
+        : trendSide === 'LONG'
+          ? 'bg-green-900/25 text-green-300 border-green-700/40'
+          : trendSide === 'SHORT'
+            ? 'bg-red-900/25 text-red-300 border-red-700/40'
+            : 'bg-zinc-800 text-zinc-300 border-zinc-700';
+  const displaySignal = positionSide
+    ? `POSITION_${positionSide}` as const
+    : (data.signalDisplay?.signal || (trendSide ? `TREND_${trendSide}` as const : null));
+  const displaySignalScore = positionSide
+    ? 100
+    : Number.isFinite(Number(data.signalDisplay?.score))
+      ? Number(data.signalDisplay?.score)
+      : (trendScorePct ?? 0);
+  const displaySignalReason = positionSide ? null : (data.signalDisplay?.vetoReason || null);
   const posNegClass = (n: number) => (n > 0 ? 'text-emerald-300' : n < 0 ? 'text-rose-300' : 'text-zinc-200');
   const asNumber = (v: unknown): number | null => (Number.isFinite(Number(v)) ? Number(v) : null);
   const fmt = (v: unknown, d = 2) => {
@@ -157,9 +174,9 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
           </button>
           <span className="font-bold text-white text-sm truncate">{symbol}</span>
           <span className="text-[8px] px-1 py-0.5 bg-zinc-800 text-zinc-500 rounded flex-shrink-0 uppercase tracking-tighter">PERP</span>
-          {aiTrend && (
+          {(aiTrend || positionSide) && (
             <span className={`text-[8px] px-1 py-0.5 rounded border flex-shrink-0 uppercase tracking-tight ${trendClass}`}>
-              TR {trendLabel} {trendScorePct}
+              {positionSide ? 'POS' : 'TR'} {trendLabel} {trendDisplayScore}
             </span>
           )}
         </div>
@@ -214,17 +231,17 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
 
         {/* Signal Column */}
         <div className="flex items-center justify-center">
-          {data.signalDisplay?.signal ? (
-            <div className={`px-2 py-0.5 rounded text-[10px] font-bold border flex flex-col items-center ${data.signalDisplay.signal.includes('LONG')
+          {displaySignal ? (
+            <div className={`px-2 py-0.5 rounded text-[10px] font-bold border flex flex-col items-center ${displaySignal.includes('LONG')
               ? 'bg-emerald-900/20 text-emerald-300 border-emerald-700/30'
               : 'bg-rose-900/20 text-rose-300 border-rose-700/30'
               }`}>
-              {data.signalDisplay.signal.split('_')[0]}
-              <span className="text-[8px] opacity-70">SCR: {data.signalDisplay.score}</span>
+              {displaySignal.split('_')[1] || displaySignal}
+              <span className="text-[8px] opacity-70">SCR: {Math.round(displaySignalScore)}</span>
             </div>
           ) : (
             <span className="text-[9px] text-zinc-600 uppercase tracking-tighter truncate max-w-[80px]">
-              {data.signalDisplay?.vetoReason || 'MONITORING'}
+              {displaySignalReason || 'MONITORING'}
             </span>
           )}
         </div>
@@ -548,20 +565,20 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <div className="bg-black/20 p-3 rounded border border-zinc-800/50">
                   <div className="text-[9px] text-zinc-600 mb-1 uppercase">Current Signal</div>
-                  <div className={`text-lg font-bold ${data.signalDisplay?.signal ? (data.signalDisplay.signal.includes('LONG') ? 'text-green-400' : 'text-red-400') : 'text-zinc-700'}`}>
-                    {data.signalDisplay?.signal || 'NONE'}
+                  <div className={`text-lg font-bold ${displaySignal ? (displaySignal.includes('LONG') ? 'text-green-400' : 'text-red-400') : 'text-zinc-700'}`}>
+                    {displaySignal || 'NONE'}
                   </div>
                 </div>
                 <div className="bg-black/20 p-3 rounded border border-zinc-800/50">
                   <div className="text-[9px] text-zinc-600 mb-1 uppercase">Signal Score</div>
                   <div className="text-lg font-mono font-bold text-white">
-                    {data.signalDisplay?.score || 0}%
+                    {Math.round(displaySignalScore)}%
                   </div>
                 </div>
                 <div className="bg-black/20 p-3 rounded border border-zinc-800/50">
                   <div className="text-[9px] text-zinc-600 mb-1 uppercase">Status / Veto</div>
                   <div className="text-xs font-mono text-zinc-400">
-                    {data.signalDisplay?.vetoReason || 'READY'}
+                    {displaySignalReason || 'READY'}
                   </div>
                 </div>
                 <div className="bg-black/20 p-3 rounded border border-zinc-800/50">

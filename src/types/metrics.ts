@@ -1,5 +1,16 @@
 export interface SignalDisplay {
-  signal: 'SWEEP_FADE_LONG' | 'SWEEP_FADE_SHORT' | 'BREAKOUT_LONG' | 'BREAKOUT_SHORT' | null;
+  signal:
+    | 'SWEEP_FADE_LONG'
+    | 'SWEEP_FADE_SHORT'
+    | 'BREAKOUT_LONG'
+    | 'BREAKOUT_SHORT'
+    | 'ENTRY_LONG'
+    | 'ENTRY_SHORT'
+    | 'TREND_LONG'
+    | 'TREND_SHORT'
+    | 'POSITION_LONG'
+    | 'POSITION_SHORT'
+    | null;
   score: number;
   confidence?: 'LOW' | 'MEDIUM' | 'HIGH';
   vetoReason: string | null;
@@ -13,6 +24,15 @@ export interface SignalDisplay {
     contributions: Record<string, number>;
     timeframeMultipliers: Record<string, number>;
   };
+}
+
+export interface StrategyPositionSnapshot {
+  side: 'LONG' | 'SHORT';
+  qty: number;
+  entryPrice: number;
+  unrealizedPnlPct: number;
+  addsUsed: number;
+  timeInPositionMs: number;
 }
 
 export interface SnapshotMetadata {
@@ -210,6 +230,7 @@ export interface MetricsMessage {
     reconnectRecommended: boolean;
   };
   signalDisplay: SignalDisplay;
+  strategyPosition?: StrategyPositionSnapshot | null;
   advancedMetrics: {
     sweepFadeScore: number;
     breakoutScore: number;

@@ -27,17 +27,26 @@ const MobileSymbolCard: React.FC<MobileSymbolCardProps> = ({ symbol, metrics, sh
 
   const lm = metrics.legacyMetrics;
   const trend = metrics.aiTrend || null;
-  const trendSide = trend?.side || 'NEUTRAL';
-  const trendScorePct = trend ? Math.round(Math.max(0, Math.min(1, Number(trend.score || 0))) * 100) : null;
-  const trendClass = !trend
-    ? 'bg-zinc-800 text-zinc-500 border-zinc-700'
-    : !trend.intact
-      ? 'bg-amber-900/30 text-amber-300 border-amber-700/40'
-      : trend.side === 'LONG'
-        ? 'bg-emerald-900/25 text-emerald-300 border-emerald-700/40'
-        : trend.side === 'SHORT'
-          ? 'bg-rose-900/25 text-rose-300 border-rose-700/40'
-          : 'bg-zinc-800 text-zinc-300 border-zinc-700';
+  const positionSide = metrics.strategyPosition?.side || null;
+  const trendSide = positionSide || trend?.side || 'NEUTRAL';
+  const trendScorePct = positionSide
+    ? 100
+    : trend
+      ? Math.round(Math.max(0, Math.min(1, Number(trend.score || 0))) * 100)
+      : null;
+  const trendClass = positionSide
+    ? (positionSide === 'LONG'
+      ? 'bg-emerald-900/35 text-emerald-200 border-emerald-700/50'
+      : 'bg-rose-900/35 text-rose-200 border-rose-700/50')
+    : !trend
+      ? 'bg-zinc-800 text-zinc-500 border-zinc-700'
+      : !trend.intact
+        ? 'bg-amber-900/30 text-amber-300 border-amber-700/40'
+        : trend.side === 'LONG'
+          ? 'bg-emerald-900/25 text-emerald-300 border-emerald-700/40'
+          : trend.side === 'SHORT'
+            ? 'bg-rose-900/25 text-rose-300 border-rose-700/40'
+            : 'bg-zinc-800 text-zinc-300 border-zinc-700';
 
   const posNegClass = (n: number) => (n > 0 ? 'text-emerald-300' : n < 0 ? 'text-rose-300' : 'text-zinc-300');
   const fmt = (v: unknown, d = 2) => (Number.isFinite(Number(v)) ? Number(v).toFixed(d) : '-');
@@ -62,10 +71,10 @@ const MobileSymbolCard: React.FC<MobileSymbolCardProps> = ({ symbol, metrics, sh
           <div>
             <div className="text-base sm:text-lg font-bold text-white">{symbol}</div>
             <div className="text-sm text-zinc-200 font-mono">${lm.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
-            {trend && (
+            {(trend || positionSide) && (
               <div className="mt-1">
                 <span className={`text-[10px] px-1.5 py-0.5 rounded border uppercase tracking-tight ${trendClass}`}>
-                  Trend {trendSide} {trendScorePct}
+                  {positionSide ? 'Position' : 'Trend'} {trendSide} {trendScorePct ?? 0}
                 </span>
               </div>
             )}
