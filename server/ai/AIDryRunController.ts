@@ -15,6 +15,7 @@ const DEFAULT_DECISION_INTERVAL_MS = 250;
 const DEFAULT_STATE_CONFIDENCE_THRESHOLD = clamp(Number(process.env.AI_STATE_CONFIDENCE_THRESHOLD || 0.58), 0, 1);
 const DEFAULT_MAX_STARTUP_WARMUP_MS = Math.max(0, Math.trunc(Number(process.env.AI_MAX_STARTUP_WARMUP_MS || 2000)));
 const DEFAULT_TREND_BREAK_CONFIRM_TICKS = Math.max(1, Math.trunc(clamp(Number(process.env.AI_TREND_BREAK_CONFIRM_TICKS || 3), 1, 8)));
+const DEFAULT_MIN_REDUCE_GAP_MS = Math.max(0, Math.trunc(Number(process.env.AI_MIN_REDUCE_GAP_MS || 30_000)));
 
 type RuntimeSymbolState = {
   firstSeenTs: number;
@@ -27,6 +28,7 @@ type RuntimeSymbolState = {
   latestTrend: AITrendStatus | null;
   trendBreakStreak: number;
   lastTrendBreakTs: number;
+  lastReduceTs: number;
 };
 
 const HARD_RISK_REASONS = new Set<string>([
@@ -319,6 +321,23 @@ export class AIDryRunController {
       } else {
         runtime.trendBreakStreak = 0;
         runtime.lastTrendBreakTs = 0;
+        runtime.lastReduceTs = 0;
+      }
+
+      if (snapshot.position && finalDecision.intent === 'REDUCE') {
+        const hardRisk = finalDecision.reasons.some((reason) => HARD_RISK_REASONS.has(reason));
+        if (!hardRisk && runtime.lastReduceTs > 0 && DEFAULT_MIN_REDUCE_GAP_MS > 0) {
+          const elapsed = Math.max(0, nowMs - runtime.lastReduceTs);
+          if (elapsed < DEFAULT_MIN_REDUCE_GAP_MS) {
+            finalDecision = {
+              ...finalDecision,
+              intent: 'HOLD',
+              side: null,
+              reducePct: null,
+              reasons: [...finalDecision.reasons, 'REDUCE_COOLDOWN'],
+            };
+          }
+        }
       }
 
       const decision = this.buildStrategyDecision(snapshot, finalDecision, {
@@ -601,6 +620,7 @@ export class AIDryRunController {
         latestTrend: null,
         trendBreakStreak: 0,
         lastTrendBreakTs: 0,
+        lastReduceTs: 0,
       };
       this.runtime.set(symbol, state);
     }
@@ -622,6 +642,9 @@ export class AIDryRunController {
         runtime.holdSamples += 1;
         runtime.holdStartTs = 0;
       }
+    }
+    if (intent === 'REDUCE') {
+      runtime.lastReduceTs = nowMs;
     }
     runtime.lastIntent = intent;
   }

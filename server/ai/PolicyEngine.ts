@@ -348,9 +348,12 @@ export class PolicyEngine {
       && sameBias
       && state.executionState !== 'LOW_RESILIENCY';
 
-    const hardRisk =
+    const lowExecutionRisk =
       state.executionState === 'LOW_RESILIENCY'
-      || state.volatilityPercentile >= 97;
+      && (state.expectedSlippageBps >= 8 || state.spreadBps >= 12);
+    const hardRisk =
+      state.volatilityPercentile >= 97
+      || lowExecutionRisk;
 
     if (hardRisk) {
       return {

@@ -1156,15 +1156,18 @@ function evaluateLiveReadiness(symbol: string) {
     // If we just resynced, give it time (MIN_RESYNC_INTERVAL check handles throttle)
     const dataFlowing = (now - meta.lastDepthMsgTs) < GRACE_PERIOD_MS;
 
-    // Primary Condition: Fresh Snapshot + Populated Book
-    // Secondary Condition: Data is flowing OR we are within throttle window (just restarted)
-    const isLiveCondition = snapshotFresh && hasBook;
+    // Consider book "live" when it is populated and either:
+    // - recent depth updates are flowing, or
+    // - a fresh snapshot was just applied.
+    // This avoids forced resync loops every snapshot TTL when depth is healthy.
+    const isLiveCondition = hasBook && (dataFlowing || snapshotFresh);
 
     if (isLiveCondition) {
         // We look good foundationally. Check data flow.
         if (ob.uiState !== 'LIVE') {
             transitionOrderbookState(symbol, 'LIVE', 'live_criteria_met', {
                 fresh: snapshotFresh,
+                dataFlowing,
                 dataLag: now - meta.lastDepthMsgTs
             });
         }
@@ -1181,6 +1184,7 @@ function evaluateLiveReadiness(symbol: string) {
             // Only transition if we are actually going to fetch
             transitionOrderbookState(symbol, 'RESYNCING', 'live_criteria_failed_throttled', {
                 fresh: snapshotFresh,
+                dataFlowing,
                 dataLag: now - meta.lastDepthMsgTs,
                 hasBook,
                 timeSinceResync

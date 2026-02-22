@@ -133,8 +133,10 @@ type ActiveTrade = {
   entryTimeMs: number;
   entryPrice: number;
   qty: number;
+  maxQtySeen: number;
   notional: number;
   marginUsed: number;
+  maxMarginUsed: number;
   leverage: number;
   pnlRealized: number;
   feeAcc: number;
@@ -294,6 +296,9 @@ const DEFAULT_MAX_SPREAD_PCT = clampNumber(process.env.MAX_SPREAD_PCT, 0.0008, 0
 const DEFAULT_AI_MAX_MARGIN_USAGE_PCT = clampNumber(process.env.AI_MAX_MARGIN_USAGE_PCT, 0.85, 0.3, 0.98);
 const DEFAULT_AI_MAX_POSITION_NOTIONAL = clampNumber(process.env.AI_MAX_POSITION_NOTIONAL_USDT, DEFAULT_MAX_NOTIONAL, 10, 10_000_000);
 const DEFAULT_AI_DAILY_LOSS_LOCK_PCT = clampNumber(process.env.AI_DAILY_LOSS_LOCK_PCT, 0.05, 0.005, 0.5);
+const DEFAULT_AI_DUST_MIN_NOTIONAL_USDT = clampNumber(process.env.AI_DUST_MIN_NOTIONAL_USDT, 5, 0.1, 1_000);
+const DEFAULT_AI_DUST_MIN_QTY = clampNumber(process.env.AI_DUST_MIN_QTY, 0.000001, 0.0000001, 0.01);
+const DEFAULT_AI_MIN_REDUCE_NOTIONAL_USDT = clampNumber(process.env.AI_MIN_REDUCE_NOTIONAL_USDT, 15, 0.1, 1_000);
 
 function parseLimitStrategy(input: string): LimitStrategyMode {
   switch (input) {
@@ -947,19 +952,39 @@ export class DryRunSessionService {
       }
 
       if (action.type === StrategyActionType.REDUCE && position) {
+        const referencePrice = Number(action.expectedPrice) || session.latestMarkPrice || position.entryPrice || 0;
+        const fullQty = roundTo(position.qty, 6);
+        if (!(fullQty > 0)) continue;
         const reducePct = clampNumber(Number(action.reducePct ?? 0.5), 0.5, 0.1, 1);
-        const reduceQty = roundTo(position.qty * reducePct, 6);
+        let reduceQty = roundTo(fullQty * reducePct, 6);
+        const residualQty = roundTo(Math.max(0, fullQty - Math.max(0, reduceQty)), 6);
+        const reduceNotional = Math.max(0, reduceQty * Math.max(referencePrice, 0));
+        const residualNotional = Math.max(0, residualQty * Math.max(referencePrice, 0));
+        const forceFullClose =
+          !(reduceQty > 0)
+          || reduceQty >= fullQty
+          || residualQty <= DEFAULT_AI_DUST_MIN_QTY
+          || (residualNotional > 0 && residualNotional <= DEFAULT_AI_DUST_MIN_NOTIONAL_USDT)
+          || (reduceNotional > 0 && reduceNotional < DEFAULT_AI_MIN_REDUCE_NOTIONAL_USDT);
+        if (forceFullClose) {
+          reduceQty = fullQty;
+        }
         if (!(reduceQty > 0)) continue;
         const reduceOrder = this.buildAiLimitOrder(
           session,
           position.side === 'LONG' ? 'SELL' : 'BUY',
           reduceQty,
           true,
-          'AI_REDUCE'
+          forceFullClose ? 'AI_EXIT' : 'AI_REDUCE'
         );
         if (reduceOrder) {
           queueOrder(reduceOrder);
-          this.addConsoleLog('INFO', normalized, `AI reduce ${position.side} -${reduceQty} (${(reducePct * 100).toFixed(0)}%)`, session.lastEventTimestampMs);
+          if (forceFullClose) {
+            session.pendingExitReason = action.reason || session.pendingExitReason || 'AI_DUST_FLATTEN';
+            this.addConsoleLog('INFO', normalized, `AI reduce escalated to full exit for ${position.side} (dust guard)`, session.lastEventTimestampMs);
+          } else {
+            this.addConsoleLog('INFO', normalized, `AI reduce ${position.side} -${reduceQty} (${(reducePct * 100).toFixed(0)}%)`, session.lastEventTimestampMs);
+          }
         }
         continue;
       }
@@ -1185,24 +1210,20 @@ export class DryRunSessionService {
         session.lossStreak += 1;
         session.winStreak = 0;
       }
-      const equity = session.lastState.walletBalance + this.computeUnrealizedPnl(session);
-      session.performance.recordTrade({
-        realizedPnl: out.log.realizedPnl,
-        equity,
-      });
-      session.lastPerfTs = eventTimestampMs;
 
       if (this.alertService && out.log.realizedPnl <= -DEFAULT_LARGE_LOSS_ALERT) {
         this.alertService.send('LARGE_LOSS', `${symbol}: realized PnL ${roundTo(out.log.realizedPnl, 2)} USDT`, 'HIGH');
       }
     }
 
-    if (out.log.realizedPnl === 0) {
-      const equity = session.lastState.walletBalance + this.computeUnrealizedPnl(session);
-      if (session.lastPerfTs === 0 || (eventTimestampMs - session.lastPerfTs) >= DEFAULT_PERF_SAMPLE_MS) {
-        session.performance.recordEquity(equity);
-        session.lastPerfTs = eventTimestampMs;
-      }
+    const equity = session.lastState.walletBalance + this.computeUnrealizedPnl(session);
+    if (
+      session.lastPerfTs === 0
+      || (eventTimestampMs - session.lastPerfTs) >= DEFAULT_PERF_SAMPLE_MS
+      || out.log.realizedPnl !== 0
+    ) {
+      session.performance.recordEquity(equity);
+      session.lastPerfTs = eventTimestampMs;
     }
 
     if (prevPosition && !out.state.position && session.activeSignal) {
@@ -1488,6 +1509,24 @@ export class DryRunSessionService {
     }
 
     const position = state.position;
+    if (this.shouldForceAIDustCleanup(session, position, markPrice)) {
+      const closeQty = roundTo(position.qty, 6);
+      if (closeQty > 0) {
+        const closeOrder = this.buildAiLimitOrder(
+          session,
+          position.side === 'LONG' ? 'SELL' : 'BUY',
+          closeQty,
+          true,
+          'AI_EXIT'
+        );
+        if (closeOrder) {
+          orders.push(closeOrder);
+          session.pendingExitReason = 'AI_DUST_FLATTEN';
+          this.addConsoleLog('INFO', session.symbol, `Dust cleanup queued (${position.side} ${closeQty})`, eventTimestampMs);
+          return orders;
+        }
+      }
+    }
     this.ensureWinnerState(session, position, markPrice);
     const positionHoldMs = this.computePositionTimeInMs(session, eventTimestampMs);
     const winnerDecision = this.winnerManager.update(session.winnerState as WinnerState, {
@@ -1722,8 +1761,10 @@ export class DryRunSessionService {
       entryTimeMs: eventTimestampMs,
       entryPrice,
       qty,
+      maxQtySeen: qty,
       notional,
       marginUsed,
+      maxMarginUsed: marginUsed,
       leverage,
       pnlRealized: 0,
       feeAcc: openingFee,
@@ -1768,7 +1809,9 @@ export class DryRunSessionService {
     const feeUsdt = trade.feeAcc;
     const fundingUsdt = trade.fundingAcc;
     const net = realized - feeUsdt + fundingUsdt;
-    const returnPct = trade.marginUsed > 0 ? (net / trade.marginUsed) * 100 : null;
+    const reportedQty = Math.max(0, Number(trade.maxQtySeen || trade.qty || qty));
+    const marginBase = Math.max(0, Number(trade.maxMarginUsed || trade.marginUsed || 0));
+    const returnPct = marginBase > 0 ? (net / marginBase) * 100 : null;
     const rMultiple = this.computeRMultiple(trade, net);
 
     this.logTradeEvent({
@@ -1781,7 +1824,7 @@ export class DryRunSessionService {
       entryTimeMs: trade.entryTimeMs,
       entryPrice: trade.entryPrice,
       exitPrice,
-      qty: trade.qty || qty,
+      qty: reportedQty > 0 ? reportedQty : qty,
       reason,
       durationMs: Math.max(0, eventTimestampMs - trade.entryTimeMs),
       pnl: {
@@ -1796,6 +1839,13 @@ export class DryRunSessionService {
       orderflow: trade.orderflow,
       candidate: trade.candidate ?? null,
     });
+
+    const equity = session.lastState.walletBalance + this.computeUnrealizedPnl(session);
+    session.performance.recordTrade({
+      realizedPnl: net,
+      equity,
+    });
+    session.lastPerfTs = eventTimestampMs;
 
     session.currentTrade = null;
     session.pendingExitReason = null;
@@ -1812,8 +1862,10 @@ export class DryRunSessionService {
     session.currentTrade.side = position.side;
     session.currentTrade.entryPrice = entryPrice;
     session.currentTrade.qty = qty;
+    session.currentTrade.maxQtySeen = Math.max(Number(session.currentTrade.maxQtySeen || 0), qty);
     session.currentTrade.notional = notional;
     session.currentTrade.marginUsed = marginUsed;
+    session.currentTrade.maxMarginUsed = Math.max(Number(session.currentTrade.maxMarginUsed || 0), marginUsed);
     session.currentTrade.leverage = leverage;
   }
 
@@ -1841,8 +1893,9 @@ export class DryRunSessionService {
 
   private computeRMultiple(trade: ActiveTrade, net: number): number | null {
     const sl = trade.candidate?.slPrice;
-    if (!Number.isFinite(sl) || !(trade.qty > 0)) return null;
-    const risk = Math.abs(trade.entryPrice - Number(sl)) * trade.qty;
+    const qty = Math.max(Number(trade.maxQtySeen || 0), Number(trade.qty || 0));
+    if (!Number.isFinite(sl) || !(qty > 0)) return null;
+    const risk = Math.abs(trade.entryPrice - Number(sl)) * qty;
     if (!(risk > 0)) return null;
     return net / risk;
   }
@@ -1864,8 +1917,10 @@ export class DryRunSessionService {
       entryTimeMs: eventTimestampMs,
       entryPrice,
       qty: size,
+      maxQtySeen: size,
       notional,
       marginUsed,
+      maxMarginUsed: marginUsed,
       leverage,
       pnlRealized: 0,
       feeAcc: 0,
@@ -1893,8 +1948,10 @@ export class DryRunSessionService {
       entryTimeMs: eventTimestampMs,
       entryPrice,
       qty: size,
+      maxQtySeen: size,
       notional,
       marginUsed,
+      maxMarginUsed: marginUsed,
       leverage,
       pnlRealized: 0,
       feeAcc: 0,
@@ -2120,6 +2177,25 @@ export class DryRunSessionService {
       ttlMs,
       reasonCode,
     };
+  }
+
+  private shouldForceAIDustCleanup(
+    session: SymbolSession,
+    position: NonNullable<DryRunStateSnapshot['position']>,
+    markPrice: number
+  ): boolean {
+    if (!this.isAIAutonomousRun()) return false;
+    const hasOpenReduceOnly = session.lastState.openLimitOrders.some((o) => Boolean(o.reduceOnly));
+    const hasQueuedReduceOnly = session.manualOrders.some((o) => Boolean(o.reduceOnly));
+    if (hasOpenReduceOnly || hasQueuedReduceOnly) return false;
+
+    const qty = Math.max(0, Number(position.qty || 0));
+    if (!(qty > 0)) return false;
+    const priceRef = Math.max(0, Number(markPrice || 0), Number(position.entryPrice || 0));
+    const notional = qty * priceRef;
+    if (qty <= DEFAULT_AI_DUST_MIN_QTY) return true;
+    if (notional > 0 && notional <= DEFAULT_AI_DUST_MIN_NOTIONAL_USDT) return true;
+    return false;
   }
 
   private isAiExecutionHealthy(session: SymbolSession): boolean {
