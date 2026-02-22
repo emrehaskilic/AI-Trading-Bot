@@ -33,8 +33,10 @@ export class DirectionLock {
   private readonly confirmationTtlMs: number;
 
   constructor(input?: { minFlipCooldownMs?: number; confirmationTtlMs?: number }) {
-    this.minFlipCooldownMs = Math.max(0, Number(input?.minFlipCooldownMs ?? process.env.AI_DIRECTION_LOCK_COOLDOWN_MS ?? 90_000));
-    this.confirmationTtlMs = Math.max(1, Number(input?.confirmationTtlMs ?? process.env.AI_DIRECTION_LOCK_CONFIRM_TTL_MS ?? 60_000));
+    const minCooldown = Math.max(0, Number(input?.minFlipCooldownMs ?? process.env.AI_DIRECTION_LOCK_COOLDOWN_MS ?? 480_000));
+    const rawTtl = Number(input?.confirmationTtlMs ?? process.env.AI_DIRECTION_LOCK_CONFIRM_TTL_MS ?? 600_000);
+    this.minFlipCooldownMs = minCooldown;
+    this.confirmationTtlMs = Math.max(minCooldown + 60_000, Math.max(1, rawTtl));
   }
 
   observe(symbol: string, position: AIMetricsSnapshot['position'], state: DeterministicStateSnapshot): void {

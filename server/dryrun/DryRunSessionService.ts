@@ -243,6 +243,14 @@ type AIIntentMetadata = {
 type AIActionMetadata = {
   plan?: AIIntentMetadata;
   incrementalRiskCapPct?: number;
+  strictThreeMMode?: boolean;
+  strictEntryFullNotional?: boolean;
+  strictAddPct?: number;
+  maxExposureMultiplier?: number;
+  allowReduceBelowNotional?: boolean;
+  maxPositionNotional?: number;
+  maxExposureNotional?: number;
+  governorReasons?: string[];
 };
 
 const DEFAULT_MAINTENANCE_MARGIN_RATE = 0.005;
@@ -809,6 +817,7 @@ export class DryRunSessionService {
       const desiredOrderSide = actionSide === 'LONG' ? 'BUY' : actionSide === 'SHORT' ? 'SELL' : null;
       const aiPlan = this.extractAIPlan(action.metadata);
       const aiPolicyAction = Boolean((action.metadata as Record<string, unknown> | undefined)?.aiPolicy) || this.isAIAutonomousRun();
+      const strictMeta = this.extractStrictThreeMMeta(action.metadata);
       const entryStyle = this.normalizeAIEntryStyle(aiPlan?.entryStyle);
       const urgencyLevel = this.normalizeAIUrgency(aiPlan?.urgency);
       const spreadPct = this.computeSpreadPct(session.lastOrderBook);
@@ -845,15 +854,21 @@ export class DryRunSessionService {
 
         if (position && position.side === actionSide) {
           const referencePrice = Number(action.expectedPrice) || session.latestMarkPrice || position.entryPrice;
-          const sizing = this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 0.5, {
-            mode: 'ADD',
-          });
+          const sizing = (aiPolicyAction && strictMeta.enabled)
+            ? this.computeStrictAISizing(session, referencePrice, {
+              mode: 'ADD',
+              addPct: strictMeta.addPct,
+              maxExposureMultiplier: strictMeta.maxExposureMultiplier,
+            })
+            : this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 0.5, {
+              mode: 'ADD',
+            });
           if (sizing.qty > 0) {
             session.engine.setLeverageOverride(sizing.leverage);
             if (aiPolicyAction) {
               if (!this.isAiExecutionHealthy(session)) continue;
               if (this.hasLiveWorkingOrderForSide(session, desiredOrderSide)) continue;
-              const addOrder = this.buildAiPostOnlyEntryOrder(session, desiredOrderSide, sizing.qty, 'AI_ADD');
+              const addOrder = this.buildAiPostOnlyEntryOrder(session, desiredOrderSide, sizing.qty, 'AI_ADD', strictMeta.enabled);
               if (!addOrder) continue;
               queueOrder(addOrder);
             } else {
@@ -881,15 +896,20 @@ export class DryRunSessionService {
 
         const referencePrice = Number(action.expectedPrice) || session.latestMarkPrice || 0;
         if (!(referencePrice > 0)) continue;
-        const sizing = this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 1, {
-          mode: 'ENTRY',
-        });
+        const sizing = (aiPolicyAction && strictMeta.enabled)
+          ? this.computeStrictAISizing(session, referencePrice, {
+            mode: 'ENTRY',
+            maxExposureMultiplier: strictMeta.maxExposureMultiplier,
+          })
+          : this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 1, {
+            mode: 'ENTRY',
+          });
         if (!(sizing.qty > 0)) continue;
         session.engine.setLeverageOverride(sizing.leverage);
         if (aiPolicyAction) {
           if (!this.isAiExecutionHealthy(session)) continue;
           if (this.hasLiveWorkingOrderForSide(session, desiredOrderSide)) continue;
-          const entryOrder = this.buildAiPostOnlyEntryOrder(session, desiredOrderSide, sizing.qty, 'AI_ENTRY');
+          const entryOrder = this.buildAiPostOnlyEntryOrder(session, desiredOrderSide, sizing.qty, 'AI_ENTRY', strictMeta.enabled);
           if (!entryOrder) continue;
           queueOrder(entryOrder);
         } else {
@@ -918,15 +938,21 @@ export class DryRunSessionService {
         if (!currentPosition) continue;
         const currentSide = currentPosition.side === 'LONG' ? 'BUY' : 'SELL';
         const referencePrice = Number(action.expectedPrice) || session.latestMarkPrice || currentPosition.entryPrice;
-        const sizing = this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 0.5, {
-          mode: 'ADD',
-        });
+        const sizing = (aiPolicyAction && strictMeta.enabled)
+          ? this.computeStrictAISizing(session, referencePrice, {
+            mode: 'ADD',
+            addPct: strictMeta.addPct,
+            maxExposureMultiplier: strictMeta.maxExposureMultiplier,
+          })
+          : this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 0.5, {
+            mode: 'ADD',
+          });
         if (!(sizing.qty > 0)) continue;
         session.engine.setLeverageOverride(sizing.leverage);
         if (aiPolicyAction) {
           if (!this.isAiExecutionHealthy(session)) continue;
           if (this.hasLiveWorkingOrderForSide(session, currentSide)) continue;
-          const addOrder = this.buildAiPostOnlyEntryOrder(session, currentSide, sizing.qty, 'AI_ADD');
+          const addOrder = this.buildAiPostOnlyEntryOrder(session, currentSide, sizing.qty, 'AI_ADD', strictMeta.enabled);
           if (!addOrder) continue;
           queueOrder(addOrder);
         } else {
@@ -957,17 +983,28 @@ export class DryRunSessionService {
         if (!(fullQty > 0)) continue;
         const reducePct = clampNumber(Number(action.reducePct ?? 0.5), 0.5, 0.1, 1);
         let reduceQty = roundTo(fullQty * reducePct, 6);
-        const residualQty = roundTo(Math.max(0, fullQty - Math.max(0, reduceQty)), 6);
-        const reduceNotional = Math.max(0, reduceQty * Math.max(referencePrice, 0));
-        const residualNotional = Math.max(0, residualQty * Math.max(referencePrice, 0));
-        const forceFullClose =
-          !(reduceQty > 0)
-          || reduceQty >= fullQty
-          || residualQty <= DEFAULT_AI_DUST_MIN_QTY
-          || (residualNotional > 0 && residualNotional <= DEFAULT_AI_DUST_MIN_NOTIONAL_USDT)
-          || (reduceNotional > 0 && reduceNotional < DEFAULT_AI_MIN_REDUCE_NOTIONAL_USDT);
-        if (forceFullClose) {
-          reduceQty = fullQty;
+        let forceFullClose = false;
+        if (aiPolicyAction && strictMeta.enabled) {
+          const strictReduce = this.computeStrictReduceQty(session, referencePrice, {
+            reducePct,
+            allowReduceBelowNotional: strictMeta.allowReduceBelowNotional,
+            maxPositionNotional: strictMeta.maxPositionNotional,
+          });
+          reduceQty = strictReduce.qty;
+          forceFullClose = strictMeta.allowReduceBelowNotional && reduceQty >= fullQty;
+        } else {
+          const residualQty = roundTo(Math.max(0, fullQty - Math.max(0, reduceQty)), 6);
+          const reduceNotional = Math.max(0, reduceQty * Math.max(referencePrice, 0));
+          const residualNotional = Math.max(0, residualQty * Math.max(referencePrice, 0));
+          forceFullClose =
+            !(reduceQty > 0)
+            || reduceQty >= fullQty
+            || residualQty <= DEFAULT_AI_DUST_MIN_QTY
+            || (residualNotional > 0 && residualNotional <= DEFAULT_AI_DUST_MIN_NOTIONAL_USDT)
+            || (reduceNotional > 0 && reduceNotional < DEFAULT_AI_MIN_REDUCE_NOTIONAL_USDT);
+          if (forceFullClose) {
+            reduceQty = fullQty;
+          }
         }
         if (!(reduceQty > 0)) continue;
         const reduceOrder = this.buildAiLimitOrder(
@@ -1035,6 +1072,9 @@ export class DryRunSessionService {
     drawdownPct: number;
     dailyLossLock: boolean;
     cooldownMsRemaining: number;
+    marginHealth: number;
+    maintenanceMarginRatio: number;
+    liquidationProximityPct: number;
   } {
     const normalized = normalizeSymbol(symbol);
     const session = this.sessions.get(normalized);
@@ -1048,6 +1088,9 @@ export class DryRunSessionService {
         drawdownPct: 0,
         dailyLossLock: false,
         cooldownMsRemaining: 0,
+        marginHealth: 0,
+        maintenanceMarginRatio: 0,
+        liquidationProximityPct: 0,
       };
     }
 
@@ -1062,6 +1105,9 @@ export class DryRunSessionService {
     const drawdownPct = equityStart > 0 ? (equity - equityStart) / equityStart : 0;
     const dailyLossLock = false;
     const cooldownMsRemaining = 0;
+    const marginHealth = Number.isFinite(session.lastState.marginHealth) ? Number(session.lastState.marginHealth) : 0;
+    const maintenanceMarginRatio = Math.max(0, Math.min(5, 1 - marginHealth));
+    const liquidationProximityPct = Math.max(0, Math.min(100, marginHealth * 100));
 
     return {
       equity: roundTo(equity, 8),
@@ -1071,6 +1117,9 @@ export class DryRunSessionService {
       drawdownPct: roundTo(drawdownPct, 8),
       dailyLossLock,
       cooldownMsRemaining,
+      marginHealth: roundTo(marginHealth, 8),
+      maintenanceMarginRatio: roundTo(maintenanceMarginRatio, 8),
+      liquidationProximityPct: roundTo(liquidationProximityPct, 8),
     };
   }
 
@@ -2120,7 +2169,8 @@ export class DryRunSessionService {
     session: SymbolSession,
     side: 'BUY' | 'SELL',
     qty: number,
-    reasonCode: DryRunReasonCode
+    reasonCode: DryRunReasonCode,
+    forcePostOnlyFromPolicy = false
   ): DryRunOrderRequest | null {
     if (!(qty > 0)) return null;
     if (!this.isAiExecutionHealthy(session)) return null;
@@ -2131,9 +2181,10 @@ export class DryRunSessionService {
     const askQty = Number(session.lastOrderBook.asks?.[0]?.qty || 0);
     if (!(bestBid > 0) || !(bestAsk > 0)) return null;
 
-    const forcePostOnly = ['1', 'true', 'yes', 'on'].includes(
+    const forcePostOnlyEnv = ['1', 'true', 'yes', 'on'].includes(
       String(process.env.AI_ENTRY_POST_ONLY || 'false').trim().toLowerCase()
     );
+    const forcePostOnly = forcePostOnlyFromPolicy || forcePostOnlyEnv;
     if (!forcePostOnly) {
       const aggressiveLimit = side === 'BUY' ? bestAsk : bestBid;
       return {
@@ -2219,6 +2270,94 @@ export class DryRunSessionService {
     const candidate = (metadata as AIActionMetadata).plan;
     if (!candidate || typeof candidate !== 'object') return null;
     return candidate;
+  }
+
+  private extractStrictThreeMMeta(metadata?: Record<string, unknown>): {
+    enabled: boolean;
+    addPct: number;
+    maxExposureMultiplier: number;
+    allowReduceBelowNotional: boolean;
+    maxPositionNotional: number | null;
+  } {
+    const raw = (metadata || {}) as AIActionMetadata;
+    const enabled = Boolean(raw.strictThreeMMode);
+    const addPct = clampNumber(raw.strictAddPct, 0.2, 0.01, 1);
+    const maxExposureMultiplier = clampNumber(raw.maxExposureMultiplier, 1.5, 1, 3);
+    const allowReduceBelowNotional = Boolean(raw.allowReduceBelowNotional);
+    const maxPositionNotional = Number.isFinite(raw.maxPositionNotional as number)
+      ? Math.max(0, Number(raw.maxPositionNotional))
+      : null;
+    return {
+      enabled,
+      addPct,
+      maxExposureMultiplier,
+      allowReduceBelowNotional,
+      maxPositionNotional,
+    };
+  }
+
+  private computeStrictAISizing(
+    session: SymbolSession,
+    price: number,
+    input: {
+      mode: 'ENTRY' | 'ADD';
+      addPct?: number;
+      maxExposureMultiplier?: number;
+    }
+  ): { qty: number; leverage: number } {
+    if (!this.config || !(price > 0)) return { qty: 0, leverage: session.dynamicLeverage || 1 };
+    const leverage = session.dynamicLeverage || this.config.leverage || 1;
+    const maxNotional = Math.max(0, Number(this.config.initialMarginUsdt || 0) * Math.max(1, leverage));
+    if (!(maxNotional > 0)) return { qty: 0, leverage };
+
+    const currentNotional = session.lastState.position
+      ? Math.max(0, Number(session.lastState.position.qty || 0) * price)
+      : 0;
+    const maxExposureNotional = maxNotional * clampNumber(input.maxExposureMultiplier, 1.5, 1, 3);
+    const remainingExposure = Math.max(0, maxExposureNotional - currentNotional);
+    if (!(remainingExposure > 0)) return { qty: 0, leverage };
+
+    let openNotional = 0;
+    if (input.mode === 'ENTRY') {
+      openNotional = Math.max(0, Math.min(maxNotional - currentNotional, remainingExposure));
+    } else {
+      const addPct = clampNumber(input.addPct, 0.2, 0.01, 1);
+      const desired = currentNotional * addPct;
+      openNotional = Math.max(0, Math.min(desired, remainingExposure));
+    }
+
+    const qty = roundTo(Math.max(0, openNotional / price), 6);
+    return { qty, leverage };
+  }
+
+  private computeStrictReduceQty(
+    session: SymbolSession,
+    referencePrice: number,
+    input: {
+      reducePct: number;
+      allowReduceBelowNotional: boolean;
+      maxPositionNotional: number | null;
+    }
+  ): { qty: number } {
+    if (!this.config || !(referencePrice > 0) || !session.lastState.position) return { qty: 0 };
+    const fullQty = Math.max(0, Number(session.lastState.position.qty || 0));
+    if (!(fullQty > 0)) return { qty: 0 };
+
+    const leverage = session.dynamicLeverage || this.config.leverage || 1;
+    const defaultMaxNotional = Math.max(0, Number(this.config.initialMarginUsdt || 0) * Math.max(1, leverage));
+    const maxPositionNotional = input.maxPositionNotional != null ? input.maxPositionNotional : defaultMaxNotional;
+    const currentNotional = fullQty * referencePrice;
+    const desiredNotional = Math.max(0, currentNotional * clampNumber(input.reducePct, 0.5, 0.1, 1));
+
+    let reducibleNotional = desiredNotional;
+    if (!input.allowReduceBelowNotional) {
+      const floorNotional = Math.max(0, maxPositionNotional);
+      const maxReducible = Math.max(0, currentNotional - floorNotional);
+      reducibleNotional = Math.min(desiredNotional, maxReducible);
+    }
+
+    const qty = roundTo(Math.max(0, reducibleNotional / referencePrice), 6);
+    return { qty };
   }
 
   private normalizeAIEntryStyle(value?: string): 'LIMIT' | 'MARKET_SMALL' | 'HYBRID' {

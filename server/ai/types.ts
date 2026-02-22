@@ -121,6 +121,9 @@ export type AIMetricsSnapshot = {
     drawdownPct: number;
     dailyLossLock: boolean;
     cooldownMsRemaining: number;
+    marginHealth?: number;
+    maintenanceMarginRatio?: number;
+    liquidationProximityPct?: number;
   };
   executionState: {
     lastAction: AIDecisionIntent | 'NONE';
