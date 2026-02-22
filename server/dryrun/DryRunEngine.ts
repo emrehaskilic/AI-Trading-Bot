@@ -71,6 +71,13 @@ function isUuidLike(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(value);
 }
 
+const POSITION_DUST_QTY = (() => {
+  const raw = Number(process.env.DRY_RUN_POSITION_DUST_QTY || 0.000001);
+  if (!Number.isFinite(raw) || raw <= 0) return 0.000001;
+  return Math.min(Math.max(raw, 0.00000001), 0.01);
+})();
+const POSITION_DUST_QTY_FP = toFp(POSITION_DUST_QTY);
+
 export class DryRunEngine {
   private readonly cfg: {
     runId: string;
@@ -227,6 +234,9 @@ export class DryRunEngine {
   }
 
   getStateSnapshot(markPriceInput?: Fp): DryRunStateSnapshot {
+    if (this.position && fpAbs(this.position.signedQty) <= POSITION_DUST_QTY_FP) {
+      this.position = null;
+    }
     const markPrice = markPriceInput ?? (this.position ? this.position.entryPrice : fpZero);
     const openLimitOrders = Array.from(this.pendingLimits.values()).map((o) => ({
       orderId: o.orderId,
@@ -885,7 +895,11 @@ export class DryRunEngine {
     }
 
     const delta = sideToSignedQty(side, fillQty);
-    const currentQty = this.position ? this.position.signedQty : fpZero;
+    let currentQty = this.position ? this.position.signedQty : fpZero;
+    if (currentQty !== fpZero && fpAbs(currentQty) <= POSITION_DUST_QTY_FP) {
+      this.position = null;
+      currentQty = fpZero;
+    }
 
     if (currentQty === 0n) {
       this.position = {
@@ -940,7 +954,7 @@ export class DryRunEngine {
     const maePct = this.position!.entryPrice > 0n ? (fromFp(mae) / fromFp(this.position!.entryPrice)) * 100 : 0;
 
     const newQty = fpAdd(currentQty, delta);
-    if (newQty === 0n) {
+    if (newQty === 0n || fpAbs(newQty) <= POSITION_DUST_QTY_FP) {
       this.position = null;
       return { realizedPnl: realized, tradeIds, maePct, mfePct };
     }

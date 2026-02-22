@@ -20,6 +20,7 @@ const DEFAULT_STATE_CONFIDENCE_THRESHOLD = clamp(Number(process.env.AI_STATE_CON
 const DEFAULT_MAX_STARTUP_WARMUP_MS = Math.max(0, Math.trunc(Number(process.env.AI_MAX_STARTUP_WARMUP_MS || 2000)));
 const DEFAULT_TREND_BREAK_CONFIRM_TICKS = Math.max(1, Math.trunc(clamp(Number(process.env.AI_TREND_BREAK_CONFIRM_TICKS || 6), 1, 12)));
 const DEFAULT_MIN_REDUCE_GAP_MS = Math.max(0, Math.trunc(Number(process.env.AI_MIN_REDUCE_GAP_MS || 30_000)));
+const REENTRY_COOLDOWN_BARS = Math.max(0, Math.trunc(Number(process.env.AI_REENTRY_COOLDOWN_BARS || 1)));
 
 const STRICT_3M_MODE_ENABLED = isEnabled(process.env.AI_STRICT_3M_TREND_MODE, true);
 const BAR_MS = Math.max(1, Math.trunc(Number(process.env.AI_BAR_INTERVAL_MS || 180_000)));
@@ -43,6 +44,7 @@ type RuntimeSymbolState = {
   holdSamples: number;
   latestTrend: AITrendStatus | null;
   trendBreakStreak: number;
+  lastTrendBreakBarId: number;
   lastTrendBreakTs: number;
   lastReduceTs: number;
   lastBarId: number;
@@ -310,23 +312,13 @@ export class AIDryRunController {
       let finalDecision = governed;
       if (lockEvaluation.blocked) {
         this.telemetry.guardrailBlocks += 1;
-        if (snapshot.position && lockEvaluation.reason === 'NO_AUTO_CLOSE_REVERSE') {
-          finalDecision = {
-            ...governed,
-            intent: 'REDUCE',
-            side: snapshot.position.side,
-            reducePct: 0.5,
-            reasons: [...governed.reasons, lockEvaluation.reason],
-          };
-        } else {
-          finalDecision = {
-            ...governed,
-            intent: 'HOLD',
-            side: null,
-            reducePct: null,
-            reasons: [...governed.reasons, lockEvaluation.reason || 'DIRECTION_LOCK'],
-          };
-        }
+        finalDecision = {
+          ...governed,
+          intent: 'HOLD',
+          side: null,
+          reducePct: null,
+          reasons: [...governed.reasons, lockEvaluation.reason || 'DIRECTION_LOCK'],
+        };
       }
 
       if (finalDecision.intent === 'ENTER' && finalDecision.side && this.isSameBarDirectionChangeBlocked(runtime, barId, finalDecision.side)) {
@@ -345,6 +337,7 @@ export class AIDryRunController {
 
         if (trendIntact) {
           runtime.trendBreakStreak = 0;
+          runtime.lastTrendBreakBarId = -1;
           runtime.lastTrendBreakTs = 0;
           if (!hardRisk && (finalDecision.intent === 'REDUCE' || finalDecision.intent === 'EXIT')) {
             finalDecision = {
@@ -356,8 +349,11 @@ export class AIDryRunController {
             };
           }
         } else {
-          runtime.trendBreakStreak += 1;
-          runtime.lastTrendBreakTs = nowMs;
+          if (runtime.lastTrendBreakBarId !== barId) {
+            runtime.trendBreakStreak += 1;
+            runtime.lastTrendBreakBarId = barId;
+            runtime.lastTrendBreakTs = nowMs;
+          }
           const breakConfirmed = runtime.trendBreakStreak >= DEFAULT_TREND_BREAK_CONFIRM_TICKS;
           if (!hardRisk && !breakConfirmed && (finalDecision.intent === 'REDUCE' || finalDecision.intent === 'EXIT')) {
             finalDecision = {
@@ -371,6 +367,7 @@ export class AIDryRunController {
         }
       } else {
         runtime.trendBreakStreak = 0;
+        runtime.lastTrendBreakBarId = -1;
         runtime.lastTrendBreakTs = 0;
         runtime.lastReduceTs = 0;
       }
@@ -692,6 +689,7 @@ export class AIDryRunController {
         holdSamples: 0,
         latestTrend: null,
         trendBreakStreak: 0,
+        lastTrendBreakBarId: -1,
         lastTrendBreakTs: 0,
         lastReduceTs: 0,
         lastBarId: this.toBarId(nowMs),
@@ -812,6 +810,13 @@ export class AIDryRunController {
     if (!position) {
       if (!trendSide) return hold();
       if (!executionHealthyForOpen) return hold();
+      if (REENTRY_COOLDOWN_BARS > 0 && runtime.lastCloseBarId >= 0 && (barId - runtime.lastCloseBarId) < REENTRY_COOLDOWN_BARS) {
+        return hold();
+      }
+      if (state.flowState === 'EXHAUSTION') return hold();
+      if (state.derivativesState === 'DELEVERAGING') return hold();
+      if (state.toxicityState === 'TOXIC') return hold();
+      if (state.volatilityPercentile >= 92) return hold();
       if (runtime.lastCloseBarId === barId && runtime.lastClosedSide && runtime.lastClosedSide !== trendSide) return hold();
       if (runtime.lastClosedSide && runtime.lastClosedSide !== trendSide) {
         const reversalStrength = this.sideStrengthPct(trendSide, dfsPct);
@@ -1034,6 +1039,9 @@ export class AIDryRunController {
     if (trendSide === runtime.trendSide) return;
     runtime.trendSide = trendSide;
     runtime.trendStartBarId = trendSide ? barId : -1;
+    runtime.trendBreakStreak = 0;
+    runtime.lastTrendBreakBarId = -1;
+    runtime.lastTrendBreakTs = 0;
   }
 
   private isSameBarDirectionChangeBlocked(runtime: RuntimeSymbolState, barId: number, side: StrategySide): boolean {

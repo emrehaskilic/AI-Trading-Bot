@@ -224,6 +224,9 @@ type SymbolSession = {
   currentTrade: ActiveTrade | null;
   lastSnapshotLogTs: number;
   lastWinnerSignalLogTs: number;
+  aiEntryCancelStreak: number;
+  aiEntryCooldownUntilMs: number;
+  lastAiEntryCooldownLogTs: number;
 };
 
 type AIIntentMetadata = {
@@ -307,6 +310,13 @@ const DEFAULT_AI_DAILY_LOSS_LOCK_PCT = clampNumber(process.env.AI_DAILY_LOSS_LOC
 const DEFAULT_AI_DUST_MIN_NOTIONAL_USDT = clampNumber(process.env.AI_DUST_MIN_NOTIONAL_USDT, 5, 0.1, 1_000);
 const DEFAULT_AI_DUST_MIN_QTY = clampNumber(process.env.AI_DUST_MIN_QTY, 0.000001, 0.0000001, 0.01);
 const DEFAULT_AI_MIN_REDUCE_NOTIONAL_USDT = clampNumber(process.env.AI_MIN_REDUCE_NOTIONAL_USDT, 15, 0.1, 1_000);
+const DEFAULT_AI_ENTRY_CANCEL_STREAK_TRIGGER = Math.max(1, Math.trunc(clampNumber(process.env.AI_ENTRY_CANCEL_STREAK_TRIGGER, 2, 1, 10)));
+const DEFAULT_AI_ENTRY_CANCEL_BASE_COOLDOWN_MS = Math.max(1000, Math.trunc(clampNumber(process.env.AI_ENTRY_CANCEL_BASE_COOLDOWN_MS, 15_000, 1000, 300_000)));
+const DEFAULT_AI_ENTRY_CANCEL_MAX_COOLDOWN_MS = Math.max(
+  DEFAULT_AI_ENTRY_CANCEL_BASE_COOLDOWN_MS,
+  Math.trunc(clampNumber(process.env.AI_ENTRY_CANCEL_MAX_COOLDOWN_MS, 120_000, DEFAULT_AI_ENTRY_CANCEL_BASE_COOLDOWN_MS, 900_000))
+);
+const DEFAULT_AI_ENTRY_CANCEL_BACKOFF_MULT = clampNumber(process.env.AI_ENTRY_CANCEL_BACKOFF_MULT, 1.75, 1, 4);
 
 function parseLimitStrategy(input: string): LimitStrategyMode {
   switch (input) {
@@ -532,6 +542,9 @@ export class DryRunSessionService {
         currentTrade: null,
         lastSnapshotLogTs: 0,
         lastWinnerSignalLogTs: 0,
+        aiEntryCancelStreak: 0,
+        aiEntryCooldownUntilMs: 0,
+        lastAiEntryCooldownLogTs: 0,
       });
     }
 
@@ -693,6 +706,9 @@ export class DryRunSessionService {
         currentTrade: null,
         lastSnapshotLogTs: 0,
         lastWinnerSignalLogTs: 0,
+        aiEntryCancelStreak: 0,
+        aiEntryCooldownUntilMs: 0,
+        lastAiEntryCooldownLogTs: 0,
       });
     }
 
@@ -908,6 +924,7 @@ export class DryRunSessionService {
         session.engine.setLeverageOverride(sizing.leverage);
         if (aiPolicyAction) {
           if (!this.isAiExecutionHealthy(session)) continue;
+          if (this.shouldBlockAiEntryByCooldown(session, normalized, decisionTs)) continue;
           if (this.hasLiveWorkingOrderForSide(session, desiredOrderSide)) continue;
           const entryOrder = this.buildAiPostOnlyEntryOrder(session, desiredOrderSide, sizing.qty, 'AI_ENTRY', strictMeta.enabled);
           if (!entryOrder) continue;
@@ -2265,6 +2282,57 @@ export class DryRunSessionService {
     return session.manualOrders.some((o) => o.side === side && o.type === 'LIMIT' && !o.reduceOnly);
   }
 
+  private shouldBlockAiEntryByCooldown(session: SymbolSession, symbol: string, nowMs: number): boolean {
+    if (session.aiEntryCooldownUntilMs <= nowMs) {
+      return false;
+    }
+    if (nowMs - session.lastAiEntryCooldownLogTs >= 5000) {
+      const waitMs = Math.max(0, session.aiEntryCooldownUntilMs - nowMs);
+      this.addConsoleLog('WARN', symbol, `AI entry cooldown active (${waitMs}ms remaining)`, nowMs);
+      session.lastAiEntryCooldownLogTs = nowMs;
+    }
+    return true;
+  }
+
+  private resetAiEntryBackoff(session: SymbolSession): void {
+    session.aiEntryCancelStreak = 0;
+    session.aiEntryCooldownUntilMs = 0;
+    session.lastAiEntryCooldownLogTs = 0;
+  }
+
+  private registerAiEntryOrderOutcome(session: SymbolSession, symbol: string, order: DryRunEventLog['orderResults'][number], eventTimestampMs: number): void {
+    if (order.reasonCode !== 'AI_ENTRY') return;
+
+    const filledQty = Math.max(0, Number(order.filledQty || 0));
+    if ((order.status === 'FILLED' || order.status === 'PARTIALLY_FILLED') && filledQty > 0) {
+      this.resetAiEntryBackoff(session);
+      return;
+    }
+
+    const isEntryCancelWithoutFill = order.status === 'CANCELED' && filledQty <= 0;
+    if (!isEntryCancelWithoutFill) return;
+
+    session.aiEntryCancelStreak += 1;
+    if (session.aiEntryCancelStreak < DEFAULT_AI_ENTRY_CANCEL_STREAK_TRIGGER) return;
+
+    const backoffExponent = session.aiEntryCancelStreak - DEFAULT_AI_ENTRY_CANCEL_STREAK_TRIGGER;
+    const cooldownMs = Math.min(
+      DEFAULT_AI_ENTRY_CANCEL_MAX_COOLDOWN_MS,
+      Math.round(DEFAULT_AI_ENTRY_CANCEL_BASE_COOLDOWN_MS * Math.pow(DEFAULT_AI_ENTRY_CANCEL_BACKOFF_MULT, Math.max(0, backoffExponent)))
+    );
+    const nextAllowedTs = eventTimestampMs + cooldownMs;
+    if (nextAllowedTs > session.aiEntryCooldownUntilMs) {
+      session.aiEntryCooldownUntilMs = nextAllowedTs;
+      this.addConsoleLog(
+        'WARN',
+        symbol,
+        `AI entry paused for ${cooldownMs}ms after ${session.aiEntryCancelStreak} consecutive unfilled TTL cancels`,
+        eventTimestampMs
+      );
+      session.lastAiEntryCooldownLogTs = eventTimestampMs;
+    }
+  }
+
   private extractAIPlan(metadata?: Record<string, unknown>): AIIntentMetadata | null {
     if (!metadata || typeof metadata !== 'object') return null;
     const candidate = (metadata as AIActionMetadata).plan;
@@ -2677,6 +2745,7 @@ export class DryRunSessionService {
 
     for (const order of orderResults || []) {
       if (order.status === 'NEW') continue;
+      this.registerAiEntryOrderOutcome(session, session.symbol, order, eventTimestampMs);
       const reasonCode = order.reasonCode ?? null;
       if (!reasonCode) continue;
       const feePaidIncrement = Number.isFinite(order.fee) ? Number(order.fee) : 0;
@@ -2812,6 +2881,7 @@ export class DryRunSessionService {
     markPrice: number
   ): void {
     if (!prevPosition && nextPosition) {
+      this.resetAiEntryBackoff(session);
       session.winnerState = this.winnerManager.initState({
         entryPrice: nextPosition.entryPrice,
         side: nextPosition.side,
@@ -2833,6 +2903,7 @@ export class DryRunSessionService {
     }
 
     if (prevPosition && !nextPosition) {
+      this.resetAiEntryBackoff(session);
       session.winnerState = null;
       session.stopLossPrice = null;
       session.addOnState.pendingClientOrderId = null;
@@ -2845,6 +2916,7 @@ export class DryRunSessionService {
     }
 
     if (prevPosition && nextPosition && prevPosition.side !== nextPosition.side) {
+      this.resetAiEntryBackoff(session);
       session.winnerState = this.winnerManager.initState({
         entryPrice: nextPosition.entryPrice,
         side: nextPosition.side,
