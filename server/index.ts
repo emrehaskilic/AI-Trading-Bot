@@ -119,7 +119,6 @@ const WS_UPDATE_SPEED = normalizeWsUpdateSpeed(WS_UPDATE_SPEED_RAW);
 const BINANCE_REST_TIMEOUT_MS = Math.max(1000, Number(process.env.BINANCE_REST_TIMEOUT_MS || 8000));
 const BINANCE_EXCHANGE_INFO_TIMEOUT_MS = Math.max(1000, Number(process.env.BINANCE_EXCHANGE_INFO_TIMEOUT_MS || BINANCE_REST_TIMEOUT_MS));
 const BINANCE_SNAPSHOT_TIMEOUT_MS = Math.max(1000, Number(process.env.BINANCE_SNAPSHOT_TIMEOUT_MS || BINANCE_REST_TIMEOUT_MS));
-const SYMBOLS_ENDPOINT_TIMEOUT_MS = Math.max(1000, Number(process.env.SYMBOLS_ENDPOINT_TIMEOUT_MS || 3500));
 const BLOCKED_TELEMETRY_INTERVAL_MS = Number(process.env.BLOCKED_TELEMETRY_INTERVAL_MS || 1000);
 const MIN_RESYNC_INTERVAL_MS = 15000;
 const GRACE_PERIOD_MS = 5000;
@@ -1935,12 +1934,7 @@ app.get('/api/exchange-info', async (req, res) => {
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
     const fallbackSymbols = buildSymbolFallbackList();
-    const info = await Promise.race([
-        fetchExchangeInfo(),
-        new Promise<{ symbols: string[] }>((resolve) => {
-            setTimeout(() => resolve({ symbols: fallbackSymbols }), SYMBOLS_ENDPOINT_TIMEOUT_MS);
-        }),
-    ]);
+    const info = await fetchExchangeInfo();
     const symbols = Array.isArray(info?.symbols) && info.symbols.length > 0 ? info.symbols : fallbackSymbols;
     res.json({ symbols });
 });
@@ -2052,12 +2046,7 @@ app.get('/api/dry-run/symbols', async (req, res) => {
         res.set('Expires', '0');
 
         const fallbackSymbols = buildSymbolFallbackList();
-        const info = await Promise.race([
-            fetchExchangeInfo(),
-            new Promise<{ symbols: string[] }>((resolve) => {
-                setTimeout(() => resolve({ symbols: fallbackSymbols }), SYMBOLS_ENDPOINT_TIMEOUT_MS);
-            }),
-        ]);
+        const info = await fetchExchangeInfo();
         const symbols = Array.isArray(info?.symbols) && info.symbols.length > 0 ? info.symbols : fallbackSymbols;
         res.json({ ok: true, symbols });
     } catch (e: any) {

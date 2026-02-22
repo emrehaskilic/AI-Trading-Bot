@@ -1,5 +1,3 @@
-const DEV_PORTS = new Set(['5173', '5174', '5175']);
-
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, '');
 }
@@ -30,11 +28,7 @@ export function getProxyApiBase(): string {
     return trimTrailingSlash(envBase);
   }
 
-  const { protocol, hostname, port, origin } = window.location;
-  if (DEV_PORTS.has(port)) {
-    return `${protocol}//${hostname}:8787`;
-  }
-
+  const { origin } = window.location;
   return trimTrailingSlash(origin);
 }
 
@@ -46,10 +40,6 @@ export function getProxyWsBase(): string {
 
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const { hostname, port } = window.location;
-  if (DEV_PORTS.has(port)) {
-    return `${wsProtocol}//${hostname}:8787`;
-  }
-
   const suffix = port ? `:${port}` : '';
   return `${wsProtocol}//${hostname}${suffix}`;
 }

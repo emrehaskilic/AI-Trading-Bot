@@ -224,7 +224,7 @@ const AIDryRunDashboard: React.FC = () => {
     const loadPairs = async () => {
       setIsLoadingPairs(true);
       const controller = new AbortController();
-      const timer = window.setTimeout(() => controller.abort(), 8000);
+      const timer = window.setTimeout(() => controller.abort(), 15000);
       try {
         const res = await fetchWithAuth(`${proxyUrl}/api/dry-run/symbols`, { signal: controller.signal, cache: 'no-store' });
         if (!res.ok) {
@@ -237,6 +237,11 @@ const AIDryRunDashboard: React.FC = () => {
         if (pairs.length === 0) {
           throw new Error('symbols_empty');
         }
+        try {
+          window.localStorage.setItem('orderflow.symbols.cache', JSON.stringify(pairs));
+        } catch {
+          // Ignore storage failures (private mode/quota).
+        }
         setAvailablePairs(pairs);
         if (pairs.length > 0) {
           setSelectedPairs((prev) => {
@@ -246,7 +251,19 @@ const AIDryRunDashboard: React.FC = () => {
           });
         }
       } catch {
-        const fallbackPairs = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+        let fallbackPairs: string[] = [];
+        try {
+          const cachedRaw = window.localStorage.getItem('orderflow.symbols.cache');
+          const cachedParsed = cachedRaw ? JSON.parse(cachedRaw) : [];
+          if (Array.isArray(cachedParsed)) {
+            fallbackPairs = cachedParsed.filter((p: unknown): p is string => typeof p === 'string' && p.length > 0);
+          }
+        } catch {
+          fallbackPairs = [];
+        }
+        if (fallbackPairs.length === 0) {
+          fallbackPairs = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+        }
         setAvailablePairs(fallbackPairs);
         setSelectedPairs((prev) => {
           const valid = prev.filter((s) => fallbackPairs.includes(s));

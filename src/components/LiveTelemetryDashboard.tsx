@@ -97,12 +97,29 @@ export const Dashboard: React.FC = () => {
         if (pairs.length === 0) {
           throw new Error('exchange_info_empty');
         }
+        try {
+          window.localStorage.setItem('orderflow.symbols.cache', JSON.stringify(pairs));
+        } catch {
+          // Ignore storage failures (private mode/quota).
+        }
         setAvailablePairs(pairs);
         if (pairs.length > 0 && selectedPairs.length === 0) {
           setSelectedPairs([pairs[0]]);
         }
       } catch {
-        const fallbackPairs = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+        let fallbackPairs: string[] = [];
+        try {
+          const cachedRaw = window.localStorage.getItem('orderflow.symbols.cache');
+          const cachedParsed = cachedRaw ? JSON.parse(cachedRaw) : [];
+          if (Array.isArray(cachedParsed)) {
+            fallbackPairs = cachedParsed.filter((p: unknown): p is string => typeof p === 'string' && p.length > 0);
+          }
+        } catch {
+          fallbackPairs = [];
+        }
+        if (fallbackPairs.length === 0) {
+          fallbackPairs = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+        }
         setAvailablePairs(fallbackPairs);
         if (selectedPairs.length === 0) {
           setSelectedPairs([fallbackPairs[0]]);
