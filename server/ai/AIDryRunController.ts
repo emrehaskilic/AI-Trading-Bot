@@ -35,6 +35,12 @@ const SLIPPAGE_HARD_BPS = Math.max(1, Number(process.env.AI_SLIPPAGE_HARD_BPS ||
 const VOL_HARD_LIMIT = clamp(Number(process.env.AI_VOL_HARD_LIMIT_PCT || 97), 90, 100);
 const CRASH_EXIT_VOL_PCT = clamp(Number(process.env.AI_CRASH_EXIT_MIN_VOL_PCT || 90), 70, 100);
 const CRASH_EXIT_OPPOSING_STRENGTH = clamp(Number(process.env.AI_CRASH_EXIT_MIN_OPPOSING_STRENGTH || 62), 50, 90);
+const CRASH_EXIT_CONFIRM_BARS = Math.max(1, Math.trunc(Number(process.env.AI_CRASH_EXIT_CONFIRM_BARS || 2)));
+const BIAS_MIN_HOLD_BARS = Math.max(1, Math.trunc(Number(process.env.AI_BIAS_MIN_HOLD_BARS || 12)));
+const BIAS_ENTRY_CONFIRM_BARS = Math.max(1, Math.trunc(Number(process.env.AI_BIAS_ENTRY_CONFIRM_BARS || 2)));
+const BIAS_FLIP_CONFIRM_BARS = Math.max(1, Math.trunc(Number(process.env.AI_BIAS_FLIP_CONFIRM_BARS || 8)));
+const BIAS_NEUTRAL_CONFIRM_BARS = Math.max(1, Math.trunc(Number(process.env.AI_BIAS_NEUTRAL_CONFIRM_BARS || 8)));
+const BIAS_MIN_SIDE_STRENGTH_PCT = clamp(Number(process.env.AI_BIAS_MIN_SIDE_STRENGTH_PCT || 60), 50, 90);
 
 type RuntimeSymbolState = {
   firstSeenTs: number;
@@ -48,6 +54,10 @@ type RuntimeSymbolState = {
   latestBias: AIBiasStatus | null;
   biasPendingSide: StrategySide | 'NEUTRAL' | null;
   biasPendingCount: number;
+  biasPendingLastBarId: number;
+  biasStableSinceBarId: number;
+  crashExitPendingBarId: number;
+  crashExitStreak: number;
   trendBreakStreak: number;
   lastTrendBreakBarId: number;
   lastTrendBreakTs: number;
@@ -344,7 +354,7 @@ export class AIDryRunController {
 
       if (
         snapshot.position
-        && this.shouldForceCrashExit(snapshot.position.side, deterministicState, snapshot, runtime, dfsPct)
+        && this.shouldForceCrashExit(snapshot.position.side, deterministicState, snapshot, runtime, dfsPct, barId)
       ) {
         finalDecision = {
           ...finalDecision,
@@ -412,7 +422,7 @@ export class AIDryRunController {
         }
       }
 
-      runtime.latestBias = this.resolveCanonicalBias(runtime, snapshot, deterministicState, finalDecision, dfsPct, nowMs);
+      runtime.latestBias = this.resolveCanonicalBias(runtime, snapshot, deterministicState, finalDecision, dfsPct, nowMs, barId);
 
       const decision = this.buildStrategyDecision(snapshot, finalDecision, {
         deterministicState,
@@ -460,11 +470,16 @@ export class AIDryRunController {
       this.lastError = String(e?.message || 'ai_policy_failed');
       this.telemetry.invalidLLMResponses += 1;
       const runtime = this.getRuntime(symbol, nowMs);
+      const previousBias = runtime.latestBias;
+      const sideFromPosition = snapshot.position?.side === 'LONG' || snapshot.position?.side === 'SHORT'
+        ? snapshot.position.side
+        : null;
+      const preservedSide = sideFromPosition || previousBias?.side || 'NEUTRAL';
       runtime.latestBias = {
-        side: 'NEUTRAL',
-        confidence: 0,
-        source: 'STATE',
-        lockedByPosition: false,
+        side: preservedSide,
+        confidence: sideFromPosition ? 1 : Number(previousBias?.confidence || 0),
+        source: sideFromPosition ? 'POSITION_LOCK' : (previousBias?.source || 'STATE'),
+        lockedByPosition: Boolean(sideFromPosition),
         breakConfirm: runtime.trendBreakStreak,
         reason: 'POLICY_RUNTIME_ERROR',
         timestampMs: nowMs,
@@ -727,6 +742,10 @@ export class AIDryRunController {
         latestBias: null,
         biasPendingSide: null,
         biasPendingCount: 0,
+        biasPendingLastBarId: -1,
+        biasStableSinceBarId: -1,
+        crashExitPendingBarId: -1,
+        crashExitStreak: 0,
         trendBreakStreak: 0,
         lastTrendBreakBarId: -1,
         lastTrendBreakTs: 0,
@@ -810,26 +829,21 @@ export class AIDryRunController {
       reasons: string[];
     },
     dfsPct: number,
-    nowMs: number
+    nowMs: number,
+    barId: number
   ): AIBiasStatus {
     const positionSide = snapshot.position?.side || null;
-    const crashExit = Boolean(positionSide)
-      && this.shouldForceCrashExit(positionSide as StrategySide, state, snapshot, runtime, dfsPct);
 
     let candidateSide: StrategySide | 'NEUTRAL' = 'NEUTRAL';
     let source: AIBiasStatus['source'] = 'STATE';
     let lockedByPosition = false;
     let reason: string | null = finalDecision.reasons[0] || null;
 
-    if (positionSide && !crashExit) {
+    if (positionSide) {
       candidateSide = positionSide;
       source = 'POSITION_LOCK';
       lockedByPosition = true;
       reason = reason || 'POSITION_LOCK';
-    } else if (finalDecision.intent === 'EXIT' && positionSide) {
-      candidateSide = this.flipSide(positionSide);
-      source = 'EXIT_SIGNAL';
-      reason = reason || 'EXIT_SIGNAL';
     } else if (runtime.trendSide) {
       candidateSide = runtime.trendSide;
       source = 'TREND_LOCK';
@@ -841,48 +855,117 @@ export class AIDryRunController {
     }
 
     const previousSide = runtime.latestBias?.side || 'NEUTRAL';
+    const previousConfidence = Number(runtime.latestBias?.confidence || 0);
+    const previousSource = runtime.latestBias?.source || source;
+    const previousReason = runtime.latestBias?.reason || reason;
+
+    if (lockedByPosition) {
+      runtime.biasPendingSide = null;
+      runtime.biasPendingCount = 0;
+      runtime.biasPendingLastBarId = -1;
+      runtime.biasStableSinceBarId = barId;
+      return {
+        side: candidateSide,
+        confidence: 1,
+        source: 'POSITION_LOCK',
+        lockedByPosition: true,
+        breakConfirm: runtime.trendBreakStreak,
+        reason: reason || 'POSITION_LOCK',
+        timestampMs: nowMs,
+      };
+    }
+
     let side: StrategySide | 'NEUTRAL' = previousSide;
 
     if (candidateSide === previousSide) {
       runtime.biasPendingSide = null;
       runtime.biasPendingCount = 0;
+      runtime.biasPendingLastBarId = -1;
+      if (runtime.biasStableSinceBarId < 0) {
+        runtime.biasStableSinceBarId = barId;
+      }
       side = candidateSide;
     } else {
-      const requiredConfirmations = (lockedByPosition || source === 'EXIT_SIGNAL') ? 1 : 2;
       if (runtime.biasPendingSide !== candidateSide) {
         runtime.biasPendingSide = candidateSide;
-        runtime.biasPendingCount = 1;
-      } else {
+        runtime.biasPendingCount = 0;
+        runtime.biasPendingLastBarId = -1;
+      }
+
+      if (runtime.biasPendingLastBarId !== barId) {
+        runtime.biasPendingLastBarId = barId;
         runtime.biasPendingCount += 1;
       }
-      if (runtime.biasPendingCount >= requiredConfirmations) {
+
+      const fromNeutral = previousSide === 'NEUTRAL' && candidateSide !== 'NEUTRAL';
+      const toNeutral = candidateSide === 'NEUTRAL';
+      const requiredConfirmations = fromNeutral
+        ? BIAS_ENTRY_CONFIRM_BARS
+        : toNeutral
+          ? BIAS_NEUTRAL_CONFIRM_BARS
+          : BIAS_FLIP_CONFIRM_BARS;
+      const barsSinceStable = runtime.biasStableSinceBarId >= 0
+        ? Math.max(0, barId - runtime.biasStableSinceBarId)
+        : Number.MAX_SAFE_INTEGER;
+      const holdSatisfied = lockedByPosition || previousSide === 'NEUTRAL' || barsSinceStable >= BIAS_MIN_HOLD_BARS;
+      const candidateStrengthPct = candidateSide === 'NEUTRAL' ? 0 : this.sideStrengthPct(candidateSide, dfsPct);
+      const strengthSatisfied = candidateSide === 'NEUTRAL' || candidateStrengthPct >= BIAS_MIN_SIDE_STRENGTH_PCT;
+
+      if (runtime.biasPendingCount >= requiredConfirmations && holdSatisfied && strengthSatisfied) {
         side = candidateSide;
         runtime.biasPendingSide = null;
         runtime.biasPendingCount = 0;
+        runtime.biasPendingLastBarId = -1;
+        runtime.biasStableSinceBarId = barId;
+      } else {
+        side = previousSide;
       }
     }
 
     const baseConfidence = positionSide
       ? 1
       : source === 'TREND_LOCK'
-        ? Math.max(0.55, Number(state.stateConfidence || 0))
+        ? Math.max(0.58, Number(state.stateConfidence || 0))
         : Number(state.stateConfidence || 0);
     const confidence = side === candidateSide
       ? clamp(baseConfidence, 0, 1)
-      : clamp(baseConfidence * 0.85, 0, 1);
+      : clamp(Math.max(previousConfidence, baseConfidence * 0.8), 0, 1);
+    const finalSource = side === candidateSide ? source : previousSource;
+    const finalReason = side === candidateSide ? reason : previousReason;
 
     return {
       side,
       confidence: Number(confidence.toFixed(4)),
-      source,
+      source: finalSource,
       lockedByPosition,
       breakConfirm: runtime.trendBreakStreak,
-      reason,
+      reason: finalReason,
       timestampMs: nowMs,
     };
   }
 
   private shouldForceCrashExit(
+    side: StrategySide,
+    state: ReturnType<StateExtractor['extract']>,
+    snapshot: AIMetricsSnapshot,
+    runtime: RuntimeSymbolState,
+    dfsPct: number,
+    barId: number
+  ): boolean {
+    const signal = this.isCrashExitSignal(side, state, snapshot, runtime, dfsPct);
+    if (!signal) {
+      runtime.crashExitStreak = 0;
+      runtime.crashExitPendingBarId = -1;
+      return false;
+    }
+    if (runtime.crashExitPendingBarId !== barId) {
+      runtime.crashExitPendingBarId = barId;
+      runtime.crashExitStreak += 1;
+    }
+    return runtime.crashExitStreak >= CRASH_EXIT_CONFIRM_BARS;
+  }
+
+  private isCrashExitSignal(
     side: StrategySide,
     state: ReturnType<StateExtractor['extract']>,
     snapshot: AIMetricsSnapshot,
@@ -1174,6 +1257,8 @@ export class AIDryRunController {
       runtime.pyramidCount = 0;
       runtime.lastDcaBarId = -1;
       runtime.lastPyramidBarId = -1;
+      runtime.crashExitPendingBarId = -1;
+      runtime.crashExitStreak = 0;
     }
 
     if (!prevSide && currentSide) {
@@ -1182,6 +1267,12 @@ export class AIDryRunController {
       runtime.pyramidCount = 0;
       runtime.lastDcaBarId = -1;
       runtime.lastPyramidBarId = -1;
+      runtime.crashExitPendingBarId = -1;
+      runtime.crashExitStreak = 0;
+      runtime.biasPendingSide = null;
+      runtime.biasPendingCount = 0;
+      runtime.biasPendingLastBarId = -1;
+      runtime.biasStableSinceBarId = barId;
       if (runtime.lastClosedSide && runtime.lastClosedSide !== currentSide) {
         runtime.lastReversalEntryBarId = barId;
       }
@@ -1194,6 +1285,12 @@ export class AIDryRunController {
       runtime.pyramidCount = 0;
       runtime.lastDcaBarId = -1;
       runtime.lastPyramidBarId = -1;
+      runtime.crashExitPendingBarId = -1;
+      runtime.crashExitStreak = 0;
+      runtime.biasPendingSide = null;
+      runtime.biasPendingCount = 0;
+      runtime.biasPendingLastBarId = -1;
+      runtime.biasStableSinceBarId = barId;
     }
 
     runtime.positionSide = currentSide;
@@ -1230,10 +1327,6 @@ export class AIDryRunController {
 
   private sideStrengthPct(side: StrategySide, dfsPct: number): number {
     return side === 'LONG' ? dfsPct : (100 - dfsPct);
-  }
-
-  private flipSide(side: StrategySide): StrategySide {
-    return side === 'LONG' ? 'SHORT' : 'LONG';
   }
 
   private resetTelemetry(): void {

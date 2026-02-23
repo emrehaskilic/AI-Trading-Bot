@@ -106,11 +106,9 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
   };
   const positionSide = strategyPosition?.side ?? null;
   const biasSide = aiBias?.side === 'LONG' || aiBias?.side === 'SHORT' ? aiBias.side : null;
-  const trendSide = aiTrend?.side ?? null;
-  const effectiveSide = positionSide || biasSide || trendSide;
-  const trendScorePct = aiTrend ? Math.round(Math.max(0, Math.min(1, Number(aiTrend.score || 0))) * 100) : null;
+  const effectiveSide = positionSide || biasSide;
   const biasScorePct = aiBias ? Math.round(Math.max(0, Math.min(1, Number(aiBias.confidence || 0))) * 100) : null;
-  const trendDisplayScore = positionSide ? 100 : (biasScorePct ?? trendScorePct ?? 0);
+  const trendDisplayScore = positionSide ? 100 : (biasScorePct ?? 0);
   const trendLabel = effectiveSide || 'NEUTRAL';
   const trendClass = positionSide
     ? (positionSide === 'LONG'
@@ -118,7 +116,7 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
       : 'bg-red-900/35 text-red-200 border-red-700/50')
     : !effectiveSide
       ? 'bg-zinc-800 text-zinc-500 border-zinc-700'
-      : (aiTrend && !aiTrend.intact && !biasSide)
+      : (aiTrend && !aiTrend.intact)
         ? 'bg-amber-900/30 text-amber-300 border-amber-700/40'
         : effectiveSide === 'LONG'
           ? 'bg-green-900/25 text-green-300 border-green-700/40'
@@ -127,13 +125,13 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
             : 'bg-zinc-800 text-zinc-300 border-zinc-700';
   const displaySignal = positionSide
     ? `POSITION_${positionSide}` as const
-    : (biasSide ? `BIAS_${biasSide}` as const : (data.signalDisplay?.signal || (trendSide ? `TREND_${trendSide}` as const : null)));
+    : (biasSide ? `BIAS_${biasSide}` as const : null);
   const displaySignalScore = positionSide
     ? 100
-    : (biasScorePct ?? (Number.isFinite(Number(data.signalDisplay?.score)) ? Number(data.signalDisplay?.score) : 0));
+    : (biasScorePct ?? 0);
   const displaySignalReason = positionSide
     ? null
-    : (aiBias?.reason || data.signalDisplay?.vetoReason || null);
+    : (aiBias?.reason || data.signalDisplay?.vetoReason || 'BIAS_NEUTRAL');
   const posNegClass = (n: number) => (n > 0 ? 'text-emerald-300' : n < 0 ? 'text-rose-300' : 'text-zinc-200');
   const asNumber = (v: unknown): number | null => (Number.isFinite(Number(v)) ? Number(v) : null);
   const fmt = (v: unknown, d = 2) => {

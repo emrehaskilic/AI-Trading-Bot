@@ -1659,28 +1659,17 @@ function broadcastMetrics(
     const biasSignal = aiBias?.side === 'LONG' || aiBias?.side === 'SHORT'
         ? `BIAS_${aiBias.side}`
         : null;
-    const trendSignal = aiTrend?.side === 'LONG' || aiTrend?.side === 'SHORT'
-        ? `TREND_${aiTrend.side}`
-        : null;
-    const entryAction = Array.isArray(decision?.actions)
-        ? decision.actions.find((action: any) => action?.type === 'ENTRY' || action?.type === 'ADD')
-        : null;
-    const entrySignal = entryAction?.side === 'LONG' || entryAction?.side === 'SHORT'
-        ? `ENTRY_${entryAction.side}`
-        : null;
     const signal = hasOpenStrategyPosition
         ? `POSITION_${strategyPosition!.side}`
-        : (biasSignal || trendSignal || entrySignal || null);
+        : (biasSignal || null);
     const signalScore = hasOpenStrategyPosition
         ? 100
         : biasSignal
             ? Math.round(clampNumber(Number(aiBias?.confidence || 0) * 100, 0, 100))
-            : trendSignal
-            ? Math.round(clampNumber(Number(aiTrend?.score || 0) * 100, 0, 100))
-            : Math.round(clampNumber(Number(decision?.dfsPercentile || 0) * 100, 0, 100));
+            : 0;
     const signalVeto = signal
         ? null
-        : (aiBias?.reason || bf.vetoReason || (aiTrend ? 'TREND_NEUTRAL' : 'NO_SIGNAL'));
+        : (aiBias?.reason || bf.vetoReason || 'BIAS_NEUTRAL');
 
     const payload: any = {
         type: 'metrics',

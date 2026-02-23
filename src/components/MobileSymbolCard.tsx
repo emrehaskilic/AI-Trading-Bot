@@ -30,14 +30,12 @@ const MobileSymbolCard: React.FC<MobileSymbolCardProps> = ({ symbol, metrics, sh
   const aiBias = metrics.aiBias || null;
   const positionSide = metrics.strategyPosition?.side || null;
   const biasSide = aiBias?.side === 'LONG' || aiBias?.side === 'SHORT' ? aiBias.side : null;
-  const trendSide = positionSide || biasSide || trend?.side || 'NEUTRAL';
+  const trendSide = positionSide || biasSide || 'NEUTRAL';
   const trendScorePct = positionSide
     ? 100
     : (aiBias
       ? Math.round(Math.max(0, Math.min(1, Number(aiBias.confidence || 0))) * 100)
-      : trend
-        ? Math.round(Math.max(0, Math.min(1, Number(trend.score || 0))) * 100)
-        : null);
+      : 0);
   const trendClass = positionSide
     ? (positionSide === 'LONG'
       ? 'bg-emerald-900/35 text-emerald-200 border-emerald-700/50'
