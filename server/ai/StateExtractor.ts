@@ -26,7 +26,7 @@ export interface DeterministicStateSnapshot {
   spreadBps: number;
 }
 
-type StateKey = 'flowState' | 'regimeState' | 'derivativesState' | 'toxicityState' | 'executionState';
+type StateKey = 'flowState' | 'regimeState' | 'derivativesState' | 'toxicityState' | 'executionState' | 'directionalBias';
 
 type StableState<T extends string> = {
   current: T;
@@ -40,6 +40,7 @@ type SymbolMemory = {
   derivativesState: StableState<DerivativesState>;
   toxicityState: StableState<ToxicityState>;
   executionState: StableState<ExecutionHealthState>;
+  directionalBias: StableState<DirectionalBias>;
   volWindow: number[];
 };
 
@@ -57,6 +58,7 @@ const defaultMemory = (): SymbolMemory => ({
   derivativesState: initializeStableState<DerivativesState>('DELEVERAGING'),
   toxicityState: initializeStableState<ToxicityState>('CLEAN'),
   executionState: initializeStableState<ExecutionHealthState>('HEALTHY'),
+  directionalBias: initializeStableState<DirectionalBias>('NEUTRAL'),
   volWindow: [],
 });
 
@@ -96,7 +98,14 @@ export class StateExtractor {
     const toxicity = this.classifyToxicity(snapshot);
     const execution = this.classifyExecution(snapshot, spreadBps, expectedSlippageBps);
 
-    const directionalBias = this.resolveDirectionalBias(snapshot);
+    const directional = this.resolveDirectionalBias(snapshot, {
+      flowState: flow.state,
+      regimeState: regime.state,
+      derivativesState: derivatives.state,
+      toxicityState: toxicity.state,
+      executionState: execution.state,
+      volPercentile,
+    });
     const cvdSlopeSign = this.resolveSign(Number(snapshot.market.cvdSlope || 0), 10_000);
     const oiDirection = this.resolveSign(Number(snapshot.openInterest.oiChangePct || 0), 0.05);
 
@@ -105,8 +114,14 @@ export class StateExtractor {
     const derivativesState = this.stabilize(state, 'derivativesState', derivatives.state);
     const toxicityState = this.stabilize(state, 'toxicityState', toxicity.state, new Set<ToxicityState>(['TOXIC']));
     const executionState = this.stabilize(state, 'executionState', execution.state, new Set<ExecutionHealthState>(['LOW_RESILIENCY']));
+    const directionalBias = this.stabilize(state, 'directionalBias', directional.side);
 
-    const directionalConfidence = directionalBias === 'NEUTRAL' ? 0.35 : 0.72;
+    const rawDirectionalConfidence = directional.side === 'NEUTRAL'
+      ? clamp(0.35 + (directional.strength * 0.25), 0.35, 0.62)
+      : clamp(0.52 + (directional.strength * 0.42), 0.52, 0.94);
+    const directionalConfidence = directionalBias === directional.side
+      ? rawDirectionalConfidence
+      : clamp(rawDirectionalConfidence - 0.08, 0.35, 0.9);
     const confidence = clamp(
       (flow.confidence + regime.confidence + derivatives.confidence + toxicity.confidence + execution.confidence + directionalConfidence) / 6,
       0,
@@ -275,27 +290,83 @@ export class StateExtractor {
     return { state: 'HEALTHY', confidence: 0.62 };
   }
 
-  private resolveDirectionalBias(snapshot: AIMetricsSnapshot): DirectionalBias {
+  private resolveDirectionalBias(
+    snapshot: AIMetricsSnapshot,
+    context: {
+      flowState: FlowState;
+      regimeState: RegimeState;
+      derivativesState: DerivativesState;
+      toxicityState: ToxicityState;
+      executionState: ExecutionHealthState;
+      volPercentile: number;
+    }
+  ): { side: DirectionalBias; strength: number } {
+    let weightedSigned = 0;
+    let totalWeight = 0;
+    const push = (value: number, weight: number) => {
+      if (!Number.isFinite(value) || !Number.isFinite(weight) || weight <= 0) return;
+      weightedSigned += clamp(value, -1, 1) * weight;
+      totalWeight += weight;
+    };
+
     const delta = Number(snapshot.market.delta1s || 0) + Number(snapshot.market.delta5s || 0);
+    const deltaZ = Number(snapshot.market.deltaZ || 0);
     const cvd = Number(snapshot.market.cvdSlope || 0);
-    const obi = Number(snapshot.market.obiDeep || 0);
-    const absorption = snapshot.absorption.side;
+    const obiDeep = Number(snapshot.market.obiDeep || 0);
+    const obiWeighted = Number(snapshot.market.obiWeighted || 0);
+    const oiChangePct = Number(snapshot.openInterest.oiChangePct || 0);
+    const perpBasisZ = Number(snapshot.derivativesMetrics.perpBasisZScore || 0);
+    const buyVol = Math.max(0, Number(snapshot.trades.aggressiveBuyVolume || 0));
+    const sellVol = Math.max(0, Number(snapshot.trades.aggressiveSellVolume || 0));
+    const totalAggVol = buyVol + sellVol;
+    const aggressiveImbalance = totalAggVol > 0 ? ((buyVol - sellVol) / totalAggVol) : 0;
 
-    let longVotes = 0;
-    let shortVotes = 0;
+    push(this.normalizeSigned(delta, 12_000), 1.45);
+    push(this.normalizeSigned(deltaZ, 2.4), 1.2);
+    push(this.normalizeSigned(cvd, 24_000), 1.45);
+    push(this.normalizeSigned(obiDeep, 0.18), 1.15);
+    push(this.normalizeSigned(obiWeighted, 0.2), 0.8);
+    push(aggressiveImbalance, 0.95);
 
-    if (delta > 0) longVotes += 1;
-    if (delta < 0) shortVotes += 1;
-    if (cvd > 0) longVotes += 1;
-    if (cvd < 0) shortVotes += 1;
-    if (obi > 0.08) longVotes += 1;
-    if (obi < -0.08) shortVotes += 1;
-    if (absorption === 'buy') longVotes += 1;
-    if (absorption === 'sell') shortVotes += 1;
+    if (Math.abs(oiChangePct) > 0) {
+      const oiNorm = this.normalizeSigned(oiChangePct, 0.008);
+      const deltaDir = Math.sign(delta);
+      const oiDir = Math.sign(oiNorm);
+      const aligned = deltaDir !== 0 && oiDir !== 0 && deltaDir === oiDir;
+      push(aligned ? oiNorm : oiNorm * 0.45, 1.0);
+    }
 
-    if (longVotes >= 2 && longVotes > shortVotes) return 'LONG';
-    if (shortVotes >= 2 && shortVotes > longVotes) return 'SHORT';
-    return 'NEUTRAL';
+    if (snapshot.absorption.side === 'buy') {
+      push(clamp(Number(snapshot.absorption.value || 0), 0, 1), 0.95);
+    } else if (snapshot.absorption.side === 'sell') {
+      push(-clamp(Number(snapshot.absorption.value || 0), 0, 1), 0.95);
+    }
+
+    push(this.normalizeSigned(perpBasisZ, 2.8), 0.35);
+
+    const rawSigned = totalWeight > 0 ? (weightedSigned / totalWeight) : 0;
+    let adjustedSigned = rawSigned;
+
+    if (context.flowState === 'EXPANSION') adjustedSigned *= 1.08;
+    if (context.flowState === 'EXHAUSTION') adjustedSigned *= 0.72;
+    if (context.regimeState === 'CHOP') adjustedSigned *= 0.65;
+    if (context.regimeState === 'VOL_EXPANSION') adjustedSigned *= 0.75;
+    if (context.derivativesState === 'DELEVERAGING') adjustedSigned *= 0.8;
+    if (context.executionState !== 'HEALTHY') adjustedSigned *= 0.84;
+    if (context.toxicityState === 'TOXIC') adjustedSigned *= 0.78;
+    if (context.volPercentile >= 95) adjustedSigned *= 0.72;
+
+    const strength = clamp(Math.abs(adjustedSigned), 0, 1);
+    const threshold = context.regimeState === 'CHOP' ? 0.28 : 0.2;
+    if (strength < threshold) {
+      return { side: 'NEUTRAL', strength };
+    }
+    return { side: adjustedSigned >= 0 ? 'LONG' : 'SHORT', strength };
+  }
+
+  private normalizeSigned(value: number, scale: number): number {
+    const safeScale = Math.max(1e-9, Math.abs(scale));
+    return clamp(value / safeScale, -1, 1);
   }
 
   private resolveSign(value: number, threshold: number): TrendSign {

@@ -27,6 +27,7 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
     bids,
     asks,
     aiTrend,
+    aiBias,
     strategyPosition,
     liquidityMetrics,
     passiveFlowMetrics,
@@ -104,33 +105,35 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
     return `${mins}m`;
   };
   const positionSide = strategyPosition?.side ?? null;
+  const biasSide = aiBias?.side === 'LONG' || aiBias?.side === 'SHORT' ? aiBias.side : null;
   const trendSide = aiTrend?.side ?? null;
-  const effectiveSide = positionSide || trendSide;
+  const effectiveSide = positionSide || biasSide || trendSide;
   const trendScorePct = aiTrend ? Math.round(Math.max(0, Math.min(1, Number(aiTrend.score || 0))) * 100) : null;
-  const trendDisplayScore = positionSide ? 100 : (trendScorePct ?? 0);
+  const biasScorePct = aiBias ? Math.round(Math.max(0, Math.min(1, Number(aiBias.confidence || 0))) * 100) : null;
+  const trendDisplayScore = positionSide ? 100 : (biasScorePct ?? trendScorePct ?? 0);
   const trendLabel = effectiveSide || 'NEUTRAL';
   const trendClass = positionSide
     ? (positionSide === 'LONG'
       ? 'bg-green-900/35 text-green-200 border-green-700/50'
       : 'bg-red-900/35 text-red-200 border-red-700/50')
-    : !aiTrend
+    : !effectiveSide
       ? 'bg-zinc-800 text-zinc-500 border-zinc-700'
-      : !aiTrend.intact
+      : (aiTrend && !aiTrend.intact && !biasSide)
         ? 'bg-amber-900/30 text-amber-300 border-amber-700/40'
-        : trendSide === 'LONG'
+        : effectiveSide === 'LONG'
           ? 'bg-green-900/25 text-green-300 border-green-700/40'
-          : trendSide === 'SHORT'
+          : effectiveSide === 'SHORT'
             ? 'bg-red-900/25 text-red-300 border-red-700/40'
             : 'bg-zinc-800 text-zinc-300 border-zinc-700';
   const displaySignal = positionSide
     ? `POSITION_${positionSide}` as const
-    : (data.signalDisplay?.signal || (trendSide ? `TREND_${trendSide}` as const : null));
+    : (biasSide ? `BIAS_${biasSide}` as const : (data.signalDisplay?.signal || (trendSide ? `TREND_${trendSide}` as const : null)));
   const displaySignalScore = positionSide
     ? 100
-    : Number.isFinite(Number(data.signalDisplay?.score))
-      ? Number(data.signalDisplay?.score)
-      : (trendScorePct ?? 0);
-  const displaySignalReason = positionSide ? null : (data.signalDisplay?.vetoReason || null);
+    : (biasScorePct ?? (Number.isFinite(Number(data.signalDisplay?.score)) ? Number(data.signalDisplay?.score) : 0));
+  const displaySignalReason = positionSide
+    ? null
+    : (aiBias?.reason || data.signalDisplay?.vetoReason || null);
   const posNegClass = (n: number) => (n > 0 ? 'text-emerald-300' : n < 0 ? 'text-rose-300' : 'text-zinc-200');
   const asNumber = (v: unknown): number | null => (Number.isFinite(Number(v)) ? Number(v) : null);
   const fmt = (v: unknown, d = 2) => {
@@ -174,9 +177,9 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
           </button>
           <span className="font-bold text-white text-sm truncate">{symbol}</span>
           <span className="text-[8px] px-1 py-0.5 bg-zinc-800 text-zinc-500 rounded flex-shrink-0 uppercase tracking-tighter">PERP</span>
-          {(aiTrend || positionSide) && (
+          {(aiTrend || aiBias || positionSide) && (
             <span className={`text-[8px] px-1 py-0.5 rounded border flex-shrink-0 uppercase tracking-tight ${trendClass}`}>
-              {positionSide ? 'POS' : 'TR'} {trendLabel} {trendDisplayScore}
+              {positionSide ? 'POS' : (aiBias ? 'BIAS' : 'TR')} {trendLabel} {trendDisplayScore}
             </span>
           )}
         </div>

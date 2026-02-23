@@ -1613,6 +1613,7 @@ function broadcastMetrics(
     const bf = getBackfill(s).getState();
     const integrity = getIntegrity(s).getStatus(now);
     const aiTrend = aiDryRun.getTrendStatus(s, now);
+    const aiBias = aiDryRun.getBiasStatus(s, now);
     const tf1m = cvdM.find((x: any) => x.timeframe === '1m') || null;
     const tf5m = cvdM.find((x: any) => x.timeframe === '5m') || null;
     const tf15m = cvdM.find((x: any) => x.timeframe === '15m') || null;
@@ -1647,12 +1648,17 @@ function broadcastMetrics(
             : null,
     });
     const advancedBundle = precomputed?.advancedBundle ?? advancedMicro.getMetrics(now);
-    const strategyPosition = dryRunSession.getStrategyPosition(s);
+    const dryRunPosition = dryRunSession.getStrategyPosition(s);
+    const liveExecutionPosition = orchestrator.getSymbolPosition(s);
+    const strategyPosition = dryRunPosition || liveExecutionPosition;
     const hasOpenStrategyPosition = Boolean(
         strategyPosition
         && (strategyPosition.side === 'LONG' || strategyPosition.side === 'SHORT')
         && Number(strategyPosition.qty || 0) > 0
     );
+    const biasSignal = aiBias?.side === 'LONG' || aiBias?.side === 'SHORT'
+        ? `BIAS_${aiBias.side}`
+        : null;
     const trendSignal = aiTrend?.side === 'LONG' || aiTrend?.side === 'SHORT'
         ? `TREND_${aiTrend.side}`
         : null;
@@ -1664,15 +1670,17 @@ function broadcastMetrics(
         : null;
     const signal = hasOpenStrategyPosition
         ? `POSITION_${strategyPosition!.side}`
-        : (trendSignal || entrySignal || null);
+        : (biasSignal || trendSignal || entrySignal || null);
     const signalScore = hasOpenStrategyPosition
         ? 100
-        : trendSignal
+        : biasSignal
+            ? Math.round(clampNumber(Number(aiBias?.confidence || 0) * 100, 0, 100))
+            : trendSignal
             ? Math.round(clampNumber(Number(aiTrend?.score || 0) * 100, 0, 100))
             : Math.round(clampNumber(Number(decision?.dfsPercentile || 0) * 100, 0, 100));
     const signalVeto = signal
         ? null
-        : (bf.vetoReason || (aiTrend ? 'TREND_NEUTRAL' : 'NO_SIGNAL'));
+        : (aiBias?.reason || bf.vetoReason || (aiTrend ? 'TREND_NEUTRAL' : 'NO_SIGNAL'));
 
     const payload: any = {
         type: 'metrics',
@@ -1698,6 +1706,15 @@ function broadcastMetrics(
             breakConfirm: aiTrend.breakConfirm,
             source: aiTrend.source,
         } : null,
+        aiBias: aiBias ? {
+            side: aiBias.side,
+            confidence: Number(aiBias.confidence.toFixed(4)),
+            source: aiBias.source,
+            lockedByPosition: Boolean(aiBias.lockedByPosition),
+            breakConfirm: Number(aiBias.breakConfirm || 0),
+            reason: aiBias.reason || null,
+            timestampMs: Number(aiBias.timestampMs || now),
+        } : null,
         strategyPosition: hasOpenStrategyPosition
             ? {
                 side: strategyPosition!.side,
@@ -1705,7 +1722,7 @@ function broadcastMetrics(
                 entryPrice: Number(strategyPosition!.entryPrice || 0),
                 unrealizedPnlPct: Number(strategyPosition!.unrealizedPnlPct || 0),
                 addsUsed: Number(strategyPosition!.addsUsed || 0),
-                timeInPositionMs: Number(strategyPosition!.timeInPositionMs || 0),
+                timeInPositionMs: Number((strategyPosition as any).timeInPositionMs || 0),
             }
             : null,
         legacyMetrics: legacyM,

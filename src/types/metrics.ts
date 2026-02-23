@@ -8,6 +8,8 @@ export interface SignalDisplay {
     | 'ENTRY_SHORT'
     | 'TREND_LONG'
     | 'TREND_SHORT'
+    | 'BIAS_LONG'
+    | 'BIAS_SHORT'
     | 'POSITION_LONG'
     | 'POSITION_SHORT'
     | null;
@@ -33,6 +35,16 @@ export interface StrategyPositionSnapshot {
   unrealizedPnlPct: number;
   addsUsed: number;
   timeInPositionMs: number;
+}
+
+export interface AIBiasSnapshot {
+  side: 'LONG' | 'SHORT' | 'NEUTRAL';
+  confidence: number;
+  source: 'POSITION_LOCK' | 'TREND_LOCK' | 'STATE' | 'EXIT_SIGNAL';
+  lockedByPosition: boolean;
+  breakConfirm: number;
+  reason: string | null;
+  timestampMs: number;
 }
 
 export interface SnapshotMetadata {
@@ -217,6 +229,7 @@ export interface MetricsMessage {
     breakConfirm: number;
     source?: 'runtime' | 'bootstrap';
   } | null;
+  aiBias?: AIBiasSnapshot | null;
   legacyMetrics: LegacyMetrics;
   orderbookIntegrity?: {
     symbol: string;

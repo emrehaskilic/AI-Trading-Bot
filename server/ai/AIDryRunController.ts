@@ -1,7 +1,7 @@
 import { DecisionLog } from '../telemetry/DecisionLog';
 import { StrategyAction, StrategyActionType, StrategyDecision, StrategyDecisionLog, StrategySide } from '../types/strategy';
 import { DryRunSessionService } from '../dryrun/DryRunSessionService';
-import { AIDryRunConfig, AIDryRunStatus, AITrendStatus, AIMetricsSnapshot } from './types';
+import { AIBiasStatus, AIDryRunConfig, AIDryRunStatus, AITrendStatus, AIMetricsSnapshot } from './types';
 import { StateExtractor } from './StateExtractor';
 import { PolicyDecision, PolicyEngine } from './PolicyEngine';
 import { RiskGovernor } from './RiskGovernor';
@@ -33,6 +33,8 @@ const REVERSE_ADD_BLOCK_BARS = Math.max(0, Math.trunc(Number(process.env.AI_REVE
 const MAX_EXPOSURE_MULTIPLIER = Math.max(1, Number(process.env.AI_MAX_EXPOSURE_MULTIPLIER || 1.5));
 const SLIPPAGE_HARD_BPS = Math.max(1, Number(process.env.AI_SLIPPAGE_HARD_BPS || 12));
 const VOL_HARD_LIMIT = clamp(Number(process.env.AI_VOL_HARD_LIMIT_PCT || 97), 90, 100);
+const CRASH_EXIT_VOL_PCT = clamp(Number(process.env.AI_CRASH_EXIT_MIN_VOL_PCT || 90), 70, 100);
+const CRASH_EXIT_OPPOSING_STRENGTH = clamp(Number(process.env.AI_CRASH_EXIT_MIN_OPPOSING_STRENGTH || 62), 50, 90);
 
 type RuntimeSymbolState = {
   firstSeenTs: number;
@@ -43,6 +45,9 @@ type RuntimeSymbolState = {
   totalHoldMs: number;
   holdSamples: number;
   latestTrend: AITrendStatus | null;
+  latestBias: AIBiasStatus | null;
+  biasPendingSide: StrategySide | 'NEUTRAL' | null;
+  biasPendingCount: number;
   trendBreakStreak: number;
   lastTrendBreakBarId: number;
   lastTrendBreakTs: number;
@@ -68,6 +73,7 @@ const HARD_RISK_REASONS = new Set<string>([
   'TOXICITY_HARD_LIMIT',
   'VOL_HARD_LIMIT',
   'HARD_LIQUIDATION_RISK',
+  'CRASH_REVERSAL_EXIT',
 ]);
 
 const NON_FATAL_POLICY_ERRORS = new Set<string>([
@@ -213,6 +219,11 @@ export class AIDryRunController {
     };
   }
 
+  getBiasStatus(symbol: string, _nowMs = Date.now()): AIBiasStatus | null {
+    const key = String(symbol || '').toUpperCase();
+    return this.runtime.get(key)?.latestBias || null;
+  }
+
   async onMetrics(snapshot: AIMetricsSnapshot): Promise<void> {
     if (!this.active || !this.config || !this.policyEngine) return;
 
@@ -331,6 +342,19 @@ export class AIDryRunController {
         };
       }
 
+      if (
+        snapshot.position
+        && this.shouldForceCrashExit(snapshot.position.side, deterministicState, snapshot, runtime, dfsPct)
+      ) {
+        finalDecision = {
+          ...finalDecision,
+          intent: 'EXIT',
+          side: snapshot.position.side,
+          reducePct: null,
+          reasons: [...finalDecision.reasons, 'CRASH_REVERSAL_EXIT'],
+        };
+      }
+
       if (snapshot.position) {
         const hardRisk = finalDecision.reasons.some((reason) => HARD_RISK_REASONS.has(reason));
         const trendIntact = this.isTrendIntact(snapshot.position.side, deterministicState, snapshot, runtime);
@@ -388,6 +412,8 @@ export class AIDryRunController {
         }
       }
 
+      runtime.latestBias = this.resolveCanonicalBias(runtime, snapshot, deterministicState, finalDecision, dfsPct, nowMs);
+
       const decision = this.buildStrategyDecision(snapshot, finalDecision, {
         deterministicState,
         policy,
@@ -433,6 +459,16 @@ export class AIDryRunController {
     } catch (e: any) {
       this.lastError = String(e?.message || 'ai_policy_failed');
       this.telemetry.invalidLLMResponses += 1;
+      const runtime = this.getRuntime(symbol, nowMs);
+      runtime.latestBias = {
+        side: 'NEUTRAL',
+        confidence: 0,
+        source: 'STATE',
+        lockedByPosition: false,
+        breakConfirm: runtime.trendBreakStreak,
+        reason: 'POLICY_RUNTIME_ERROR',
+        timestampMs: nowMs,
+      };
       const holdDecision = this.buildStrategyDecision(snapshot, {
         intent: 'HOLD',
         side: null,
@@ -688,6 +724,9 @@ export class AIDryRunController {
         totalHoldMs: 0,
         holdSamples: 0,
         latestTrend: null,
+        latestBias: null,
+        biasPendingSide: null,
+        biasPendingCount: 0,
         trendBreakStreak: 0,
         lastTrendBreakBarId: -1,
         lastTrendBreakTs: 0,
@@ -758,6 +797,112 @@ export class AIDryRunController {
       count += runtime.holdSamples;
     }
     return count > 0 ? Number((total / count).toFixed(2)) : 0;
+  }
+
+  private resolveCanonicalBias(
+    runtime: RuntimeSymbolState,
+    snapshot: AIMetricsSnapshot,
+    state: ReturnType<StateExtractor['extract']>,
+    finalDecision: {
+      intent: 'HOLD' | 'ENTER' | 'ADD' | 'REDUCE' | 'EXIT';
+      side: StrategySide | null;
+      confidence: number;
+      reasons: string[];
+    },
+    dfsPct: number,
+    nowMs: number
+  ): AIBiasStatus {
+    const positionSide = snapshot.position?.side || null;
+    const crashExit = Boolean(positionSide)
+      && this.shouldForceCrashExit(positionSide as StrategySide, state, snapshot, runtime, dfsPct);
+
+    let candidateSide: StrategySide | 'NEUTRAL' = 'NEUTRAL';
+    let source: AIBiasStatus['source'] = 'STATE';
+    let lockedByPosition = false;
+    let reason: string | null = finalDecision.reasons[0] || null;
+
+    if (positionSide && !crashExit) {
+      candidateSide = positionSide;
+      source = 'POSITION_LOCK';
+      lockedByPosition = true;
+      reason = reason || 'POSITION_LOCK';
+    } else if (finalDecision.intent === 'EXIT' && positionSide) {
+      candidateSide = this.flipSide(positionSide);
+      source = 'EXIT_SIGNAL';
+      reason = reason || 'EXIT_SIGNAL';
+    } else if (runtime.trendSide) {
+      candidateSide = runtime.trendSide;
+      source = 'TREND_LOCK';
+      reason = reason || 'TREND_LOCK';
+    } else if (state.directionalBias === 'LONG' || state.directionalBias === 'SHORT') {
+      candidateSide = state.directionalBias;
+      source = 'STATE';
+      reason = reason || 'STATE_DIRECTIONAL_BIAS';
+    }
+
+    const previousSide = runtime.latestBias?.side || 'NEUTRAL';
+    let side: StrategySide | 'NEUTRAL' = previousSide;
+
+    if (candidateSide === previousSide) {
+      runtime.biasPendingSide = null;
+      runtime.biasPendingCount = 0;
+      side = candidateSide;
+    } else {
+      const requiredConfirmations = (lockedByPosition || source === 'EXIT_SIGNAL') ? 1 : 2;
+      if (runtime.biasPendingSide !== candidateSide) {
+        runtime.biasPendingSide = candidateSide;
+        runtime.biasPendingCount = 1;
+      } else {
+        runtime.biasPendingCount += 1;
+      }
+      if (runtime.biasPendingCount >= requiredConfirmations) {
+        side = candidateSide;
+        runtime.biasPendingSide = null;
+        runtime.biasPendingCount = 0;
+      }
+    }
+
+    const baseConfidence = positionSide
+      ? 1
+      : source === 'TREND_LOCK'
+        ? Math.max(0.55, Number(state.stateConfidence || 0))
+        : Number(state.stateConfidence || 0);
+    const confidence = side === candidateSide
+      ? clamp(baseConfidence, 0, 1)
+      : clamp(baseConfidence * 0.85, 0, 1);
+
+    return {
+      side,
+      confidence: Number(confidence.toFixed(4)),
+      source,
+      lockedByPosition,
+      breakConfirm: runtime.trendBreakStreak,
+      reason,
+      timestampMs: nowMs,
+    };
+  }
+
+  private shouldForceCrashExit(
+    side: StrategySide,
+    state: ReturnType<StateExtractor['extract']>,
+    snapshot: AIMetricsSnapshot,
+    runtime: RuntimeSymbolState,
+    dfsPct: number
+  ): boolean {
+    const opposingStrength = side === 'LONG' ? (100 - dfsPct) : dfsPct;
+    if (opposingStrength < CRASH_EXIT_OPPOSING_STRENGTH) return false;
+
+    const opposingBias = (side === 'LONG' && state.directionalBias === 'SHORT')
+      || (side === 'SHORT' && state.directionalBias === 'LONG');
+    const oiOpposing = (side === 'LONG' && state.oiDirection === 'DOWN')
+      || (side === 'SHORT' && state.oiDirection === 'UP');
+    const cvdOpposingAccel = this.isCvdOpposingAccelerating(side, Number(snapshot.market.cvdSlope || 0), runtime.lastCvdSlope);
+    const flowBreak = state.flowState === 'EXHAUSTION' || (state.flowState === 'ABSORPTION' && this.isOpposingPressure(side, state));
+    const severeVol = Number(state.volatilityPercentile || 0) >= CRASH_EXIT_VOL_PCT;
+    const severeExec = state.executionState === 'LOW_RESILIENCY';
+
+    if (!(opposingBias || oiOpposing || cvdOpposingAccel)) return false;
+    return severeVol || severeExec || flowBreak;
   }
 
   private isTrendIntact(
@@ -1085,6 +1230,10 @@ export class AIDryRunController {
 
   private sideStrengthPct(side: StrategySide, dfsPct: number): number {
     return side === 'LONG' ? dfsPct : (100 - dfsPct);
+  }
+
+  private flipSide(side: StrategySide): StrategySide {
+    return side === 'LONG' ? 'SHORT' : 'LONG';
   }
 
   private resetTelemetry(): void {

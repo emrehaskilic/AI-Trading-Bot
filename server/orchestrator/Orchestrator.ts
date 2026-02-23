@@ -341,6 +341,28 @@ export class Orchestrator {
     };
   }
 
+  getSymbolPosition(symbol: string): {
+    side: 'LONG' | 'SHORT';
+    qty: number;
+    entryPrice: number;
+    unrealizedPnlPct: number;
+    addsUsed: number;
+  } | null {
+    const normalized = String(symbol || '').toUpperCase();
+    const snapshot = this.stateSnapshots.get(normalized);
+    const live = snapshot?.position;
+    if (!live || !(Number(live.qty || 0) > 0)) {
+      return null;
+    }
+    return {
+      side: live.side,
+      qty: Number(live.qty || 0),
+      entryPrice: Number(live.entryPrice || 0),
+      unrealizedPnlPct: Number(live.unrealizedPnlPct || 0),
+      addsUsed: Number(live.addsUsed || 0),
+    };
+  }
+
   async updateCapitalSettings(input: {
     leverage?: number;
     pairInitialMargins?: Record<string, number>;

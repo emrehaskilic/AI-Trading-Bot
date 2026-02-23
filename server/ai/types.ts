@@ -83,6 +83,16 @@ export type AITrendStatus = {
   source: 'runtime' | 'bootstrap';
 };
 
+export type AIBiasStatus = {
+  side: StrategySide | 'NEUTRAL';
+  confidence: number;
+  source: 'POSITION_LOCK' | 'TREND_LOCK' | 'STATE' | 'EXIT_SIGNAL';
+  lockedByPosition: boolean;
+  breakConfirm: number;
+  reason: string | null;
+  timestampMs: number;
+};
+
 export type AIDryRunStatus = {
   active: boolean;
   model: string | null;
