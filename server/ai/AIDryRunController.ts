@@ -3,7 +3,7 @@ import { StrategyAction, StrategyActionType, StrategyDecision, StrategyDecisionL
 import { DryRunSessionService } from '../dryrun/DryRunSessionService';
 import { AIBiasStatus, AIDryRunConfig, AIDryRunStatus, AITrendStatus, AIMetricsSnapshot } from './types';
 import { StateExtractor } from './StateExtractor';
-import { PolicyDecision, PolicyEngine } from './PolicyEngine';
+import { PolicyDecision, PolicyEngine, PolicyLLMCaller } from './PolicyEngine';
 import { RiskGovernor } from './RiskGovernor';
 import { DirectionLock } from './DirectionLock';
 import { AIPerformanceTracker } from './AIPerformanceTracker';
@@ -23,7 +23,8 @@ const DEFAULT_TREND_BREAK_CONFIRM_TICKS = Math.max(1, Math.trunc(clamp(Number(pr
 const DEFAULT_MIN_REDUCE_GAP_MS = Math.max(0, Math.trunc(Number(process.env.AI_MIN_REDUCE_GAP_MS || 30_000)));
 const REENTRY_COOLDOWN_BARS = Math.max(0, Math.trunc(Number(process.env.AI_REENTRY_COOLDOWN_BARS || 2)));
 
-const STRICT_3M_MODE_ENABLED = isEnabled(process.env.AI_STRICT_3M_TREND_MODE, true);
+const TEST_LOCAL_POLICY_ENABLED = isEnabled(process.env.AI_TEST_LOCAL_POLICY, false);
+const STRICT_3M_MODE_ENABLED = TEST_LOCAL_POLICY_ENABLED && isEnabled(process.env.AI_STRICT_3M_TREND_MODE, false);
 const BAR_MS = Math.max(1, Math.trunc(Number(process.env.AI_BAR_INTERVAL_MS || 180_000)));
 const MIN_TREND_DURATION_BARS = Math.max(1, Math.trunc(Number(process.env.AI_MIN_TREND_DURATION_BARS || 3)));
 const DCA_MAX_COUNT = Math.max(0, Math.trunc(Number(process.env.AI_DCA_MAX_COUNT || 3)));
@@ -145,12 +146,13 @@ export class AIDryRunController {
     temperature?: number;
     maxOutputTokens?: number;
     localOnly?: boolean;
+    llmCaller?: PolicyLLMCaller;
     bootstrapTrendBySymbol?: Record<string, { bias: 'LONG' | 'SHORT' | null; strength?: number; asOfMs?: number }>;
   }): void {
     const symbols = input.symbols.map((s) => String(s || '').toUpperCase()).filter(Boolean);
     const apiKey = String(input.apiKey || '').trim();
     const model = String(input.model || '').trim();
-    const localOnly = STRICT_3M_MODE_ENABLED ? true : (Boolean(input.localOnly) || !apiKey || !model);
+    const localOnly = TEST_LOCAL_POLICY_ENABLED && Boolean(input.localOnly);
 
     this.symbols = new Set(symbols);
     this.config = {
@@ -175,6 +177,8 @@ export class AIDryRunController {
       temperature: this.config.temperature,
       maxOutputTokens: this.config.maxOutputTokens,
       localOnly,
+      llmCaller: input.llmCaller,
+      testLocalPolicyEnabled: TEST_LOCAL_POLICY_ENABLED,
     });
 
     this.active = true;
@@ -271,27 +275,26 @@ export class AIDryRunController {
       runtime.latestTrend = this.toTrendView(deterministicState, snapshot, nowMs, runtime.latestTrend);
 
       const ready = this.isReadyForPolicy(snapshot);
-      const hasOpenPosition = Boolean(snapshot.position);
       const confidenceEnough = deterministicState.stateConfidence >= DEFAULT_STATE_CONFIDENCE_THRESHOLD;
       const startupExecutionPass = deterministicState.executionState === 'HEALTHY';
       const startupSafetyPass =
         startupExecutionPass
         && deterministicState.toxicityState !== 'TOXIC'
         && deterministicState.volatilityPercentile < 95;
-      const canEvaluateForEntry = confidenceEnough && startupSafetyPass;
-      const canEvaluatePolicy = ready && (hasOpenPosition || canEvaluateForEntry);
+      const canEvaluatePolicy = ready && confidenceEnough;
 
-      let policy: PolicyDecision = { intent: 'HOLD', side: null, riskMultiplier: 0.2, confidence: 0 };
-      let policySource: 'LLM' | 'LOCAL_POLICY' | 'HOLD_FALLBACK' = 'LOCAL_POLICY';
+      let policy: PolicyDecision = { intent: 'HOLD', side: null, riskMultiplier: 1, confidence: 0 };
+      let policySource: 'LLM' | 'LOCAL_POLICY' = 'LLM';
       let policyError: string | null = null;
       let policyGateReason: string | null = null;
       let rawPolicyText: string | null = null;
+      let parsedPolicy: PolicyDecision | null = null;
 
       if (canEvaluatePolicy) {
         if (STRICT_3M_MODE_ENABLED) {
           policy = this.computeStrict3MPolicy(snapshot, deterministicState, runtime, barId, dfsPct);
           policySource = 'LOCAL_POLICY';
-          policyError = null;
+          parsedPolicy = policy;
         } else {
           const policyResult = await this.policyEngine.evaluate({
             symbol,
@@ -305,33 +308,50 @@ export class AIDryRunController {
           policy = policyResult.decision;
           policySource = policyResult.source;
           policyError = policyResult.error;
-          rawPolicyText = policyResult.rawText;
-
-          if (policyResult.source === 'HOLD_FALLBACK') {
-            this.telemetry.invalidLLMResponses += 1;
-          }
+          rawPolicyText = policyResult.rawText ? String(policyResult.rawText).slice(0, 200) : null;
+          parsedPolicy = policyResult.parsedPolicy;
         }
       } else {
-        policySource = 'LOCAL_POLICY';
-        policyError = null;
         if (!ready) {
           policyGateReason = 'state_not_ready';
         } else if (!confidenceEnough) {
           policyGateReason = 'state_confidence_low';
-        } else if (!startupSafetyPass) {
-          policyGateReason = 'startup_safety_block';
         } else {
           policyGateReason = 'policy_gate_blocked';
         }
       }
 
-      const governed = this.riskGovernor.apply({
+      const forceHoldReasons: string[] = [];
+      if (policySource !== 'LLM') {
+        forceHoldReasons.push('POLICY_NOT_FROM_LLM');
+      }
+      if (policyError) {
+        forceHoldReasons.push('POLICY_ERROR_HOLD');
+      }
+      if (forceHoldReasons.length > 0) {
+        policy = { intent: 'HOLD', side: null, riskMultiplier: 1, confidence: 0 };
+      }
+      if (policyError) {
+        this.telemetry.invalidLLMResponses += 1;
+      }
+
+      let governed = this.riskGovernor.apply({
         symbol,
         timestampMs: nowMs,
         policy,
         deterministicState,
         snapshot,
       });
+
+      if (forceHoldReasons.length > 0) {
+        governed = {
+          ...governed,
+          intent: 'HOLD',
+          side: null,
+          reducePct: null,
+          reasons: [...governed.reasons, ...forceHoldReasons],
+        };
+      }
 
       if (governed.intent !== policy.intent) {
         this.telemetry.guardrailBlocks += 1;
@@ -446,6 +466,7 @@ export class AIDryRunController {
         policyError,
         policyGateReason,
         rawPolicyText,
+        parsedPolicy,
         confidenceEnough,
         startupSafetyPass,
         ready,
@@ -485,8 +506,11 @@ export class AIDryRunController {
         finalSide: finalDecision.side,
         reasons: finalDecision.reasons,
         policySource,
+        llmUsed: policySource === 'LLM',
         policyError,
         policyGateReason,
+        policyRawText: rawPolicyText,
+        parsedPolicy,
         strict3MMode: STRICT_3M_MODE_ENABLED,
       });
     } catch (e: any) {
@@ -511,7 +535,7 @@ export class AIDryRunController {
         intent: 'HOLD',
         side: null,
         confidence: 0,
-        riskMultiplier: 0.2,
+        riskMultiplier: 1,
         sizeMultiplier: 0,
         reducePct: null,
         maxPositionNotional: 0,
@@ -519,11 +543,12 @@ export class AIDryRunController {
         reasons: ['POLICY_RUNTIME_ERROR'],
       }, {
         deterministicState: this.extractor.extract(snapshot),
-        policy: { intent: 'HOLD', side: null, confidence: 0, riskMultiplier: 0.2 },
-        policySource: 'HOLD_FALLBACK',
+        policy: { intent: 'HOLD', side: null, confidence: 0, riskMultiplier: 1 },
+        policySource: 'LLM',
         policyError: this.lastError,
         policyGateReason: null,
         rawPolicyText: null,
+        parsedPolicy: null,
         confidenceEnough: false,
         startupSafetyPass: false,
         ready: false,
@@ -554,10 +579,11 @@ export class AIDryRunController {
       context: {
       deterministicState: ReturnType<StateExtractor['extract']>;
       policy: PolicyDecision;
-      policySource: 'LLM' | 'LOCAL_POLICY' | 'HOLD_FALLBACK';
+      policySource: 'LLM' | 'LOCAL_POLICY';
       policyError: string | null;
       policyGateReason: string | null;
       rawPolicyText: string | null;
+      parsedPolicy: PolicyDecision | null;
       confidenceEnough: boolean;
       startupSafetyPass: boolean;
       ready: boolean;
@@ -574,6 +600,7 @@ export class AIDryRunController {
         reason: 'NOOP',
         metadata: {
           aiPolicy: true,
+          llmUsed: context.policySource === 'LLM',
           deterministic: context.deterministicState,
           policySource: context.policySource,
           policyError: context.policyError,
@@ -669,12 +696,15 @@ export class AIDryRunController {
         reason: null,
         details: {
           aiPolicy: true,
+          llmUsed: context.policySource === 'LLM',
           deterministicState: context.deterministicState,
           policy: context.policy,
           policySource: context.policySource,
           policyError: context.policyError,
           policyGateReason: context.policyGateReason,
           policyRawText: context.rawPolicyText,
+          parsedPolicy: context.parsedPolicy,
+          finalIntent: governed.intent,
           governorReasons: governed.reasons,
           ready: context.ready,
           confidenceEnough: context.confidenceEnough,

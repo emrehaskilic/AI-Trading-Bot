@@ -8,14 +8,43 @@ function assert(condition: unknown, message: string): void {
 export function runTests() {
   {
     const extractor = new StateExtractor(10);
+    const bid = 78.06;
+    const ask = 78.07;
+    const mid = (bid + ask) / 2;
+    const spreadRatio = (ask - bid) / mid;
+    const spreadPct = spreadRatio * 100;
+
+    // Warm-up to pass state hysteresis in extractor.
+    extractor.extract(buildAIMetricsSnapshot({
+      symbol: 'SOLUSDT',
+      market: { spreadPct },
+    }));
+
+    const state = extractor.extract(buildAIMetricsSnapshot({
+      symbol: 'SOLUSDT',
+      market: { spreadPct },
+    }));
+
+    const expectedSpreadBps = spreadRatio * 10_000;
+    assert(Math.abs(spreadRatio - 0.000128098379555382) < 1e-12, 'spread ratio conversion should match expected baseline');
+    assert(Math.abs(spreadPct - 0.0128098379555382) < 1e-12, 'spread percent conversion should match expected baseline');
+    assert(Math.abs(state.spreadBps - expectedSpreadBps) < 1e-3, `spread bps should be ${expectedSpreadBps}, got ${state.spreadBps}`);
+    assert(state.spreadBps < 10, 'spread bps should never show 100x inflation for this case');
+    assert(state.executionState !== 'LOW_RESILIENCY', '1.28 bps spread must not force LOW_RESILIENCY by spread alone');
+  }
+
+  {
+    const extractor = new StateExtractor(10);
     extractor.extract(buildAIMetricsSnapshot({
       market: { deltaZ: 2.3, cvdSlope: 60_000, obiDeep: 0.5 },
       openInterest: { oiChangePct: 0.45 },
+      liquidityMetrics: { expectedSlippageBuy: 0.5, expectedSlippageSell: 0.5 },
       toxicityMetrics: { vpinApprox: 0.25, burstPersistenceScore: 0.35, priceImpactPerSignedNotional: 0.00001 },
     }));
     const state = extractor.extract(buildAIMetricsSnapshot({
       market: { deltaZ: 2.3, cvdSlope: 60_000, obiDeep: 0.5 },
       openInterest: { oiChangePct: 0.45 },
+      liquidityMetrics: { expectedSlippageBuy: 0.5, expectedSlippageSell: 0.5 },
       toxicityMetrics: { vpinApprox: 0.25, burstPersistenceScore: 0.35, priceImpactPerSignedNotional: 0.00001 },
     }));
     assert(state.flowState === 'EXPANSION', 'flow should classify as EXPANSION');

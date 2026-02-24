@@ -82,10 +82,13 @@ export class StateExtractor {
     }
 
     const volPercentile = this.computePercentile(state.volWindow, volatility);
+    // `snapshot.market.spreadPct` is represented in percent units (e.g. 0.0128 = 1.28 bps).
+    // Normalize to ratio first, then derive bps from ratio.
     const spreadPct = Number.isFinite(snapshot.market.spreadPct as number)
       ? Math.max(0, Math.abs(Number(snapshot.market.spreadPct || 0)))
       : 0;
-    const spreadBps = spreadPct * 10_000;
+    const spreadRatio = spreadPct / 100;
+    const spreadBps = spreadRatio * 10_000;
     const expectedSlippageBps = Math.max(
       0,
       Number(snapshot.liquidityMetrics.expectedSlippageBuy || 0),
