@@ -104,6 +104,14 @@ export type AIDryRunStatus = {
   lastError: string | null;
   symbols: string[];
   telemetry: AIDecisionTelemetry;
+  performance: {
+    samples: number;
+    winRate: number;
+    avgOutcome: number;
+    avgWin: number;
+    avgLoss: number;
+    profitFactor: number;
+  };
 };
 
 export type AIMetricsSnapshot = {

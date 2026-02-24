@@ -650,7 +650,16 @@ export class ExecutionConnector {
       params: { symbol: symbol.toUpperCase() },
     });
 
-    const row = Array.isArray(response) ? response[0] : response;
+    const symbolKey = symbol.toUpperCase();
+    const collapsed = this.collapsePositionsBySymbol(Array.isArray(response) ? response : [response], {
+      symbol: (row) => String(row?.symbol || symbolKey).toUpperCase(),
+      amount: (row) => Number(row?.positionAmt || 0),
+      entryPrice: (row) => Number(row?.entryPrice || 0),
+      unrealized: (row) => Number(row?.unRealizedProfit || 0),
+      positionSide: (row) => String(row?.positionSide || 'BOTH').toUpperCase(),
+    });
+
+    const row = collapsed.get(symbolKey);
     if (!row) {
       return null;
     }
@@ -681,12 +690,13 @@ export class ExecutionConnector {
     this.availableBalance = Number(usdtBalance?.availableBalance || 0);
     this.walletBalance = Number(usdtBalance?.balance || 0);
 
-    const bySymbol = new Map<string, any>();
-    if (Array.isArray(positions)) {
-      for (const p of positions) {
-        bySymbol.set(String(p.symbol), p);
-      }
-    }
+    const bySymbol = this.collapsePositionsBySymbol(Array.isArray(positions) ? positions : [], {
+      symbol: (row) => String(row?.symbol || '').toUpperCase(),
+      amount: (row) => Number(row?.positionAmt || 0),
+      entryPrice: (row) => Number(row?.entryPrice || 0),
+      unrealized: (row) => Number(row?.unRealizedProfit || 0),
+      positionSide: (row) => String(row?.positionSide || 'BOTH').toUpperCase(),
+    });
 
     for (const symbol of this.symbols) {
       const p = bySymbol.get(symbol);
@@ -881,9 +891,15 @@ export class ExecutionConnector {
       this.walletBalance = Number(balance?.wb || 0);
       const eventTime = Number(message.E || 0);
 
-      const positions = Array.isArray(message.a.P) ? message.a.P : [];
-      for (const p of positions) {
-        const symbol = String(p.s || '').toUpperCase();
+      const positions = this.collapsePositionsBySymbol(Array.isArray(message.a.P) ? message.a.P : [], {
+        symbol: (row) => String(row?.s || '').toUpperCase(),
+        amount: (row) => Number(row?.pa || 0),
+        entryPrice: (row) => Number(row?.ep || 0),
+        unrealized: (row) => Number(row?.up || 0),
+        positionSide: (row) => String(row?.ps || 'BOTH').toUpperCase(),
+      });
+
+      for (const [symbol, p] of positions.entries()) {
         if (!symbol || !this.symbols.has(symbol)) {
           continue;
         }
@@ -893,9 +909,9 @@ export class ExecutionConnector {
           event_time_ms: eventTime,
           availableBalance: this.availableBalance,
           walletBalance: this.walletBalance,
-          positionAmt: Number(p.pa || 0),
-          entryPrice: Number(p.ep || 0),
-          unrealizedPnL: Number(p.up || 0),
+          positionAmt: Number(p.positionAmt || 0),
+          entryPrice: Number(p.entryPrice || 0),
+          unrealizedPnL: Number(p.unRealizedProfit || 0),
         });
       }
       return;
@@ -1049,6 +1065,47 @@ export class ExecutionConnector {
       requiresAuth: false,
       params: { listenKey },
     });
+  }
+
+  private collapsePositionsBySymbol(
+    rows: any[],
+    selectors: {
+      symbol: (row: any) => string;
+      amount: (row: any) => number;
+      entryPrice: (row: any) => number;
+      unrealized: (row: any) => number;
+      positionSide?: (row: any) => string;
+    }
+  ): Map<string, { positionAmt: number; entryPrice: number; unRealizedProfit: number }> {
+    const out = new Map<string, { positionAmt: number; entryPrice: number; unRealizedProfit: number }>();
+    for (const row of rows) {
+      const symbol = selectors.symbol(row).toUpperCase();
+      if (!symbol) continue;
+
+      const signedAmt = this.normalizePositionAmt(
+        selectors.amount(row),
+        selectors.positionSide ? selectors.positionSide(row) : undefined
+      );
+      const entryPrice = Number(selectors.entryPrice(row) || 0);
+      const unRealizedProfit = Number(selectors.unrealized(row) || 0);
+      const prev = out.get(symbol);
+
+      // For hedge-mode payloads we may receive both LONG/SHORT legs; keep the dominant leg.
+      if (!prev || Math.abs(signedAmt) >= Math.abs(prev.positionAmt)) {
+        out.set(symbol, { positionAmt: signedAmt, entryPrice, unRealizedProfit });
+      }
+    }
+    return out;
+  }
+
+  private normalizePositionAmt(amount: number, positionSideRaw?: string): number {
+    const amt = Number(amount || 0);
+    if (!Number.isFinite(amt)) return 0;
+
+    const positionSide = String(positionSideRaw || 'BOTH').toUpperCase();
+    if (positionSide === 'LONG') return Math.abs(amt);
+    if (positionSide === 'SHORT') return -Math.abs(amt);
+    return amt;
   }
 
   private emitEvent(event: ExecutionEvent) {

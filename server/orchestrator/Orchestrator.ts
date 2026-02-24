@@ -532,7 +532,8 @@ export class Orchestrator {
       profitLockBufferBps: this.config.profitLockBufferBps,
     });
 
-    const planRunner = this.ensurePlanRunner(normalized);
+    const engineMode = this.config.engineMode === 'DECISION' ? 'DECISION' : 'PLAN';
+    const planRunner = engineMode === 'PLAN' ? this.ensurePlanRunner(normalized) : undefined;
 
     const actor = new SymbolActor({
       symbol: normalized,
@@ -1336,6 +1337,9 @@ export function createOrchestratorFromEnv(alertService?: AlertService): Orchestr
   };
 
   const executionEnabledEnv = parseEnvFlag(process.env.EXECUTION_ENABLED);
+  const engineMode: 'PLAN' | 'DECISION' = String(process.env.ORCHESTRATOR_ENGINE_MODE || 'PLAN').trim().toUpperCase() === 'DECISION'
+    ? 'DECISION'
+    : 'PLAN';
   const enableGateV2 = parseEnvFlag(process.env.ENABLE_GATE_V2);
   const gateMode: GateMode = enableGateV2 ? 'V2_NETWORK_LATENCY' : 'V1_NO_LATENCY';
   const gate: GateConfig = {
@@ -1343,7 +1347,7 @@ export function createOrchestratorFromEnv(alertService?: AlertService): Orchestr
     maxSpreadPct: Number(process.env.MAX_SPREAD_PCT || 0.12),
     minObiDeep: Number(process.env.MIN_OBI_DEEP || 0.03),
     v2: {
-      maxNetworkLatencyMs: Number(process.env.MAX_NETWORK_LATENCY_MS || 1500),
+      maxNetworkLatencyMs: Number(process.env.MAX_NETWORK_LATENCY_MS || 2500),
     },
   };
 
@@ -1396,20 +1400,48 @@ export function createOrchestratorFromEnv(alertService?: AlertService): Orchestr
       upExit: Number(process.env.TREND_UP_EXIT || 0.15),
       downEnter: Number(process.env.TREND_DOWN_ENTER || -0.45),
       downExit: Number(process.env.TREND_DOWN_EXIT || -0.15),
-      confirmTicks: Number(process.env.TREND_CONFIRM_TICKS || 3),
-      reversalConfirmTicks: Number(process.env.TREND_REVERSAL_CONFIRM_TICKS || 4),
+      confirmTicks: Number(process.env.TREND_CONFIRM_TICKS || 2),
+      reversalConfirmTicks: Number(process.env.TREND_REVERSAL_CONFIRM_TICKS || 3),
+      dynamicConfirmByVolatility: parseEnvFlag(process.env.TREND_DYNAMIC_CONFIRM_BY_VOLATILITY ?? 'true'),
+      highVolatilityThresholdPct: Number(process.env.TREND_HIGH_VOL_THRESHOLD_PCT || 90),
+      mediumVolatilityThresholdPct: Number(process.env.TREND_MEDIUM_VOL_THRESHOLD_PCT || 70),
+      highVolConfirmTicks: Number(process.env.TREND_HIGH_VOL_CONFIRM_TICKS || 2),
+      mediumVolConfirmTicks: Number(process.env.TREND_MEDIUM_VOL_CONFIRM_TICKS || 3),
+      lowVolConfirmTicks: Number(process.env.TREND_LOW_VOL_CONFIRM_TICKS || 4),
+      highVolReversalConfirmTicks: Number(process.env.TREND_HIGH_VOL_REVERSAL_CONFIRM_TICKS || 2),
+      mediumVolReversalConfirmTicks: Number(process.env.TREND_MEDIUM_VOL_REVERSAL_CONFIRM_TICKS || 3),
+      lowVolReversalConfirmTicks: Number(process.env.TREND_LOW_VOL_REVERSAL_CONFIRM_TICKS || 4),
       obiNorm: Number(process.env.TREND_OBI_NORM || 0.3),
       deltaNorm: Number(process.env.TREND_DELTA_NORM || 1.0),
       cvdNorm: Number(process.env.TREND_CVD_NORM || 0.8),
       scoreClamp: Number(process.env.TREND_SCORE_CLAMP || 1.0),
+    },
+    multiTimeframe: {
+      enabled: parseEnvFlag(process.env.MTF_ENABLED ?? 'true'),
+      minConsensus: Number(process.env.MTF_MIN_CONSENSUS || 0.7),
+      oppositeExitConsensus: Number(process.env.MTF_OPPOSITE_EXIT_CONSENSUS || 0.8),
+      deadband: Number(process.env.MTF_DEADBAND || 0.1),
+      weights: {
+        m1: Number(process.env.MTF_WEIGHT_M1 || 1.0),
+        m3: Number(process.env.MTF_WEIGHT_M3 || 1.0),
+        m5: Number(process.env.MTF_WEIGHT_M5 || 1.2),
+        m15: Number(process.env.MTF_WEIGHT_M15 || 1.4),
+      },
+      norms: {
+        m1: Number(process.env.MTF_NORM_M1 || 1),
+        m3: Number(process.env.MTF_NORM_M3 || 1),
+        m5: Number(process.env.MTF_NORM_M5 || 500),
+        m15: Number(process.env.MTF_NORM_M15 || 1000),
+      },
     },
     scaleIn: {
       levels: Number(process.env.SCALE_IN_LEVELS || 3),
       stepPct: Number(process.env.SCALE_IN_STEP_PCT || 0.15),
       maxAdds: Number(process.env.MAX_ADDS || 3),
       addOnlyIfTrendConfirmed: parseEnvFlag(process.env.ADD_ONLY_IF_TREND_CONFIRMED ?? 'true'),
+      addOnlyIfPositive: parseEnvFlag(process.env.ADD_ONLY_IF_POSITIVE ?? 'true'),
       addMinUpnlUsdt: Number(process.env.ADD_MIN_UPNL_USDT || 0),
-      addMinUpnlR: Number(process.env.ADD_MIN_UPNL_R || 0),
+      addMinUpnlR: Number(process.env.ADD_MIN_UPNL_R || 0.3),
     },
     tp: {
       levels: Number(process.env.TP_LEVELS || 3),
@@ -1424,9 +1456,32 @@ export function createOrchestratorFromEnv(alertService?: AlertService): Orchestr
     },
     profitLock: {
       lockTriggerUsdt: Number(process.env.LOCK_TRIGGER_USDT || 0),
-      lockTriggerR: Number(process.env.LOCK_TRIGGER_R || 0.25),
+      lockTriggerR: Number(process.env.LOCK_TRIGGER_R || 0.8),
       maxDdFromPeakUsdt: Number(process.env.MAX_DD_FROM_PEAK_USDT || 0),
-      maxDdFromPeakR: Number(process.env.MAX_DD_FROM_PEAK_R || 0.15),
+      maxDdFromPeakR: Number(process.env.MAX_DD_FROM_PEAK_R || 0.25),
+    },
+    regimeConfigs: {
+      TREND: {
+        profitLockTriggerR: Number(process.env.REGIME_TREND_PROFIT_LOCK_TRIGGER_R || 1.0),
+        scaleInLevels: Number(process.env.REGIME_TREND_SCALE_IN_LEVELS || 3),
+        stopDistancePct: Number(process.env.REGIME_TREND_STOP_DISTANCE_PCT || 0.5),
+      },
+      MR: {
+        profitLockTriggerR: Number(process.env.REGIME_MR_PROFIT_LOCK_TRIGGER_R || 0.4),
+        scaleInLevels: Number(process.env.REGIME_MR_SCALE_IN_LEVELS || 1),
+        stopDistancePct: Number(process.env.REGIME_MR_STOP_DISTANCE_PCT || 0.3),
+      },
+      EV: {
+        profitLockTriggerR: Number(process.env.REGIME_EV_PROFIT_LOCK_TRIGGER_R || 0.6),
+        scaleInLevels: Number(process.env.REGIME_EV_SCALE_IN_LEVELS || 2),
+        stopDistancePct: Number(process.env.REGIME_EV_STOP_DISTANCE_PCT || 0.8),
+      },
+    },
+    trailingStop: {
+      enabled: parseEnvFlag(process.env.TRAILING_STOP_ENABLED ?? 'true'),
+      activationR: Number(process.env.TRAILING_STOP_ACTIVATION_R || 0.8),
+      trailingRatio: Number(process.env.TRAILING_STOP_RATIO || 0.3),
+      minDrawdownR: Number(process.env.TRAILING_STOP_MIN_DD_R || 0.2),
     },
     reversalExitMode: String(process.env.REVERSAL_EXIT_MODE || 'MARKET').toUpperCase() === 'LIMIT' ? 'LIMIT' : 'MARKET',
     exitLimitBufferBps: Number(process.env.EXIT_LIMIT_BUFFER_BPS || 5),
@@ -1449,13 +1504,14 @@ export function createOrchestratorFromEnv(alertService?: AlertService): Orchestr
   };
 
   return new Orchestrator(connector, {
+    engineMode,
     maxLeverage: Number(process.env.MAX_LEVERAGE || 125),
     loggerQueueLimit: Number(process.env.LOGGER_QUEUE_LIMIT || 10000),
     loggerDropHaltThreshold: Number(process.env.LOGGER_DROP_HALT_THRESHOLD || 500),
     gate,
     cooldown: {
-      minMs: Number(process.env.COOLDOWN_MIN_MS || 1000),
-      maxMs: Number(process.env.COOLDOWN_MAX_MS || 15000),
+      minMs: Number(process.env.COOLDOWN_MIN_MS || 2000),
+      maxMs: Number(process.env.COOLDOWN_MAX_MS || 20000),
     },
     startingMarginUsdt: Number(process.env.STARTING_MARGIN_USDT || 0),
     minMarginUsdt: Number(process.env.MIN_MARGIN_USDT || 0),

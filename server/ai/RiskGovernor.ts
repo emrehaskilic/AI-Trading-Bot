@@ -63,7 +63,7 @@ export class RiskGovernor {
     const currentNotional = position ? Math.max(0, Number(position.qty || 0) * Math.max(0, Number(input.snapshot.market.price || 0))) : 0;
 
     const confidence = clamp(Number(policy.confidence || 0), 0, 1);
-    const requestedMultiplier = clamp(Number(policy.riskMultiplier || 0.2), 0.01, 1.2);
+    const requestedMultiplier = clamp(Number(policy.riskMultiplier || 0.2), 0.01, 2.0);
     let intent: PolicyIntent = policy.intent;
     let side: PolicySide = policy.side;
     let reducePct: number | null = null;
@@ -150,18 +150,32 @@ export class RiskGovernor {
       }
     }
 
+    let adaptiveMultiplier = requestedMultiplier;
+    if (position) {
+      const unrealizedPnlPct = Number(position.unrealizedPnlPct || 0);
+      if (Number.isFinite(unrealizedPnlPct) && unrealizedPnlPct > 0) {
+        const profitFactor = Math.min(2, 1 + (unrealizedPnlPct / 100));
+        adaptiveMultiplier = Math.min(2, adaptiveMultiplier * profitFactor);
+        reasons.push('WINNER_RISK_BOOST');
+      } else if (Number.isFinite(unrealizedPnlPct) && unrealizedPnlPct < 0) {
+        adaptiveMultiplier *= 0.5;
+        reasons.push('LOSER_RISK_DAMP');
+      }
+    }
+    adaptiveMultiplier = clamp(adaptiveMultiplier, 0.01, 2.0);
+
     const sizeMultiplier =
       intent === 'ENTER'
         ? 1
         : intent === 'ADD'
-          ? clamp(requestedMultiplier, 0.01, 1)
+          ? clamp(adaptiveMultiplier, 0.01, 2.0)
           : 1;
 
     return {
       intent,
       side,
       confidence: Number(confidence.toFixed(6)),
-      riskMultiplier: Number(clamp(requestedMultiplier, 0.01, 1.2).toFixed(6)),
+      riskMultiplier: Number(clamp(adaptiveMultiplier, 0.01, 2.0).toFixed(6)),
       sizeMultiplier: Number(sizeMultiplier.toFixed(6)),
       reducePct: reducePct == null ? null : Number(clamp(reducePct, 0.1, 1).toFixed(6)),
       maxPositionNotional: Number(maxPositionNotional.toFixed(6)),

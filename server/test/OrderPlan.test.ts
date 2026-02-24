@@ -320,4 +320,149 @@ export function runTests() {
     assert(tpOrders.length === 2, 'tp ladder should create expected number of orders');
     assert(tpOrders.every((o) => o.reduceOnly), 'tp orders must be reduce-only');
   }
+
+  // Multi-timeframe consensus: conflict blocks fresh entry.
+  {
+    const cfg = baseConfig();
+    cfg.multiTimeframe = {
+      enabled: true,
+      minConsensus: 0.7,
+      oppositeExitConsensus: 0.8,
+      deadband: 0.1,
+      weights: { m1: 1, m3: 1, m5: 1, m15: 1 },
+      norms: { m1: 1, m3: 1, m5: 1, m15: 1 },
+    };
+    const runner = new PlanRunner(cfg);
+    const state = baseState();
+    const result = runner.tick({
+      symbol: 'BTCUSDT',
+      nowMs: 1000,
+      metrics: makeMetrics({
+        legacyMetrics: { obiDeep: 0.5, deltaZ: 0.5, cvdSlope: 0.4 },
+        multiTimeframe: { m1TrendScore: -1, m3TrendScore: -1, m5TrendScore: -1, m15TrendScore: -1 },
+      }),
+      gatePassed: true,
+      state,
+      executionReady: true,
+      leverage: 10,
+      currentMarginBudgetUsdt: 100,
+      startingMarginUsdt: 100,
+    });
+    assert(result.planId === null, 'mtf conflict should keep plan unstarted');
+    assert(result.events.some((e) => e.type === 'MTF_DIRECTION_CONFLICT'), 'mtf conflict event should be emitted');
+  }
+
+  // Trailing stop: activated winner should exit when drawdown exceeds trailing threshold.
+  {
+    const cfg = baseConfig();
+    cfg.profitLock = {
+      lockTriggerUsdt: 10_000,
+      lockTriggerR: 0,
+      maxDdFromPeakUsdt: 10_000,
+      maxDdFromPeakR: 10,
+    };
+    cfg.trailingStop = {
+      enabled: true,
+      activationR: 0.2,
+      trailingRatio: 0.3,
+      minDrawdownR: 0.05,
+    };
+    const runner = new PlanRunner(cfg);
+    const state = baseState();
+    runner.tick({
+      symbol: 'BTCUSDT',
+      nowMs: 1000,
+      metrics: makeMetrics({ legacyMetrics: { obiDeep: 0.4, deltaZ: 0.4, cvdSlope: 0.4 } }),
+      gatePassed: true,
+      state,
+      executionReady: true,
+      leverage: 10,
+      currentMarginBudgetUsdt: 100,
+      startingMarginUsdt: 100,
+    });
+    state.position = {
+      side: 'LONG',
+      qty: 1,
+      entryPrice: 100,
+      unrealizedPnlPct: 50,
+      addsUsed: 0,
+      peakPnlPct: 50,
+      profitLockActivated: false,
+      hardStopPrice: null,
+    };
+    runner.tick({
+      symbol: 'BTCUSDT',
+      nowMs: 2000,
+      metrics: makeMetrics({ legacyMetrics: { obiDeep: 0.4, deltaZ: 0.4, cvdSlope: 0.4 } }),
+      gatePassed: true,
+      state,
+      executionReady: true,
+      leverage: 10,
+      currentMarginBudgetUsdt: 100,
+      startingMarginUsdt: 100,
+    });
+    state.position.unrealizedPnlPct = 30;
+    const result = runner.tick({
+      symbol: 'BTCUSDT',
+      nowMs: 3000,
+      metrics: makeMetrics({ legacyMetrics: { obiDeep: 0.4, deltaZ: 0.4, cvdSlope: 0.4 } }),
+      gatePassed: true,
+      state,
+      executionReady: true,
+      leverage: 10,
+      currentMarginBudgetUsdt: 100,
+      startingMarginUsdt: 100,
+    });
+    assert(result.planState === 'EXITING', 'trailing stop drawdown should move plan to EXITING');
+    assert(result.events.some((e) => e.type === 'TRAILING_STOP_TRIGGERED'), 'trailing stop event should be emitted');
+  }
+
+  // Regime config: MR mode should cap scale-in levels.
+  {
+    const cfg = baseConfig();
+    cfg.regimeConfigs = {
+      MR: {
+        scaleInLevels: 1,
+      },
+    };
+    const runner = new PlanRunner(cfg);
+    const state = baseState();
+    runner.tick({
+      symbol: 'BTCUSDT',
+      nowMs: 1000,
+      metrics: makeMetrics({ legacyMetrics: { obiDeep: 0.4, deltaZ: 0.4, cvdSlope: 0.4 } }),
+      gatePassed: true,
+      state,
+      executionReady: true,
+      leverage: 10,
+      currentMarginBudgetUsdt: 100,
+      startingMarginUsdt: 100,
+    });
+    state.position = {
+      side: 'LONG',
+      qty: 1,
+      entryPrice: 100,
+      unrealizedPnlPct: 3,
+      addsUsed: 0,
+      peakPnlPct: 3,
+      profitLockActivated: false,
+      hardStopPrice: null,
+    };
+    const result = runner.tick({
+      symbol: 'BTCUSDT',
+      nowMs: 2000,
+      metrics: makeMetrics({
+        strategyRegime: 'MR',
+        legacyMetrics: { obiDeep: 0.4, deltaZ: 0.4, cvdSlope: 0.4 },
+      }),
+      gatePassed: true,
+      state,
+      executionReady: true,
+      leverage: 10,
+      currentMarginBudgetUsdt: 100,
+      startingMarginUsdt: 100,
+    });
+    const scaleIns = result.desiredOrders.filter((o) => o.role === 'SCALE_IN');
+    assert(scaleIns.length <= 1, 'mr regime should cap scale-in count to 1');
+  }
 }

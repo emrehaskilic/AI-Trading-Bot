@@ -16,6 +16,8 @@ import {
   parseClientOrderId,
 } from './OrderPlan';
 import { TrendStateMachine } from './TrendStateMachine';
+import { TrailingStopManager } from './TrailingStopManager';
+import { MultiTimeframeSignal, TimeframeAggregator } from './TimeframeAggregator';
 import { reconcileOrders } from './Reconciler';
 
 export interface PlanTickInput {
@@ -62,11 +64,15 @@ interface PlanContext {
   lastDesiredOrders: PlannedOrder[];
   peakUpnl: number;
   profitLockTriggered: boolean;
+  trailingPeakR: number;
+  trailingActivated: boolean;
   lastStepUpAtMs: number;
 }
 
 export class PlanRunner {
   private readonly trend: TrendStateMachine;
+  private readonly trailingStop: TrailingStopManager;
+  private readonly timeframeAggregator: TimeframeAggregator | null;
   private ctx: PlanContext;
 
   constructor(private readonly config: OrderPlanConfig) {
@@ -77,7 +83,42 @@ export class PlanRunner {
       downExit: config.trend.downExit,
       confirmTicks: config.trend.confirmTicks,
       reversalConfirmTicks: config.trend.reversalConfirmTicks,
+      dynamicConfirmByVolatility: config.trend.dynamicConfirmByVolatility,
+      highVolatilityThresholdPct: config.trend.highVolatilityThresholdPct,
+      mediumVolatilityThresholdPct: config.trend.mediumVolatilityThresholdPct,
+      highVolConfirmTicks: config.trend.highVolConfirmTicks,
+      mediumVolConfirmTicks: config.trend.mediumVolConfirmTicks,
+      lowVolConfirmTicks: config.trend.lowVolConfirmTicks,
+      highVolReversalConfirmTicks: config.trend.highVolReversalConfirmTicks,
+      mediumVolReversalConfirmTicks: config.trend.mediumVolReversalConfirmTicks,
+      lowVolReversalConfirmTicks: config.trend.lowVolReversalConfirmTicks,
     });
+    this.trailingStop = new TrailingStopManager({
+      enabled: Boolean(config.trailingStop?.enabled),
+      activationR: Number(config.trailingStop?.activationR ?? 0.8),
+      trailingRatio: Number(config.trailingStop?.trailingRatio ?? 0.3),
+      minDrawdownR: Number(config.trailingStop?.minDrawdownR ?? 0.2),
+    });
+    this.timeframeAggregator = config.multiTimeframe?.enabled
+      ? new TimeframeAggregator({
+          enabled: true,
+          minConsensus: Number(config.multiTimeframe.minConsensus || 0.7),
+          oppositeExitConsensus: Number(config.multiTimeframe.oppositeExitConsensus || 0.8),
+          deadband: Number(config.multiTimeframe.deadband || 0.1),
+          weights: {
+            m1: Number(config.multiTimeframe.weights?.m1 ?? 1),
+            m3: Number(config.multiTimeframe.weights?.m3 ?? 1),
+            m5: Number(config.multiTimeframe.weights?.m5 ?? 1),
+            m15: Number(config.multiTimeframe.weights?.m15 ?? 1),
+          },
+          norms: {
+            m1: Number(config.multiTimeframe.norms?.m1 ?? 1),
+            m3: Number(config.multiTimeframe.norms?.m3 ?? 1),
+            m5: Number(config.multiTimeframe.norms?.m5 ?? 500),
+            m15: Number(config.multiTimeframe.norms?.m15 ?? 1000),
+          },
+        })
+      : null;
 
     this.ctx = this.createEmptyContext();
   }
@@ -87,10 +128,16 @@ export class PlanRunner {
     const events: Array<{ type: string; detail?: Record<string, any> }> = [];
 
     const trendScore = this.computeTrendScore(metrics);
-    const trendSnapshot = this.trend.update(trendScore);
+    const volatilityPct = Number(metrics.advancedMetrics?.volatilityIndex ?? Number.NaN);
+    const trendSnapshot = this.trend.update(trendScore, Number.isFinite(volatilityPct) ? volatilityPct : null);
     const trendState = trendSnapshot.state;
     const confirmCount = trendSnapshot.confirmCount;
-    const trendConfirmed = confirmCount >= Math.max(1, this.config.trend.confirmTicks);
+    const trendConfirmedRaw = confirmCount >= Math.max(1, trendSnapshot.confirmThreshold);
+    const regime = this.resolveRegime(metrics, trendScore, volatilityPct);
+    const multiTimeframeSignal = this.timeframeAggregator
+      ? this.timeframeAggregator.evaluate(metrics, trendScore)
+      : null;
+    const trendConfirmed = trendConfirmedRaw && this.isTrendConsensusConfirmed(trendState, multiTimeframeSignal);
 
     const position = state.position;
     const openOrders = Array.from(state.openOrders.values());
@@ -108,6 +155,9 @@ export class PlanRunner {
       trendState,
       freezeActive: input.freezeActive ?? state.execQuality.freezeActive,
       backoffActive: input.backoffActive ?? false,
+      nowMs,
+      cooldownUntilMs: state.cooldown_until_ms,
+      multiTimeframeSignal,
     });
     if (this.ctx.planId === null && this.ctx.planState === 'FLATTENED') {
       this.ctx.planState = 'BOOT';
@@ -135,7 +185,7 @@ export class PlanRunner {
       this.updateBudgetStepUp(input, trendScore, trendConfirmed, events);
     }
 
-    const exitReason = this.evaluateExitReason(position, trendState, trendConfirmed, events);
+    const exitReason = this.evaluateExitReason(position, trendState, trendConfirmed, multiTimeframeSignal, regime, events);
     if (exitReason) {
       this.ctx.planState = 'EXITING';
       events.push({ type: exitReason });
@@ -154,7 +204,7 @@ export class PlanRunner {
 
     const shouldRebuild = this.shouldRebuildPlan(nowMs, position, trendState, trendScore, gatePassed);
     const desiredOrders = shouldRebuild
-      ? this.buildDesiredOrders(input, trendState, trendConfirmed, gatePassed, events)
+      ? this.buildDesiredOrders(input, trendState, trendConfirmed, gatePassed, regime, events)
       : this.ctx.lastDesiredOrders;
 
     if (shouldRebuild) {
@@ -209,6 +259,8 @@ export class PlanRunner {
       lastDesiredOrders: [],
       peakUpnl: 0,
       profitLockTriggered: false,
+      trailingPeakR: 0,
+      trailingActivated: false,
       lastStepUpAtMs: 0,
     };
   }
@@ -290,6 +342,8 @@ export class PlanRunner {
     this.ctx.lastDesiredOrders = [];
     this.ctx.peakUpnl = 0;
     this.ctx.profitLockTriggered = false;
+    this.ctx.trailingPeakR = 0;
+    this.ctx.trailingActivated = false;
     this.ctx.lastStepUpAtMs = 0;
   }
 
@@ -387,6 +441,8 @@ export class PlanRunner {
     position: SymbolState['position'],
     trendState: TrendState,
     trendConfirmed: boolean,
+    multiTimeframeSignal: MultiTimeframeSignal | null,
+    regime: 'TREND' | 'MR' | 'EV',
     events: Array<{ type: string; detail?: Record<string, any> }>
   ): string | null {
     if (!position || !this.ctx.planId) {
@@ -403,7 +459,13 @@ export class PlanRunner {
       activated: this.ctx.profitLockTriggered,
       peakUpnlR: this.ctx.peakUpnl / base,
     };
-    const shouldFlattenForProfitLock = this.checkProfitLock(upnl, upnl / base, profitLockState);
+    const regimeConfig = this.resolveRegimeConfig(regime);
+    const shouldFlattenForProfitLock = this.checkProfitLock(
+      upnl,
+      upnl / base,
+      profitLockState,
+      regimeConfig.profitLockTriggerR
+    );
     this.ctx.profitLockTriggered = profitLockState.activated;
     this.ctx.peakUpnl = Math.max(this.ctx.peakUpnl, profitLockState.peakUpnlR * base);
     if (shouldFlattenForProfitLock.shouldFlatten) {
@@ -416,6 +478,40 @@ export class PlanRunner {
         },
       });
       return 'PROFIT_LOCK_TRIGGERED';
+    }
+
+    const trailing = this.trailingStop.update(upnl / base, {
+      peakR: this.ctx.trailingPeakR,
+      activated: this.ctx.trailingActivated,
+    });
+    this.ctx.trailingPeakR = trailing.state.peakR;
+    this.ctx.trailingActivated = trailing.state.activated;
+    if (trailing.triggered) {
+      events.push({
+        type: 'TRAILING_STOP_TRIGGERED',
+        detail: {
+          drawdownR: Number(trailing.drawdownR.toFixed(4)),
+          allowedDrawdownR: Number(trailing.allowedDrawdownR.toFixed(4)),
+          peakR: Number(this.ctx.trailingPeakR.toFixed(4)),
+        },
+      });
+      return 'TRAILING_STOP_TRIGGERED';
+    }
+
+    if (
+      position
+      && this.timeframeAggregator
+      && multiTimeframeSignal
+      && this.timeframeAggregator.isOppositeExitSignal(multiTimeframeSignal, position.side)
+    ) {
+      events.push({
+        type: 'MTF_OPPOSITE_CONSENSUS_EXIT',
+        detail: {
+          direction: multiTimeframeSignal.direction,
+          consensus: multiTimeframeSignal.consensus,
+        },
+      });
+      return 'MTF_OPPOSITE_CONSENSUS_EXIT';
     }
 
     if (trendConfirmed) {
@@ -502,6 +598,7 @@ export class PlanRunner {
     trendState: TrendState,
     trendConfirmed: boolean,
     gatePassed: boolean,
+    regime: 'TREND' | 'MR' | 'EV',
     events: Array<{ type: string; detail?: Record<string, any> }>
   ): PlannedOrder[] {
     if (!this.ctx.planId || !this.ctx.side) {
@@ -513,6 +610,7 @@ export class PlanRunner {
     const position = input.state.position;
     const leverage = input.leverage;
     const midPrice = this.resolveMidPrice(input.metrics);
+    const regimeConfig = this.resolveRegimeConfig(regime);
 
     if (this.ctx.planState !== 'EXITING') {
       const remainingBudget = this.remainingBudget(position, midPrice, leverage);
@@ -527,13 +625,14 @@ export class PlanRunner {
           trendState,
           trendConfirmed,
           gatePassed,
+          regimeScaleInLevels: regimeConfig.scaleInLevels,
         });
         desired.push(...scaleIn);
       }
     }
 
     if (position) {
-      const stopOrder = this.buildStopOrder(symbol, position, leverage);
+      const stopOrder = this.buildStopOrder(symbol, position, leverage, regimeConfig.stopDistancePct);
       if (stopOrder) {
         desired.push(stopOrder);
       }
@@ -577,6 +676,7 @@ export class PlanRunner {
     trendState: TrendState;
     trendConfirmed: boolean;
     gatePassed: boolean;
+    regimeScaleInLevels?: number;
   }): PlannedOrder[] {
     if (input.basePrice <= 0 || input.budgetUsdt <= 0 || !input.gatePassed) {
       return [];
@@ -587,6 +687,9 @@ export class PlanRunner {
 
     if (input.position) {
       const upnl = input.position.unrealizedPnlPct;
+      if (this.config.scaleIn.addOnlyIfPositive && upnl <= 0) {
+        return [];
+      }
       if (this.config.scaleIn.addMinUpnlUsdt > 0 && upnl < this.config.scaleIn.addMinUpnlUsdt) {
         return [];
       }
@@ -603,7 +706,11 @@ export class PlanRunner {
       ? Math.max(0, this.config.scaleIn.maxAdds - input.position.addsUsed)
       : this.config.scaleIn.maxAdds;
 
-    const levels = Math.max(0, Math.min(this.config.scaleIn.levels, remainingAdds));
+    const regimeLevels = Number(input.regimeScaleInLevels || 0);
+    const configuredLevels = regimeLevels > 0
+      ? Math.min(this.config.scaleIn.levels, Math.trunc(regimeLevels))
+      : this.config.scaleIn.levels;
+    const levels = Math.max(0, Math.min(configuredLevels, remainingAdds));
     if (levels <= 0) {
       return [];
     }
@@ -665,8 +772,16 @@ export class PlanRunner {
     return orders;
   }
 
-  private buildStopOrder(symbol: string, position: NonNullable<SymbolState['position']>, leverage: number): PlannedOrder | null {
-    const distPct = this.resolveStopDistancePct(this.config.stop.distancePct, leverage);
+  private buildStopOrder(
+    symbol: string,
+    position: NonNullable<SymbolState['position']>,
+    leverage: number,
+    stopDistanceOverridePct?: number
+  ): PlannedOrder | null {
+    const stopDistanceBase = Number.isFinite(stopDistanceOverridePct as number)
+      ? Number(stopDistanceOverridePct)
+      : this.config.stop.distancePct;
+    const distPct = this.resolveStopDistancePct(stopDistanceBase, leverage);
     const side: Side = position.side === 'LONG' ? 'SELL' : 'BUY';
     const stopPrice = position.side === 'LONG'
       ? position.entryPrice * (1 - distPct / 100)
@@ -796,6 +911,47 @@ export class PlanRunner {
     return Math.max(minFactor, Math.min(maxFactor, raw));
   }
 
+  private resolveRegime(
+    metrics: OrchestratorMetricsInput,
+    trendScore: number,
+    volatilityPct: number
+  ): 'TREND' | 'MR' | 'EV' {
+    const fromMetrics = String(metrics.strategyRegime || '').trim().toUpperCase();
+    if (fromMetrics === 'TREND' || fromMetrics === 'MR' || fromMetrics === 'EV') {
+      return fromMetrics;
+    }
+
+    if (Number.isFinite(volatilityPct) && volatilityPct >= 90) {
+      return 'EV';
+    }
+    if (Math.abs(Number(trendScore || 0)) >= 0.45) {
+      return 'TREND';
+    }
+    return 'MR';
+  }
+
+  private resolveRegimeConfig(regime: 'TREND' | 'MR' | 'EV'): {
+    profitLockTriggerR?: number;
+    scaleInLevels?: number;
+    stopDistancePct?: number;
+  } {
+    const cfg = this.config.regimeConfigs?.[regime];
+    if (!cfg) {
+      return {};
+    }
+    return {
+      profitLockTriggerR: Number.isFinite(cfg.profitLockTriggerR as number)
+        ? Number(cfg.profitLockTriggerR)
+        : undefined,
+      scaleInLevels: Number.isFinite(cfg.scaleInLevels as number)
+        ? Math.max(0, Math.trunc(Number(cfg.scaleInLevels)))
+        : undefined,
+      stopDistancePct: Number.isFinite(cfg.stopDistancePct as number)
+        ? Number(cfg.stopDistancePct)
+        : undefined,
+    };
+  }
+
   private filterSide(side: Side | null): Side | null {
     if (!side) return null;
     const allowed = (this.config.allowedSides || 'BOTH').toUpperCase();
@@ -848,9 +1004,29 @@ export class PlanRunner {
     trendState: TrendState;
     freezeActive: boolean;
     backoffActive: boolean;
+    nowMs: number;
+    cooldownUntilMs: number;
+    multiTimeframeSignal: MultiTimeframeSignal | null;
   }): { blocked: boolean; reason?: string } {
     if (input.trendState === 'CHOP') {
       return { blocked: true, reason: 'CHOP_MARKET_NO_NEW_POSITIONS' };
+    }
+    if (this.timeframeAggregator && this.config.multiTimeframe?.enabled) {
+      if (!input.multiTimeframeSignal || input.multiTimeframeSignal.direction === 'CHOP') {
+        return { blocked: true, reason: 'MTF_CONSENSUS_LOW' };
+      }
+      if (input.multiTimeframeSignal.consensus < this.config.multiTimeframe.minConsensus) {
+        return { blocked: true, reason: 'MTF_CONSENSUS_LOW' };
+      }
+      if (
+        (input.trendState === 'UP' && input.multiTimeframeSignal.direction === 'DOWN')
+        || (input.trendState === 'DOWN' && input.multiTimeframeSignal.direction === 'UP')
+      ) {
+        return { blocked: true, reason: 'MTF_DIRECTION_CONFLICT' };
+      }
+    }
+    if (Number.isFinite(input.cooldownUntilMs) && input.cooldownUntilMs > input.nowMs) {
+      return { blocked: true, reason: 'POST_EXIT_COOLDOWN_ACTIVE' };
     }
     if (input.freezeActive) {
       return { blocked: true, reason: 'EXECUTION_FROZEN' };
@@ -859,6 +1035,23 @@ export class PlanRunner {
       return { blocked: true, reason: 'RATE_LIMIT_BACKOFF' };
     }
     return { blocked: false };
+  }
+
+  private isTrendConsensusConfirmed(trendState: TrendState, signal: MultiTimeframeSignal | null): boolean {
+    if (!this.timeframeAggregator || !this.config.multiTimeframe?.enabled) {
+      return true;
+    }
+    return this.timeframeAggregator.isEntryConsensusOk(
+      signal || {
+        m1: 'CHOP',
+        m3: 'CHOP',
+        m5: 'CHOP',
+        m15: 'CHOP',
+        direction: 'CHOP',
+        consensus: 0,
+      },
+      trendState
+    );
   }
 
   private validateMargin(notional: number, leverage: number): boolean {
@@ -872,10 +1065,14 @@ export class PlanRunner {
   private checkProfitLock(
     upnlUsdt: number,
     upnlR: number,
-    state: { activated: boolean; peakUpnlR: number }
+    state: { activated: boolean; peakUpnlR: number },
+    lockTriggerROverride?: number
   ): { shouldFlatten: boolean } {
+    const lockTriggerR = Number.isFinite(lockTriggerROverride as number)
+      ? Number(lockTriggerROverride)
+      : this.config.profitLock.lockTriggerR;
     const shouldActivateByUsdt = this.config.profitLock.lockTriggerUsdt > 0 && upnlUsdt >= this.config.profitLock.lockTriggerUsdt;
-    const shouldActivateByR = this.config.profitLock.lockTriggerR > 0 && upnlR >= this.config.profitLock.lockTriggerR;
+    const shouldActivateByR = lockTriggerR > 0 && upnlR >= lockTriggerR;
     if (!state.activated && (shouldActivateByUsdt || shouldActivateByR)) {
       state.activated = true;
       state.peakUpnlR = upnlR;

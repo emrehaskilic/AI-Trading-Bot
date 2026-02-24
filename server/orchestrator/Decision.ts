@@ -181,9 +181,10 @@ export class DecisionEngine {
 
     const absDelta = Math.max(0, Math.abs(Number(deltaZ) || 0));
     const activity = Math.max(0, Math.min(1, (Number(printsPerSecond) || 0) / 10));
-    const conviction = Math.max(0, Math.min(1, absDelta / 3));
-    const acceleration = (conviction * 0.65) + (activity * 0.35);
-    const cooldown = hi - ((hi - lo) * acceleration);
-    return Math.max(lo, Math.min(hi, Math.round(cooldown)));
+    const volatilityFactor = Math.min(1, absDelta / 5);
+    const baseCooldown = hi - ((hi - lo) * (1 - volatilityFactor));
+    const activityFactor = activity * 0.3;
+    const finalCooldown = baseCooldown * (1 - activityFactor);
+    return Math.max(lo, Math.min(hi, Math.round(finalCooldown)));
   }
 }

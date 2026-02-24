@@ -2,6 +2,7 @@ import { ExecutionEvent, OrderType, Side } from '../connectors/executionTypes';
 
 export interface OrchestratorMetricsInput {
   symbol: string;
+  strategyRegime?: string | null;
   canonical_time_ms?: number;
   exchange_event_time_ms?: number | null;
   spread_pct?: number | null;
@@ -15,6 +16,12 @@ export interface OrchestratorMetricsInput {
     obiDeep?: number | null;
     deltaZ?: number | null;
     cvdSlope?: number | null;
+  } | null;
+  multiTimeframe?: {
+    m1TrendScore?: number | null;
+    m3TrendScore?: number | null;
+    m5TrendScore?: number | null;
+    m15TrendScore?: number | null;
   } | null;
   funding?: {
     rate?: number | null;
@@ -186,16 +193,44 @@ export interface OrderPlanConfig {
     downExit: number;
     confirmTicks: number;
     reversalConfirmTicks: number;
+    dynamicConfirmByVolatility?: boolean;
+    highVolatilityThresholdPct?: number;
+    mediumVolatilityThresholdPct?: number;
+    highVolConfirmTicks?: number;
+    mediumVolConfirmTicks?: number;
+    lowVolConfirmTicks?: number;
+    highVolReversalConfirmTicks?: number;
+    mediumVolReversalConfirmTicks?: number;
+    lowVolReversalConfirmTicks?: number;
     obiNorm: number;
     deltaNorm: number;
     cvdNorm: number;
     scoreClamp: number;
+  };
+  multiTimeframe?: {
+    enabled: boolean;
+    minConsensus: number;
+    oppositeExitConsensus: number;
+    deadband: number;
+    weights: {
+      m1: number;
+      m3: number;
+      m5: number;
+      m15: number;
+    };
+    norms: {
+      m1: number;
+      m3: number;
+      m5: number;
+      m15: number;
+    };
   };
   scaleIn: {
     levels: number;
     stepPct: number;
     maxAdds: number;
     addOnlyIfTrendConfirmed: boolean;
+    addOnlyIfPositive?: boolean;
     addMinUpnlUsdt: number;
     addMinUpnlR: number;
   };
@@ -216,6 +251,29 @@ export interface OrderPlanConfig {
     maxDdFromPeakUsdt: number;
     maxDdFromPeakR: number;
   };
+  regimeConfigs?: {
+    TREND?: {
+      profitLockTriggerR?: number;
+      scaleInLevels?: number;
+      stopDistancePct?: number;
+    };
+    MR?: {
+      profitLockTriggerR?: number;
+      scaleInLevels?: number;
+      stopDistancePct?: number;
+    };
+    EV?: {
+      profitLockTriggerR?: number;
+      scaleInLevels?: number;
+      stopDistancePct?: number;
+    };
+  };
+  trailingStop?: {
+    enabled: boolean;
+    activationR: number;
+    trailingRatio: number;
+    minDrawdownR: number;
+  };
   reversalExitMode: 'MARKET' | 'LIMIT';
   exitLimitBufferBps: number;
   exitRetryMs: number;
@@ -233,6 +291,7 @@ export interface OrderPlanConfig {
 }
 
 export interface OrchestratorConfig {
+  engineMode?: 'PLAN' | 'DECISION';
   maxLeverage: number;
   loggerQueueLimit: number;
   loggerDropHaltThreshold: number;

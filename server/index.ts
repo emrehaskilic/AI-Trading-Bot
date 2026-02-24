@@ -1788,10 +1788,15 @@ function broadcastMetrics(
 
     if (eventTimeMs > 0) {
         const canonicalTimeMs = Date.now();
+        const m1TrendScore = Number(legacyM?.deltaZ ?? tf1m?.delta ?? 0);
+        const m5TrendScore = Number(tf5m?.delta ?? legacyM?.cvdSlope ?? m1TrendScore);
+        const m15TrendScore = Number(tf15m?.delta ?? m5TrendScore);
+        const m3TrendScore = Number(((m1TrendScore * 0.5) + (m5TrendScore * 0.5)).toFixed(6));
         // Mainnet market data is ingested here only for signal/intent generation.
         // Execution state remains testnet-only via execution events in orchestrator.
         orchestrator.ingest({
             symbol: s,
+            strategyRegime: typeof decision?.regime === 'string' ? String(decision.regime).toUpperCase() : null,
             canonical_time_ms: canonicalTimeMs,
             exchange_event_time_ms: eventTimeMs,
             spread_pct: spreadPct,
@@ -1808,6 +1813,12 @@ function broadcastMetrics(
                     trend: lastFunding.get(s)?.trend ?? null,
                 }
                 : null,
+            multiTimeframe: {
+                m1TrendScore,
+                m3TrendScore,
+                m5TrendScore,
+                m15TrendScore,
+            },
             legacyMetrics: legacyM ? {
                 obiDeep: legacyM.obiDeep,
                 deltaZ: legacyM.deltaZ,

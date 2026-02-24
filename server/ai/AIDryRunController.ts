@@ -6,6 +6,7 @@ import { StateExtractor } from './StateExtractor';
 import { PolicyDecision, PolicyEngine } from './PolicyEngine';
 import { RiskGovernor } from './RiskGovernor';
 import { DirectionLock } from './DirectionLock';
+import { AIPerformanceTracker } from './AIPerformanceTracker';
 
 const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(max, value));
 const isEnabled = (value: string | undefined, fallback: boolean): boolean => {
@@ -18,9 +19,9 @@ const DEFAULT_MAX_DECISION_INTERVAL_MS = 1000;
 const DEFAULT_DECISION_INTERVAL_MS = 250;
 const DEFAULT_STATE_CONFIDENCE_THRESHOLD = clamp(Number(process.env.AI_STATE_CONFIDENCE_THRESHOLD || 0.5), 0, 1);
 const DEFAULT_MAX_STARTUP_WARMUP_MS = Math.max(0, Math.trunc(Number(process.env.AI_MAX_STARTUP_WARMUP_MS || 2000)));
-const DEFAULT_TREND_BREAK_CONFIRM_TICKS = Math.max(1, Math.trunc(clamp(Number(process.env.AI_TREND_BREAK_CONFIRM_TICKS || 6), 1, 12)));
+const DEFAULT_TREND_BREAK_CONFIRM_TICKS = Math.max(1, Math.trunc(clamp(Number(process.env.AI_TREND_BREAK_CONFIRM_TICKS || 3), 1, 12)));
 const DEFAULT_MIN_REDUCE_GAP_MS = Math.max(0, Math.trunc(Number(process.env.AI_MIN_REDUCE_GAP_MS || 30_000)));
-const REENTRY_COOLDOWN_BARS = Math.max(0, Math.trunc(Number(process.env.AI_REENTRY_COOLDOWN_BARS || 0)));
+const REENTRY_COOLDOWN_BARS = Math.max(0, Math.trunc(Number(process.env.AI_REENTRY_COOLDOWN_BARS || 2)));
 
 const STRICT_3M_MODE_ENABLED = isEnabled(process.env.AI_STRICT_3M_TREND_MODE, true);
 const BAR_MS = Math.max(1, Math.trunc(Number(process.env.AI_BAR_INTERVAL_MS || 180_000)));
@@ -30,16 +31,16 @@ const DCA_BAR_GAP = Math.max(1, Math.trunc(Number(process.env.AI_DCA_MIN_BAR_GAP
 const PYRAMID_MAX_COUNT = Math.max(0, Math.trunc(Number(process.env.AI_PYRAMID_MAX_COUNT || 3)));
 const PYRAMID_BAR_GAP = Math.max(1, Math.trunc(Number(process.env.AI_PYRAMID_MIN_BAR_GAP || 1)));
 const REVERSE_ADD_BLOCK_BARS = Math.max(0, Math.trunc(Number(process.env.AI_REVERSE_ADD_BLOCK_BARS || 2)));
-const MAX_EXPOSURE_MULTIPLIER = Math.max(1, Number(process.env.AI_MAX_EXPOSURE_MULTIPLIER || 1.5));
+const MAX_EXPOSURE_MULTIPLIER = Math.max(1, Number(process.env.AI_MAX_EXPOSURE_MULTIPLIER || 2.0));
 const SLIPPAGE_HARD_BPS = Math.max(1, Number(process.env.AI_SLIPPAGE_HARD_BPS || 12));
 const VOL_HARD_LIMIT = clamp(Number(process.env.AI_VOL_HARD_LIMIT_PCT || 97), 90, 100);
 const CRASH_EXIT_VOL_PCT = clamp(Number(process.env.AI_CRASH_EXIT_MIN_VOL_PCT || 90), 70, 100);
 const CRASH_EXIT_OPPOSING_STRENGTH = clamp(Number(process.env.AI_CRASH_EXIT_MIN_OPPOSING_STRENGTH || 62), 50, 90);
 const CRASH_EXIT_CONFIRM_BARS = Math.max(1, Math.trunc(Number(process.env.AI_CRASH_EXIT_CONFIRM_BARS || 2)));
-const BIAS_MIN_HOLD_BARS = Math.max(1, Math.trunc(Number(process.env.AI_BIAS_MIN_HOLD_BARS || 12)));
+const BIAS_MIN_HOLD_BARS = Math.max(1, Math.trunc(Number(process.env.AI_BIAS_MIN_HOLD_BARS || 4)));
 const BIAS_ENTRY_CONFIRM_BARS = Math.max(1, Math.trunc(Number(process.env.AI_BIAS_ENTRY_CONFIRM_BARS || 2)));
-const BIAS_FLIP_CONFIRM_BARS = Math.max(1, Math.trunc(Number(process.env.AI_BIAS_FLIP_CONFIRM_BARS || 8)));
-const BIAS_NEUTRAL_CONFIRM_BARS = Math.max(1, Math.trunc(Number(process.env.AI_BIAS_NEUTRAL_CONFIRM_BARS || 8)));
+const BIAS_FLIP_CONFIRM_BARS = Math.max(1, Math.trunc(Number(process.env.AI_BIAS_FLIP_CONFIRM_BARS || 3)));
+const BIAS_NEUTRAL_CONFIRM_BARS = Math.max(1, Math.trunc(Number(process.env.AI_BIAS_NEUTRAL_CONFIRM_BARS || 3)));
 const BIAS_MIN_SIDE_STRENGTH_PCT = clamp(Number(process.env.AI_BIAS_MIN_SIDE_STRENGTH_PCT || 60), 50, 90);
 
 type RuntimeSymbolState = {
@@ -76,6 +77,13 @@ type RuntimeSymbolState = {
   pyramidCount: number;
   lastCvdSlope: number | null;
   lastDfsPct: number;
+  lastObservedUnrealizedPnlPct: number;
+  activeTradeRegime: string | null;
+  activeTradeDecisionTs: number;
+  activeTradeConfidence: number;
+  activeTradeRiskMultiplier: number;
+  activeTradeReasons: string[];
+  activeTradeRealizedPnlBase: number | null;
 };
 
 const HARD_RISK_REASONS = new Set<string>([
@@ -104,6 +112,9 @@ export class AIDryRunController {
   private policyEngine: PolicyEngine | null = null;
   private readonly riskGovernor = new RiskGovernor();
   private readonly directionLock = new DirectionLock();
+  private readonly performanceTracker = new AIPerformanceTracker(
+    Math.max(500, Math.trunc(Number(process.env.AI_PERF_TRACKER_MAX_RECORDS || 5000)))
+  );
 
   private lastError: string | null = null;
   private telemetry = {
@@ -171,6 +182,7 @@ export class AIDryRunController {
     this.lastError = null;
     this.pending.clear();
     this.runtime.clear();
+    this.performanceTracker.clear();
     this.resetTelemetry();
 
     this.log?.('AI_POLICY_ENGINE_START', {
@@ -190,6 +202,7 @@ export class AIDryRunController {
     this.symbols.clear();
     this.pending.clear();
     this.runtime.clear();
+    this.performanceTracker.clear();
     this.lastError = null;
     this.log?.('AI_POLICY_ENGINE_STOP', {});
   }
@@ -204,6 +217,7 @@ export class AIDryRunController {
 
   getStatus(): AIDryRunStatus {
     this.telemetry.avgHoldTimeMs = this.computeAvgHoldTime();
+    const performance = this.performanceTracker.getSummary(1000);
     return {
       active: this.active,
       model: this.config?.model || null,
@@ -215,6 +229,7 @@ export class AIDryRunController {
       lastError: this.lastError,
       symbols: [...this.symbols],
       telemetry: { ...this.telemetry },
+      performance,
     };
   }
 
@@ -250,7 +265,7 @@ export class AIDryRunController {
     try {
       const deterministicState = this.extractor.extract(snapshot);
       const dfsPct = this.toPercentile(snapshot.decision.dfsPercentile);
-      this.syncRuntimePositionState(runtime, snapshot, barId);
+      this.syncRuntimePositionState(runtime, snapshot, barId, symbol, nowMs);
       this.syncRuntimeTrendState(runtime, deterministicState, dfsPct, barId);
       this.directionLock.observe(symbol, snapshot.position, deterministicState);
       runtime.latestTrend = this.toTrendView(deterministicState, snapshot, nowMs, runtime.latestTrend);
@@ -441,6 +456,14 @@ export class AIDryRunController {
 
       const submittedOrders = this.dryRunSession.submitStrategyDecision(symbol, decision, nowMs);
       this.decisionLog?.record(decision.log);
+      this.updateActiveTradeContext(
+        runtime,
+        symbol,
+        deterministicState.regimeState,
+        finalDecision,
+        nowMs,
+        submittedOrders.length > 0
+      );
 
       this.updateRuntimeAfterDecision(runtime, finalDecision, nowMs, barId, submittedOrders.length > 0);
       runtime.lastCvdSlope = Number(snapshot.market.cvdSlope || 0);
@@ -764,6 +787,13 @@ export class AIDryRunController {
         pyramidCount: 0,
         lastCvdSlope: null,
         lastDfsPct: this.toPercentile(0),
+        lastObservedUnrealizedPnlPct: 0,
+        activeTradeRegime: null,
+        activeTradeDecisionTs: 0,
+        activeTradeConfidence: 0,
+        activeTradeRiskMultiplier: 0.2,
+        activeTradeReasons: [],
+        activeTradeRealizedPnlBase: null,
       };
       this.runtime.set(symbol, state);
     }
@@ -1243,14 +1273,24 @@ export class AIDryRunController {
     return false;
   }
 
-  private syncRuntimePositionState(runtime: RuntimeSymbolState, snapshot: AIMetricsSnapshot, barId: number): void {
+  private syncRuntimePositionState(
+    runtime: RuntimeSymbolState,
+    snapshot: AIMetricsSnapshot,
+    barId: number,
+    symbol: string,
+    nowMs: number
+  ): void {
     const currentSide = snapshot.position?.side || null;
     const prevSide = runtime.positionSide;
+    if (snapshot.position) {
+      runtime.lastObservedUnrealizedPnlPct = Number(snapshot.position.unrealizedPnlPct || 0);
+    }
     if (prevSide === currentSide) return;
 
     runtime.lastBarId = barId;
 
     if (prevSide && !currentSide) {
+      this.recordActiveTradeOutcome(symbol, runtime, prevSide, nowMs);
       runtime.lastClosedSide = prevSide;
       runtime.lastCloseBarId = barId;
       runtime.dcaCount = 0;
@@ -1262,6 +1302,9 @@ export class AIDryRunController {
     }
 
     if (!prevSide && currentSide) {
+      if (runtime.activeTradeRealizedPnlBase == null) {
+        runtime.activeTradeRealizedPnlBase = this.dryRunSession.getSymbolRealizedPnl(symbol);
+      }
       runtime.entryBarId = barId;
       runtime.dcaCount = 0;
       runtime.pyramidCount = 0;
@@ -1279,6 +1322,8 @@ export class AIDryRunController {
     }
 
     if (prevSide && currentSide && prevSide !== currentSide) {
+      this.recordActiveTradeOutcome(symbol, runtime, prevSide, nowMs);
+      runtime.activeTradeRealizedPnlBase = this.dryRunSession.getSymbolRealizedPnl(symbol);
       runtime.entryBarId = barId;
       runtime.lastReversalEntryBarId = barId;
       runtime.dcaCount = 0;
@@ -1294,6 +1339,72 @@ export class AIDryRunController {
     }
 
     runtime.positionSide = currentSide;
+  }
+
+  private updateActiveTradeContext(
+    runtime: RuntimeSymbolState,
+    symbol: string,
+    regime: string,
+    decision: {
+      intent: 'HOLD' | 'ENTER' | 'ADD' | 'REDUCE' | 'EXIT';
+      side: StrategySide | null;
+      confidence: number;
+      riskMultiplier: number;
+      reasons: string[];
+    },
+    nowMs: number,
+    hadOrders: boolean
+  ): void {
+    if (!hadOrders) return;
+    if (decision.intent !== 'ENTER' && decision.intent !== 'ADD') return;
+    if (!decision.side) return;
+
+    runtime.activeTradeRegime = regime;
+    runtime.activeTradeDecisionTs = nowMs;
+    runtime.activeTradeConfidence = clamp(Number(decision.confidence || 0), 0, 1);
+    runtime.activeTradeRiskMultiplier = Number(decision.riskMultiplier || 0.2);
+    runtime.activeTradeReasons = Array.isArray(decision.reasons) ? [...decision.reasons] : [];
+    if (runtime.activeTradeRealizedPnlBase == null) {
+      runtime.activeTradeRealizedPnlBase = this.dryRunSession.getSymbolRealizedPnl(symbol);
+    }
+  }
+
+  private recordActiveTradeOutcome(
+    symbol: string,
+    runtime: RuntimeSymbolState,
+    side: StrategySide,
+    nowMs: number
+  ): void {
+    const realizedNow = this.dryRunSession.getSymbolRealizedPnl(symbol);
+    const baseline = runtime.activeTradeRealizedPnlBase;
+    const pnlFromRealized =
+      realizedNow != null && baseline != null
+        ? Number(realizedNow) - Number(baseline)
+        : null;
+    const outcome = Number.isFinite(pnlFromRealized as number)
+      ? Number(pnlFromRealized)
+      : Number(runtime.lastObservedUnrealizedPnlPct || 0);
+
+    this.performanceTracker.record({
+      timestamp: nowMs,
+      symbol,
+      decision: {
+        intent: 'ENTER',
+        side,
+        riskMultiplier: runtime.activeTradeRiskMultiplier || 0.2,
+        confidence: runtime.activeTradeConfidence || 0,
+        reasons: runtime.activeTradeReasons,
+      },
+      outcome,
+      regime: runtime.activeTradeRegime || 'UNKNOWN',
+    });
+
+    runtime.activeTradeRegime = null;
+    runtime.activeTradeDecisionTs = 0;
+    runtime.activeTradeConfidence = 0;
+    runtime.activeTradeRiskMultiplier = 0.2;
+    runtime.activeTradeReasons = [];
+    runtime.activeTradeRealizedPnlBase = realizedNow;
   }
 
   private syncRuntimeTrendState(

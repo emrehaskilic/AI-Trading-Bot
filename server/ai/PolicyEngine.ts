@@ -185,7 +185,7 @@ export class PolicyEngine {
     return [
       'You are a policy engine. Return JSON only, no text.',
       'Allowed output:',
-      '{"intent":"HOLD|ENTER|ADD|REDUCE|EXIT","side":"LONG|SHORT|null","riskMultiplier":0.2-1.2,"confidence":0.0-1.0}',
+      '{"intent":"HOLD|ENTER|ADD|REDUCE|EXIT","side":"LONG|SHORT|null","riskMultiplier":0.2-2.0,"confidence":0.0-1.0}',
       'Hard constraints:',
       '- ENTER only if flat',
       '- ADD only if same direction position exists',
@@ -239,7 +239,7 @@ export class PolicyEngine {
 
     const sideRaw = String(raw.side ?? '').trim().toUpperCase();
     const side: PolicySide = sideRaw === 'LONG' || sideRaw === 'SHORT' ? sideRaw : null;
-    const riskMultiplier = clamp(Number(raw.riskMultiplier ?? 0.2), 0.2, 1.2);
+    const riskMultiplier = clamp(Number(raw.riskMultiplier ?? 0.2), 0.2, 2.0);
     const confidence = clamp(Number(raw.confidence ?? 0), 0, 1);
 
     if (intent === 'ENTER' && !side) {

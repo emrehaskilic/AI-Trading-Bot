@@ -38,8 +38,16 @@ export function runGate(input: RunGateInput, cfg: GateConfig): GateResult {
     ? null
     : Math.max(0, input.canonical_time_ms - input.exchange_event_time_ms);
 
+  const volatilityPct = Number(input.metrics.advancedMetrics?.volatilityIndex ?? Number.NaN);
+  const baseLatencyThreshold = cfg.v2?.maxNetworkLatencyMs ?? Number.POSITIVE_INFINITY;
+  const dynamicLatencyThreshold = Number.isFinite(volatilityPct) && volatilityPct >= 80
+    ? Math.max(baseLatencyThreshold, 3000)
+    : Number.isFinite(volatilityPct) && volatilityPct >= 60
+      ? Math.max(baseLatencyThreshold, 2500)
+      : baseLatencyThreshold;
+
   const networkLatencyOk = cfg.mode === GateMode.V2_NETWORK_LATENCY
-    ? networkLatencyMs !== null && networkLatencyMs <= (cfg.v2?.maxNetworkLatencyMs ?? Number.POSITIVE_INFINITY)
+    ? networkLatencyMs !== null && networkLatencyMs <= dynamicLatencyThreshold
     : null;
 
   let reason: string | null = null;

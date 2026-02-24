@@ -1081,6 +1081,14 @@ export class DryRunSessionService {
     };
   }
 
+  getSymbolRealizedPnl(symbol: string): number | null {
+    const normalized = normalizeSymbol(symbol);
+    const session = this.sessions.get(normalized);
+    if (!session) return null;
+    const value = Number(session.realizedPnl);
+    return Number.isFinite(value) ? value : null;
+  }
+
   getAIDryRunRiskState(symbol: string, timestampMs?: number): {
     equity: number;
     leverage: number;
