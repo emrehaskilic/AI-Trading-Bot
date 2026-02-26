@@ -3,7 +3,11 @@ export type GoogleAIConfig = {
   model: string;
   temperature?: number;
   maxOutputTokens?: number;
+  thinkingBudget?: number | null;
   responseSchema?: Record<string, unknown>;
+  abortSignal?: AbortSignal;
+  maxHttpAttempts?: number;
+  disableHttpRetries?: boolean;
 };
 
 export type GoogleAIResponse = {
@@ -88,6 +92,23 @@ export async function generateContent(config: GoogleAIConfig, prompt: string): P
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
     `https://generativelanguage.googleapis.com/v1/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
   ];
+  const thinkingBudgetRaw =
+    config.thinkingBudget != null
+      ? Number(config.thinkingBudget)
+      : Number(process.env.AI_THINKING_BUDGET ?? 0);
+  const thinkingBudget = Number.isFinite(thinkingBudgetRaw)
+    ? Math.max(0, Math.trunc(thinkingBudgetRaw))
+    : null;
+
+  const generationConfig: Record<string, unknown> = {
+    temperature: typeof config.temperature === 'number' ? config.temperature : 0,
+    maxOutputTokens: typeof config.maxOutputTokens === 'number' ? config.maxOutputTokens : 256,
+    responseMimeType: 'application/json',
+  };
+  if (thinkingBudget != null) {
+    generationConfig.thinkingConfig = { thinkingBudget };
+  }
+
   const bodyBase = {
     contents: [
       {
@@ -95,11 +116,7 @@ export async function generateContent(config: GoogleAIConfig, prompt: string): P
         parts: [{ text: prompt }],
       },
     ],
-    generationConfig: {
-      temperature: typeof config.temperature === 'number' ? config.temperature : 0,
-      maxOutputTokens: typeof config.maxOutputTokens === 'number' ? config.maxOutputTokens : 256,
-      responseMimeType: 'application/json',
-    },
+    generationConfig,
   };
 
   const requestedSchema = config.responseSchema && typeof config.responseSchema === 'object'
@@ -125,13 +142,16 @@ export async function generateContent(config: GoogleAIConfig, prompt: string): P
   };
 
   const execute = async (url: string, body: any): Promise<{ payload: any; status: number }> => {
-    const maxAttempts = 3;
+    const maxAttempts = config.disableHttpRetries
+      ? 1
+      : Math.max(1, Math.trunc(Number(config.maxHttpAttempts ?? 3)));
     let lastError: Error | null = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        signal: config.abortSignal,
       });
       if (res.ok) {
         const payload = await res.json();

@@ -165,6 +165,7 @@ export type AIMetricsSnapshot = {
   market: {
     price: number;
     vwap: number;
+    // Percent value, not ratio. Example: 0.0128 means ~1.28 bps.
     spreadPct: number | null;
     delta1s: number;
     delta5s: number;
