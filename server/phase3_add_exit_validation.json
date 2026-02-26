@@ -1,0 +1,549 @@
+{
+  "generatedAt": "2026-02-26T14:16:30.599Z",
+  "decisionMode": "orchestrator_v1",
+  "phase2_hold_ok": true,
+  "phase2_entry_ok": true,
+  "adds_used_max_2_ok": true,
+  "add1_fired": true,
+  "add2_fired": true,
+  "no_add3_ok": true,
+  "exit_risk_triggered_ok": true,
+  "exit_maker_attempts": 2,
+  "exit_taker_count": 1,
+  "exit_taker_count_lte_1": true,
+  "legacyDecisionCalls": 0,
+  "phase2_fallback_ok": true,
+  "phase2_fallback_notional_pct": 0.25,
+  "checks": {
+    "exit_taker_count_lte_1": true
+  },
+  "samples": {
+    "holdSamples": [
+      {
+        "idx": 0,
+        "ts": 1772115390599,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 1,
+        "ts": 1772115390849,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 2,
+        "ts": 1772115391099,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 3,
+        "ts": 1772115391349,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 4,
+        "ts": 1772115391599,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 5,
+        "ts": 1772115391849,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 6,
+        "ts": 1772115392099,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 7,
+        "ts": 1772115392349,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 8,
+        "ts": 1772115392599,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 9,
+        "ts": 1772115392849,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      }
+    ],
+    "entrySample": {
+      "intent": "ENTRY",
+      "side": "BUY",
+      "orders": [
+        {
+          "id": "BTCUSDT-maker-l1-1772115395599-0",
+          "kind": "MAKER",
+          "side": "BUY",
+          "qty": 0.6,
+          "notionalPct": 0.6,
+          "price": 68099.9,
+          "postOnly": true,
+          "ttlMs": 8000,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repriceAttempt": 0,
+          "role": "ENTRY_L1"
+        },
+        {
+          "id": "BTCUSDT-maker-l2-1772115395599-0",
+          "kind": "MAKER",
+          "side": "BUY",
+          "qty": 0.4,
+          "notionalPct": 0.4,
+          "price": 68096.49500499999,
+          "postOnly": true,
+          "ttlMs": 8000,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repriceAttempt": 0,
+          "role": "ENTRY_L2"
+        }
+      ],
+      "chase": {
+        "active": true,
+        "startedAtMs": 1772115395599,
+        "expiresAtMs": 1772115413599,
+        "repriceMs": 1200,
+        "maxReprices": 6,
+        "repricesUsed": 0,
+        "chaseMaxSeconds": 18,
+        "ttlMs": 8000
+      }
+    },
+    "chaseTrace": [
+      {
+        "step": 1,
+        "ts": 1772115396799,
+        "intent": "ENTRY",
+        "orders": [
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L1",
+            "qty": 0.6,
+            "notionalPct": 0.6
+          },
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L2",
+            "qty": 0.4,
+            "notionalPct": 0.4
+          }
+        ],
+        "chase": {
+          "active": true,
+          "startedAtMs": 1772115395599,
+          "expiresAtMs": 1772115413599,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 1,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        }
+      },
+      {
+        "step": 2,
+        "ts": 1772115397999,
+        "intent": "ENTRY",
+        "orders": [
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L1",
+            "qty": 0.6,
+            "notionalPct": 0.6
+          },
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L2",
+            "qty": 0.4,
+            "notionalPct": 0.4
+          }
+        ],
+        "chase": {
+          "active": true,
+          "startedAtMs": 1772115395599,
+          "expiresAtMs": 1772115413599,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 2,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        }
+      },
+      {
+        "step": 3,
+        "ts": 1772115399199,
+        "intent": "ENTRY",
+        "orders": [
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L1",
+            "qty": 0.6,
+            "notionalPct": 0.6
+          },
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L2",
+            "qty": 0.4,
+            "notionalPct": 0.4
+          }
+        ],
+        "chase": {
+          "active": true,
+          "startedAtMs": 1772115395599,
+          "expiresAtMs": 1772115413599,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 3,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        }
+      },
+      {
+        "step": 4,
+        "ts": 1772115400399,
+        "intent": "ENTRY",
+        "orders": [
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L1",
+            "qty": 0.6,
+            "notionalPct": 0.6
+          },
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L2",
+            "qty": 0.4,
+            "notionalPct": 0.4
+          }
+        ],
+        "chase": {
+          "active": true,
+          "startedAtMs": 1772115395599,
+          "expiresAtMs": 1772115413599,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 4,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        }
+      },
+      {
+        "step": 5,
+        "ts": 1772115401599,
+        "intent": "ENTRY",
+        "orders": [
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L1",
+            "qty": 0.6,
+            "notionalPct": 0.6
+          },
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L2",
+            "qty": 0.4,
+            "notionalPct": 0.4
+          }
+        ],
+        "chase": {
+          "active": true,
+          "startedAtMs": 1772115395599,
+          "expiresAtMs": 1772115413599,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 5,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        }
+      },
+      {
+        "step": 6,
+        "ts": 1772115402799,
+        "intent": "ENTRY",
+        "orders": [
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L1",
+            "qty": 0.6,
+            "notionalPct": 0.6
+          },
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L2",
+            "qty": 0.4,
+            "notionalPct": 0.4
+          }
+        ],
+        "chase": {
+          "active": true,
+          "startedAtMs": 1772115395599,
+          "expiresAtMs": 1772115413599,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 6,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        }
+      },
+      {
+        "step": 7,
+        "ts": 1772115403999,
+        "intent": "ENTRY",
+        "orders": [
+          {
+            "kind": "TAKER_ENTRY_FALLBACK",
+            "role": "ENTRY_FALLBACK",
+            "qty": 0.25,
+            "notionalPct": 0.25
+          }
+        ],
+        "chase": {
+          "active": false,
+          "startedAtMs": 1772115395599,
+          "expiresAtMs": 1772115413599,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 6,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        }
+      }
+    ],
+    "addTrace": [
+      {
+        "step": "add1",
+        "intent": "ADD",
+        "position": {
+          "isOpen": true,
+          "qty": 1.6,
+          "entryVwap": 97.93749999999999,
+          "baseQty": 1,
+          "addsUsed": 1,
+          "lastAddTs": 1772115491599,
+          "cooldownUntilTs": 0,
+          "atr3m": 10,
+          "atrSource": "MICRO_ATR"
+        },
+        "orders": [
+          {
+            "id": "ETHUSDT-add-1-1772115491599",
+            "kind": "MAKER",
+            "side": "BUY",
+            "qty": 0.6,
+            "notionalPct": 0.6,
+            "price": 99.99,
+            "postOnly": true,
+            "ttlMs": 8000,
+            "repriceMs": 1200,
+            "maxReprices": 6,
+            "repriceAttempt": 1,
+            "role": "ADD_1"
+          }
+        ]
+      },
+      {
+        "step": "add2",
+        "intent": "ADD",
+        "position": {
+          "isOpen": true,
+          "qty": 2,
+          "entryVwap": 95.7375,
+          "baseQty": 1,
+          "addsUsed": 2,
+          "lastAddTs": 1772115582599,
+          "cooldownUntilTs": 0,
+          "atr3m": 10,
+          "atrSource": "MICRO_ATR"
+        },
+        "orders": [
+          {
+            "id": "ETHUSDT-add-2-1772115582599",
+            "kind": "MAKER",
+            "side": "BUY",
+            "qty": 0.4,
+            "notionalPct": 0.4,
+            "price": 99.99,
+            "postOnly": true,
+            "ttlMs": 8000,
+            "repriceMs": 1200,
+            "maxReprices": 6,
+            "repriceAttempt": 2,
+            "role": "ADD_2"
+          }
+        ]
+      },
+      {
+        "step": "add3",
+        "intent": "HOLD",
+        "position": {
+          "isOpen": true,
+          "qty": 2,
+          "entryVwap": 95.7375,
+          "baseQty": 1,
+          "addsUsed": 2,
+          "lastAddTs": 1772115582599,
+          "cooldownUntilTs": 0,
+          "atr3m": 10,
+          "atrSource": "MICRO_ATR"
+        },
+        "orders": []
+      }
+    ],
+    "exitSamples": [
+      {
+        "idx": 0,
+        "ts": 1772115890599,
+        "intent": "EXIT_RISK",
+        "exitRisk": {
+          "triggered": true,
+          "triggeredThisTick": true,
+          "reason": "REGIME",
+          "makerAttemptsUsed": 1,
+          "takerUsed": false
+        },
+        "orders": [
+          {
+            "kind": "MAKER",
+            "role": "EXIT_RISK_MAKER",
+            "qty": 2
+          }
+        ]
+      },
+      {
+        "idx": 1,
+        "ts": 1772115890600,
+        "intent": "EXIT_RISK",
+        "exitRisk": {
+          "triggered": true,
+          "triggeredThisTick": false,
+          "reason": "REGIME",
+          "makerAttemptsUsed": 2,
+          "takerUsed": false
+        },
+        "orders": [
+          {
+            "kind": "MAKER",
+            "role": "EXIT_RISK_MAKER",
+            "qty": 2
+          }
+        ]
+      },
+      {
+        "idx": 2,
+        "ts": 1772115890601,
+        "intent": "EXIT_RISK",
+        "exitRisk": {
+          "triggered": true,
+          "triggeredThisTick": false,
+          "reason": "REGIME",
+          "makerAttemptsUsed": 0,
+          "takerUsed": false
+        },
+        "orders": [
+          {
+            "kind": "TAKER_RISK_EXIT",
+            "role": "EXIT_RISK_TAKER",
+            "qty": 2
+          }
+        ]
+      },
+      {
+        "idx": 3,
+        "ts": 1772115890602,
+        "intent": "HOLD",
+        "exitRisk": {
+          "triggered": true,
+          "triggeredThisTick": false,
+          "reason": null,
+          "makerAttemptsUsed": 0,
+          "takerUsed": false
+        },
+        "orders": []
+      }
+    ]
+  }
+}

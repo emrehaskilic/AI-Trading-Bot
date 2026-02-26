@@ -1,0 +1,19 @@
+{
+  "generatedAt": "2026-02-26T12:38:18.657Z",
+  "commitHash": "e52ca7ea43f843422768dc4792177109a198f4b0",
+  "outputs": {
+    "md": "AI_Trading_Bot_Metrik_Envanteri_2026-02-26.md",
+    "html": "AI_Trading_Bot_Metrik_Envanteri_2026-02-26.html",
+    "pdf": "AI_Trading_Bot_Metrik_Envanteri_2026-02-26.pdf"
+  },
+  "counts": {
+    "uiVisible": 101,
+    "payloadOnly": 42,
+    "internalOnly": 541,
+    "typedSurface": 199,
+    "decisionPayload": 10
+  },
+  "pdfRender": {
+    "ok": true
+  }
+}

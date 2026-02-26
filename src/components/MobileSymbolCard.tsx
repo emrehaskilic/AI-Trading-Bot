@@ -26,6 +26,8 @@ const MobileSymbolCard: React.FC<MobileSymbolCardProps> = ({ symbol, metrics, sh
   }
 
   const lm = metrics.legacyMetrics;
+  const sessionVwap = metrics.sessionVwap || null;
+  const htf = metrics.htf || null;
   const trend = metrics.aiTrend || null;
   const aiBias = metrics.aiBias || null;
   const positionSide = metrics.strategyPosition?.side || null;
@@ -51,17 +53,57 @@ const MobileSymbolCard: React.FC<MobileSymbolCardProps> = ({ symbol, metrics, sh
             : 'bg-zinc-800 text-zinc-300 border-zinc-700';
 
   const posNegClass = (n: number) => (n > 0 ? 'text-emerald-300' : n < 0 ? 'text-rose-300' : 'text-zinc-300');
-  const fmt = (v: unknown, d = 2) => (Number.isFinite(Number(v)) ? Number(v).toFixed(d) : '-');
+  const inferTickSize = (): number => {
+    const levels = [...(metrics.bids || []), ...(metrics.asks || [])]
+      .map((lvl) => Number(lvl?.[0]))
+      .filter((px) => Number.isFinite(px) && px > 0)
+      .sort((a, b) => a - b);
+    let minDiff = Number.POSITIVE_INFINITY;
+    for (let i = 1; i < levels.length; i += 1) {
+      const diff = Math.abs(levels[i] - levels[i - 1]);
+      if (diff > 0 && diff < minDiff) {
+        minDiff = diff;
+      }
+    }
+    if (!Number.isFinite(minDiff)) {
+      return lm.price >= 1000 ? 0.1 : lm.price >= 1 ? 0.01 : 0.0001;
+    }
+    return minDiff;
+  };
+  const tickSize = inferTickSize();
+  const priceDecimals = Math.max(0, Math.min(8, Math.ceil(-Math.log10(tickSize))));
+  const fmtPrice = (v: unknown) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return '—';
+    return n.toLocaleString(undefined, {
+      minimumFractionDigits: priceDecimals,
+      maximumFractionDigits: priceDecimals,
+    });
+  };
+  const fmt = (v: unknown, d = 2) => (Number.isFinite(Number(v)) ? Number(v).toFixed(d) : '—');
   const fmtSigned = (v: unknown, d = 2) => {
     const n = Number(v);
-    if (!Number.isFinite(n)) return '-';
+    if (!Number.isFinite(n)) return '—';
     return `${n > 0 ? '+' : ''}${n.toFixed(d)}`;
   };
   const fmtPct = (v: unknown, d = 2) => {
     const n = Number(v);
-    if (!Number.isFinite(n)) return '-';
+    if (!Number.isFinite(n)) return '—';
     return `${n > 0 ? '+' : ''}${n.toFixed(d)}%`;
   };
+  const formatSessionStart = (ts: number | null | undefined) => {
+    const n = Number(ts);
+    if (!Number.isFinite(n) || n <= 0) return '—';
+    const d = new Date(n);
+    const hh = String(d.getUTCHours()).padStart(2, '0');
+    const mm = String(d.getUTCMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+  };
+  const elapsedMin = Number.isFinite(Number(sessionVwap?.elapsedMs))
+    ? `${Math.floor(Number(sessionVwap?.elapsedMs || 0) / 60000)}m`
+    : '—';
+  const h1Brk = htf?.h1?.structureBreakUp ? '↑' : htf?.h1?.structureBreakDn ? '↓' : '-';
+  const h4Brk = htf?.h4?.structureBreakUp ? '↑' : htf?.h4?.structureBreakDn ? '↓' : '-';
 
   return (
     <div className="bg-gradient-to-br from-zinc-900/85 to-zinc-950 border border-zinc-800 rounded-lg overflow-hidden shadow-xl">
@@ -72,7 +114,10 @@ const MobileSymbolCard: React.FC<MobileSymbolCardProps> = ({ symbol, metrics, sh
         <div className="flex items-center space-x-3">
           <div>
             <div className="text-base sm:text-lg font-bold text-white">{symbol}</div>
-            <div className="text-sm text-zinc-200 font-mono">${lm.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+            <div className="text-sm text-zinc-200 font-mono">${fmtPrice(lm.price)}</div>
+            <div className="text-[10px] text-zinc-500 font-mono">
+              Session {sessionVwap?.name || '—'} | sVWAP {fmtPrice(sessionVwap?.value)} | Δbps {fmtSigned(sessionVwap?.priceDistanceBps, 1)} | Rng {fmtPct(sessionVwap?.sessionRangePct, 2)}
+            </div>
             {(trend || aiBias || positionSide) && (
               <div className="mt-1">
                 <span className={`text-[10px] px-1.5 py-0.5 rounded border uppercase tracking-tight ${trendClass}`}>
@@ -95,7 +140,7 @@ const MobileSymbolCard: React.FC<MobileSymbolCardProps> = ({ symbol, metrics, sh
         </div>
       </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5 px-4 pb-3 text-xs">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 px-4 pb-3 text-xs">
         <div className="text-center p-2 bg-zinc-800/40 rounded border border-zinc-800/60">
           <div className="text-zinc-500 text-[10px] uppercase tracking-wider">OBI W</div>
           <div className={`font-mono font-medium ${posNegClass(lm.obiWeighted)}`}>{lm.obiWeighted.toFixed(2)}</div>
@@ -116,10 +161,48 @@ const MobileSymbolCard: React.FC<MobileSymbolCardProps> = ({ symbol, metrics, sh
           <div className="text-zinc-500 text-[10px] uppercase tracking-wider">CVD</div>
           <div className={`font-mono font-medium ${posNegClass(lm.cvdSlope)}`}>{lm.cvdSlope.toFixed(2)}</div>
         </div>
+        <div className="text-center p-2 bg-zinc-800/40 rounded border border-zinc-800/60">
+          <div className="text-zinc-500 text-[10px] uppercase tracking-wider">Session</div>
+          <div className="font-mono font-medium text-zinc-200">{sessionVwap?.name || '—'}</div>
+          <div className="text-[9px] text-zinc-500">{formatSessionStart(sessionVwap?.sessionStartMs)} / {elapsedMin}</div>
+        </div>
+        <div className="text-center p-2 bg-zinc-800/40 rounded border border-zinc-800/60">
+          <div className="text-zinc-500 text-[10px] uppercase tracking-wider">H1</div>
+          <div className="font-mono font-medium text-zinc-200">ATR {fmtPrice(htf?.h1?.atr)}</div>
+          <div className="text-[9px] text-zinc-500">Brk {h1Brk}</div>
+        </div>
+        <div className="text-center p-2 bg-zinc-800/40 rounded border border-zinc-800/60">
+          <div className="text-zinc-500 text-[10px] uppercase tracking-wider">H4</div>
+          <div className="font-mono font-medium text-zinc-200">ATR {fmtPrice(htf?.h4?.atr)}</div>
+          <div className="text-[9px] text-zinc-500">Brk {h4Brk}</div>
+        </div>
       </div>
 
       {open && (
         <div className="border-t border-zinc-800 p-4 space-y-4 animate-in">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px] font-mono">
+            <div className="bg-zinc-900/70 border border-zinc-800 rounded p-2">
+              <div className="text-zinc-500 text-[10px] uppercase">Session VWAP</div>
+              <div className="text-zinc-100">sVWAP {fmtPrice(sessionVwap?.value)}</div>
+              <div className={posNegClass(Number(sessionVwap?.priceDistanceBps || 0))}>Δbps {fmtSigned(sessionVwap?.priceDistanceBps, 1)}</div>
+              <div className="text-zinc-500">Rng {fmtPct(sessionVwap?.sessionRangePct, 2)}</div>
+            </div>
+            <div className="bg-zinc-900/70 border border-zinc-800 rounded p-2">
+              <div className="text-zinc-500 text-[10px] uppercase">HTF 1H</div>
+              <div className="text-zinc-100">Close {fmtPrice(htf?.h1?.close)}</div>
+              <div className="text-zinc-100">ATR {fmtPrice(htf?.h1?.atr)}</div>
+              <div className="text-zinc-500">Sw {fmtPrice(htf?.h1?.lastSwingHigh)} / {fmtPrice(htf?.h1?.lastSwingLow)}</div>
+              <div className="text-zinc-500">Brk {h1Brk}</div>
+            </div>
+            <div className="bg-zinc-900/70 border border-zinc-800 rounded p-2">
+              <div className="text-zinc-500 text-[10px] uppercase">HTF 4H</div>
+              <div className="text-zinc-100">Close {fmtPrice(htf?.h4?.close)}</div>
+              <div className="text-zinc-100">ATR {fmtPrice(htf?.h4?.atr)}</div>
+              <div className="text-zinc-500">Sw {fmtPrice(htf?.h4?.lastSwingHigh)} / {fmtPrice(htf?.h4?.lastSwingLow)}</div>
+              <div className="text-zinc-500">Brk {h4Brk}</div>
+            </div>
+          </div>
+
           <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
             <div className="bg-zinc-900/70 border border-zinc-800 rounded p-2">
               <div className="text-zinc-500 text-[10px] uppercase">MicroPx</div>

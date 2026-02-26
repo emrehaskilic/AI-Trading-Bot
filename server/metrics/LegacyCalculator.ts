@@ -2,6 +2,7 @@
 // Senior Quantitative Finance Developer Implementation
 import { OrderbookState } from './OrderbookManager';
 import { OpenInterestMonitor, OpenInterestMetrics as OIMetrics } from './OpenInterestMonitor';
+import { SessionVwapSnapshot, SessionVwapTracker } from './SessionVwapTracker';
 
 // Type for a trade used in the legacy metrics calculations
 interface LegacyTrade {
@@ -41,6 +42,7 @@ export class LegacyCalculator {
     private trades: LegacyTrade[] = [];
     private tradesHead = 0;
     private oiMonitor: OpenInterestMonitor | null = null;
+    private readonly sessionVwapTracker = new SessionVwapTracker();
 
     constructor(symbol?: string) {
         if (symbol) {
@@ -113,6 +115,11 @@ export class LegacyCalculator {
         if (this.volumeHistory.length > 100) {
             this.volumeHistory.shift();
         }
+        this.sessionVwapTracker.update(trade.timestamp, trade.price, trade.quantity);
+    }
+
+    public getSessionVwapSnapshot(nowMs: number, referencePrice: number | null | undefined): SessionVwapSnapshot {
+        return this.sessionVwapTracker.snapshot(nowMs, referencePrice);
     }
 
     /**

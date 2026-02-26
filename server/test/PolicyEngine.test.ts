@@ -1,22 +1,88 @@
-﻿import { PolicyEngine } from '../ai/PolicyEngine';
+import { PolicyEngine } from '../ai/PolicyEngine';
+import { buildAIMetricsSnapshot } from './helpers/aiSnapshot';
 
 function assert(condition: unknown, message: string): void {
   if (!condition) throw new Error(message);
 }
 
-export function runTests() {
+export async function runTests() {
+  const snapshot = buildAIMetricsSnapshot({
+    symbol: 'BTCUSDT',
+    timestampMs: 1700000000000,
+  });
+
+  const input: any = {
+    symbol: 'BTCUSDT',
+    timestampMs: snapshot.timestampMs,
+    state: {
+      symbol: 'BTCUSDT',
+      timestampMs: snapshot.timestampMs,
+      flowState: 'NEUTRAL',
+      regimeState: 'TRANSITION',
+      derivativesState: 'DELEVERAGING',
+      toxicityState: 'CLEAN',
+      executionState: 'HEALTHY',
+      stateConfidence: 0.6,
+      directionalBias: 'NEUTRAL',
+      cvdSlopeSign: 'FLAT',
+      oiDirection: 'FLAT',
+      volatilityPercentile: 50,
+      expectedSlippageBps: 2,
+      spreadBps: 2,
+    },
+    snapshot,
+    position: null,
+    directionLockBlocked: false,
+    lockReason: null,
+    startedAtMs: snapshot.timestampMs - 1000,
+  };
+
   {
+    const engine = new PolicyEngine({
+      apiKey: '',
+      model: '',
+      localOnly: false,
+      temperature: 0,
+      maxOutputTokens: 64,
+    });
+
+    const out = await engine.evaluate(input);
+    assert(out.decision.intent === 'HOLD', 'missing llm config must hold');
+    assert(out.source === 'HOLD_FALLBACK', 'missing llm config source must be HOLD_FALLBACK');
+    assert(out.error === 'LLM_NOT_CONFIGURED', 'missing llm config error must be LLM_NOT_CONFIGURED');
+  }
+
+  {
+    const prev = process.env.AI_TEST_LOCAL_POLICY;
+    process.env.AI_TEST_LOCAL_POLICY = 'false';
     const engine = new PolicyEngine({
       apiKey: '',
       model: '',
       localOnly: true,
       temperature: 0,
       maxOutputTokens: 64,
-    }) as any;
+    });
 
-    const fallback = engine.hold('llm_unavailable', 0, null);
-    assert(fallback.decision.intent === 'HOLD', 'local-only fallback must always hold');
-    assert(fallback.source === 'HOLD_FALLBACK', 'hold fallback source must be HOLD_FALLBACK');
+    const out = await engine.evaluate(input);
+    assert(out.decision.intent === 'HOLD', 'localOnly must be blocked when test flag disabled');
+    assert(out.error === 'LOCAL_POLICY_DISABLED', 'disabled local policy should report LOCAL_POLICY_DISABLED');
+    process.env.AI_TEST_LOCAL_POLICY = prev;
+  }
+
+  {
+    const prev = process.env.AI_TEST_LOCAL_POLICY;
+    process.env.AI_TEST_LOCAL_POLICY = 'true';
+    const engine = new PolicyEngine({
+      apiKey: '',
+      model: '',
+      localOnly: true,
+      temperature: 0,
+      maxOutputTokens: 64,
+    });
+
+    const out = await engine.evaluate(input);
+    assert(out.source === 'LOCAL_POLICY', 'local policy should be reachable only in test mode');
+    process.env.AI_TEST_LOCAL_POLICY = prev;
   }
 
   {

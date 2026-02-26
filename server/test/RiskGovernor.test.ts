@@ -69,7 +69,7 @@ export function runTests() {
         startingMarginUser: 200,
         marginInUse: 300,
         drawdownPct: -0.05,
-        dailyLossLock: false,
+        dailyLossLock: true,
         cooldownMsRemaining: 0,
       },
       position: {
@@ -92,6 +92,70 @@ export function runTests() {
 
     assert(out.intent === 'REDUCE' || out.intent === 'HOLD', 'daily loss breach must block new risk');
     assert(out.reasons.includes('DAILY_LOSS_CAP'), 'daily loss reason should be emitted');
+  }
+
+  {
+    const storePath = path.join(process.cwd(), 'server', 'test', '.tmp', `risk-governor-${Date.now()}-2b.json`);
+    const governor = new RiskGovernor({ storePath });
+    const snapshot = buildAIMetricsSnapshot({
+      riskState: {
+        equity: 9_500,
+        leverage: 10,
+        startingMarginUser: 200,
+        marginInUse: 300,
+        drawdownPct: -0.05,
+        dailyLossLock: false,
+        cooldownMsRemaining: 0,
+      },
+      position: {
+        side: 'LONG',
+        qty: 0.2,
+        entryPrice: 60_000,
+        unrealizedPnlPct: -0.03,
+        addsUsed: 1,
+        timeInPositionMs: 30_000,
+      },
+    });
+    const deterministicState = new StateExtractor().extract(snapshot);
+    const out = governor.apply({
+      symbol: snapshot.symbol,
+      timestampMs: snapshot.timestampMs,
+      policy: { intent: 'ADD', side: 'LONG', riskMultiplier: 1, confidence: 0.9 },
+      deterministicState,
+      snapshot,
+    });
+
+    assert(!out.reasons.includes('DAILY_LOSS_CAP'), 'drawdown-only should not trigger daily loss cap by default');
+    assert(out.intent !== 'REDUCE', 'drawdown-only should not force reduce when explicit lock is off');
+  }
+
+  {
+    const storePath = path.join(process.cwd(), 'server', 'test', '.tmp', `risk-governor-${Date.now()}-2c.json`);
+    const governor = new RiskGovernor({ storePath });
+    const snapshot = buildAIMetricsSnapshot({
+      market: {
+        price: 60_000,
+      },
+      position: {
+        side: 'SHORT',
+        qty: 0.25,
+        entryPrice: 58_000,
+        unrealizedPnlPct: -0.012,
+        addsUsed: 1,
+        timeInPositionMs: 120_000,
+      },
+    });
+    const deterministicState = new StateExtractor().extract(snapshot);
+    const out = governor.apply({
+      symbol: snapshot.symbol,
+      timestampMs: snapshot.timestampMs,
+      policy: { intent: 'REDUCE', side: 'SHORT', riskMultiplier: 1, confidence: 0.7 },
+      deterministicState,
+      snapshot,
+    });
+
+    assert(out.intent === 'HOLD', 'losing position should not realize loss without hard risk');
+    assert(out.reasons.includes('LOSER_REALIZE_BLOCK'), 'loser realize block reason should be emitted');
   }
 
   {
@@ -125,5 +189,46 @@ export function runTests() {
 
     assert(out.intent === 'REDUCE', 'toxic state should force reduce for open position');
     assert(out.reasons.includes('TOXICITY_LIMIT'), 'toxic reason should be emitted');
+  }
+
+  {
+    const storePath = path.join(process.cwd(), 'server', 'test', '.tmp', `risk-governor-${Date.now()}-4.json`);
+    const governor = new RiskGovernor({ storePath });
+    const snapshot = buildAIMetricsSnapshot({
+      market: {
+        price: 62_500,
+        vwap: 60_000,
+        deltaZ: 2.1,
+        cvdSlope: 65_000,
+      },
+      regimeMetrics: {
+        trendinessScore: 0.82,
+        chopScore: 0.2,
+      },
+      openInterest: {
+        oiChangePct: 0.55,
+      },
+      position: null,
+    });
+    const deterministicState = new StateExtractor().extract(snapshot);
+
+    const blockedShort = governor.apply({
+      symbol: snapshot.symbol,
+      timestampMs: snapshot.timestampMs,
+      policy: { intent: 'ENTER', side: 'SHORT', riskMultiplier: 1, confidence: 0.9 },
+      deterministicState,
+      snapshot,
+    });
+    assert(blockedShort.intent === 'HOLD', 'strong uptrend must block short entry');
+    assert(blockedShort.reasons.includes('ENTRY_COUNTERTREND_GUARD'), 'countertrend block reason should be emitted');
+
+    const allowedLong = governor.apply({
+      symbol: snapshot.symbol,
+      timestampMs: snapshot.timestampMs + 1,
+      policy: { intent: 'ENTER', side: 'LONG', riskMultiplier: 1, confidence: 0.9 },
+      deterministicState,
+      snapshot,
+    });
+    assert(allowedLong.intent === 'ENTER', 'trend-aligned long entry should remain allowed');
   }
 }

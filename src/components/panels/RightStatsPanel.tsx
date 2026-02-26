@@ -17,7 +17,7 @@ export interface RightStatsPanelProps {
  * connection state.
  */
 const RightStatsPanel: React.FC<RightStatsPanelProps> = ({ metrics, showLatency = false }) => {
-  const { timeAndSales, cvd, openInterest, funding, absorption, legacyMetrics, state } = metrics;
+  const { timeAndSales, cvd, openInterest, funding, absorption, legacyMetrics, state, sessionVwap, htf, bids, asks } = metrics;
   const lm: LegacyMetrics | undefined = legacyMetrics;
   const posNegClass = (n: number) => (n > 0 ? 'text-green-400' : n < 0 ? 'text-red-400' : 'text-zinc-300');
   // Bid/ask pressure ratio mapping to bar widths: ratio > 1 indicates more bid pressure
@@ -43,6 +43,64 @@ const RightStatsPanel: React.FC<RightStatsPanelProps> = ({ metrics, showLatency 
     const sec = secs % 60;
     return `${mins}m ${sec}s`;
   };
+  const inferTickSize = (): number => {
+    const levels = [...(bids || []), ...(asks || [])]
+      .map((lvl) => Number(lvl?.[0]))
+      .filter((px) => Number.isFinite(px) && px > 0)
+      .sort((a, b) => a - b);
+    let minDiff = Number.POSITIVE_INFINITY;
+    for (let i = 1; i < levels.length; i += 1) {
+      const diff = Math.abs(levels[i] - levels[i - 1]);
+      if (diff > 0 && diff < minDiff) {
+        minDiff = diff;
+      }
+    }
+    if (!Number.isFinite(minDiff)) {
+      return (lm?.price || 0) >= 1000 ? 0.1 : (lm?.price || 0) >= 1 ? 0.01 : 0.0001;
+    }
+    return minDiff;
+  };
+  const tickSize = inferTickSize();
+  const priceDecimals = Math.max(0, Math.min(8, Math.ceil(-Math.log10(tickSize))));
+    const fmtPrice = (value: unknown): string => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '-';
+    return n.toLocaleString(undefined, {
+      minimumFractionDigits: priceDecimals,
+      maximumFractionDigits: priceDecimals,
+    });
+  };
+  const fmtSigned = (value: unknown, decimals = 1): string => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '-';
+    return `${n > 0 ? '+' : ''}${n.toFixed(decimals)}`;
+  };
+  const fmtPct = (value: unknown, decimals = 2): string => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '-';
+    return `${n > 0 ? '+' : ''}${n.toFixed(decimals)}%`;
+  };
+  const formatSessionStart = (ts: number | null | undefined): string => {
+    const n = Number(ts);
+    if (!Number.isFinite(n) || n <= 0) return '-';
+    const d = new Date(n);
+    const hh = String(d.getUTCHours()).padStart(2, '0');
+    const mm = String(d.getUTCMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+  };
+  const elapsedMinutes = Number.isFinite(Number(sessionVwap?.elapsedMs))
+    ? `${Math.floor(Number(sessionVwap?.elapsedMs || 0) / 60000)}m`
+    : '-';
+  const h1Brk = htf?.h1?.structureBreakUp ? 'UP' : htf?.h1?.structureBreakDn ? 'DN' : '-';
+  const h4Brk = htf?.h4?.structureBreakUp ? 'UP' : htf?.h4?.structureBreakDn ? 'DN' : '-';
+  const formatBarStartHHmm = (value: unknown): string => {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return '-';
+    const d = new Date(n);
+    const hh = String(d.getUTCHours()).padStart(2, '0');
+    const mm = String(d.getUTCMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+  };
   return (
     <div className="space-y-3 text-xs">
       {/* Legacy rolling deltas and session stats */}
@@ -55,6 +113,32 @@ const RightStatsPanel: React.FC<RightStatsPanelProps> = ({ metrics, showLatency 
           <MetricTile title="CVD Slope" value={lm.cvdSlope.toFixed(2)} valueClassName={posNegClass(lm.cvdSlope)} />
         </div>
       )}
+
+      <div className="grid grid-cols-2 gap-2">
+        <div className="bg-zinc-800/50 p-2 rounded">
+          <div className="font-semibold text-zinc-400 text-[10px] uppercase">Session VWAP</div>
+          <div className="text-sm text-zinc-200 font-mono">{sessionVwap?.name || '-'} | {fmtPrice(sessionVwap?.value)}</div>
+          <div className={`text-xs font-mono ${posNegClass(Number(sessionVwap?.priceDistanceBps || 0))}`}>
+            Δbps {fmtSigned(sessionVwap?.priceDistanceBps, 1)}
+          </div>
+          <div className="text-[10px] text-zinc-500 font-mono">
+            Rng {fmtPct(sessionVwap?.sessionRangePct, 2)} | Start {formatSessionStart(sessionVwap?.sessionStartMs)} | Elapsed {elapsedMinutes}
+          </div>
+        </div>
+        <div className="bg-zinc-800/50 p-2 rounded">
+          <div className="font-semibold text-zinc-400 text-[10px] uppercase">HTF 1H / 4H</div>
+          <div className="text-[11px] text-zinc-200 font-mono">H1 Close {fmtPrice(htf?.h1?.close)} | ATR {fmtPrice(htf?.h1?.atr)}</div>
+          <div className="text-[10px] text-zinc-500 font-mono">H1 Bar {formatBarStartHHmm(htf?.h1?.barStartMs)} UTC</div>
+          <div className="text-[10px] text-zinc-500 font-mono">
+            H1 Sw {fmtPrice(htf?.h1?.lastSwingHigh)}/{fmtPrice(htf?.h1?.lastSwingLow)} Brk {h1Brk}
+          </div>
+          <div className="text-[11px] text-zinc-200 font-mono mt-1">H4 Close {fmtPrice(htf?.h4?.close)} | ATR {fmtPrice(htf?.h4?.atr)}</div>
+          <div className="text-[10px] text-zinc-500 font-mono">H4 Bar {formatBarStartHHmm(htf?.h4?.barStartMs)} UTC</div>
+          <div className="text-[10px] text-zinc-500 font-mono">
+            H4 Sw {fmtPrice(htf?.h4?.lastSwingHigh)}/{fmtPrice(htf?.h4?.lastSwingLow)} Brk {h4Brk}
+          </div>
+        </div>
+      </div>
 
       {/* Pressure bar */}
       <div>

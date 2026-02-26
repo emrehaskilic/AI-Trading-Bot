@@ -4,6 +4,10 @@ import * as AbsorptionTests from './AbsorptionDetector.test';
 import * as OrderbookTests from './OrderbookManager.test';
 import * as OIMonitorTests from './OpenInterestMonitor.test';
 import * as FundingTests from './FundingMonitor.test';
+import * as SessionVwapTrackerTests from './SessionVwapTracker.test';
+import * as BackfillCoordinatorTests from './BackfillCoordinator.test';
+import * as HtfStructureMonitorTests from './HtfStructureMonitor.test';
+import * as OrchestratorV1Tests from './OrchestratorV1.test';
 import * as LatencyTests from './Latency.test';
 import * as SequenceRuleTests from './SequenceRule.test';
 import * as ReconnectTests from './ReconnectContinuity.test';
@@ -37,6 +41,10 @@ export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'OrderbookManager', fn: OrderbookTests.runTests },
     { name: 'OpenInterestMonitor', fn: OIMonitorTests.runTests },
     { name: 'FundingMonitor', fn: FundingTests.runTests },
+    { name: 'SessionVwapTracker', fn: SessionVwapTrackerTests.runTests },
+    { name: 'BackfillCoordinator', fn: BackfillCoordinatorTests.runTests },
+    { name: 'HtfStructureMonitor', fn: HtfStructureMonitorTests.runTests },
+    { name: 'OrchestratorV1', fn: OrchestratorV1Tests.runTests },
     { name: 'LatencyClamp', fn: LatencyTests.runTests },
     { name: 'SequenceRule', fn: SequenceRuleTests.runTests },
     { name: 'ReconnectContinuity', fn: ReconnectTests.runTests },

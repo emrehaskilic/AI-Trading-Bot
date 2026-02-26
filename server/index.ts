@@ -45,6 +45,7 @@ import { bootstrapMeanCI, tTestPValue } from './backtesting/Statistics';
 
 // [PHASE 1 & 2] New Imports
 import { KlineBackfill } from './backfill/KlineBackfill';
+import { BackfillCoordinator } from './backfill/BackfillCoordinator';
 import { OICalculator } from './metrics/OICalculator';
 import { SymbolEventQueue } from './utils/SymbolEventQueue';
 import { SnapshotTracker } from './telemetry/Snapshot';
@@ -52,6 +53,8 @@ import { apiKeyMiddleware, validateWebSocketApiKey } from './auth/apiKey';
 import { NewStrategyV11 } from './strategy/NewStrategyV11';
 import { DecisionLog } from './telemetry/DecisionLog';
 import { AIDryRunController } from './ai/AIDryRunController';
+import { DecisionProvider } from './ai/DecisionProvider';
+import { NoopDecisionProvider } from './ai/NoopDecisionProvider';
 import { DryRunConfig, DryRunEngine, DryRunEventInput, DryRunSessionService, isUpstreamGuardError } from './dryrun';
 import { logger, requestLogger, serializeError } from './utils/logger';
 import { WebSocketManager } from './ws/WebSocketManager';
@@ -73,6 +76,9 @@ import {
     AdvancedMicrostructureBundle,
 } from './metrics/AdvancedMicrostructureMetrics';
 import { SpotReferenceMonitor, SpotReferenceMetrics } from './metrics/SpotReferenceMonitor';
+import { HtfStructureMonitor } from './metrics/HtfStructureMonitor';
+import { OrchestratorV1 } from './orchestrator_v1/OrchestratorV1';
+import { OrchestratorV1Decision, OrchestratorV1Order, OrchestratorV1Side } from './orchestrator_v1/types';
 
 // =============================================================================
 // Configuration
@@ -127,9 +133,7 @@ const CLIENT_STALE_CONNECTION_MS = Number(process.env.CLIENT_STALE_CONNECTION_MS
 const WS_MAX_SUBSCRIPTIONS = Number(process.env.WS_MAX_SUBSCRIPTIONS || 500);
 const BACKFILL_RECORDING_ENABLED = parseEnvFlag(process.env.BACKFILL_RECORDING_ENABLED);
 const BACKFILL_SNAPSHOT_INTERVAL_MS = Number(process.env.BACKFILL_SNAPSHOT_INTERVAL_MS || 2000);
-const AI_TREND_BOOTSTRAP_DEFAULT_HOURS = Math.max(1, Number(process.env.AI_TREND_BOOTSTRAP_HOURS || 6));
-const AI_TREND_BOOTSTRAP_MAX_HOURS = 12;
-const AI_TREND_BOOTSTRAP_MIN_BARS = 120;
+const BOOTSTRAP_1M_LIMIT = Math.max(50, Math.trunc(Number(process.env.BOOTSTRAP_1M_LIMIT || 500)));
 const STRATEGY_EVAL_MIN_INTERVAL_MS = Math.max(50, Number(process.env.STRATEGY_EVAL_MIN_INTERVAL_MS || 200));
 // Cross-market metrics should be available out-of-the-box.
 // Explicitly set ENABLE_CROSS_MARKET_CONFIRMATION=false to disable.
@@ -145,9 +149,21 @@ function parseEnvFlag(value: string | undefined): boolean {
     return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on';
 }
 
+function normalizeDecisionMode(raw: string | undefined): 'off' | 'orchestrator_v1' {
+    const normalized = String(raw || '').trim().toLowerCase();
+    if (normalized === 'off') return 'off';
+    if (normalized === 'orchestrator_v1') return 'orchestrator_v1';
+    logger.error('INVALID_DECISION_MODE', {
+        provided: String(raw || ''),
+        allowed: ['off', 'orchestrator_v1'],
+    });
+    process.exit(1);
+}
+
 const EXECUTION_ENABLED_DEFAULT = parseEnvFlag(process.env.EXECUTION_ENABLED);
 let EXECUTION_ENABLED = EXECUTION_ENABLED_DEFAULT;
 const EXECUTION_ENV = 'testnet';
+const DECISION_MODE = normalizeDecisionMode(process.env.DECISION_MODE || 'off');
 
 function normalizeWsUpdateSpeed(raw: string): '100ms' | '250ms' | '500ms' {
     const value = String(raw || '').trim().toLowerCase();
@@ -264,6 +280,7 @@ const lastFunding = new Map<string, FundingMetrics>();
 const oiMonitors = new Map<string, OpenInterestMonitor>();
 const fundingMonitors = new Map<string, FundingMonitor>();
 const spotReferenceMonitors = new Map<string, SpotReferenceMonitor>();
+const htfMonitors = new Map<string, HtfStructureMonitor>();
 
 // [PHASE 1 & 2] New Maps
 const backfillMap = new Map<string, KlineBackfill>();
@@ -271,15 +288,21 @@ const oiCalculatorMap = new Map<string, OICalculator>();
 const decisionLog = new DecisionLog();
 decisionLog.start();
 const strategyMap = new Map<string, NewStrategyV11>();
-const backfillInFlight = new Set<string>();
-const backfillLastAttemptMs = new Map<string, number>();
 const BACKFILL_RETRY_INTERVAL_MS = 30_000;
+const backfillCoordinator = new BackfillCoordinator(
+    BINANCE_REST_BASE,
+    BOOTSTRAP_1M_LIMIT,
+    BACKFILL_RETRY_INTERVAL_MS,
+    log
+);
 const alertConfig = getAlertConfig();
 const alertService = new AlertService(alertConfig);
 const notificationService = new NotificationService(alertConfig);
 const orchestrator = createOrchestratorFromEnv(alertService);
 const dryRunSession = new DryRunSessionService(alertService);
 const aiDryRun = new AIDryRunController(dryRunSession, decisionLog, log);
+const decisionProvider: DecisionProvider = new NoopDecisionProvider();
+const orchestratorV1 = new OrchestratorV1();
 const abTestManager = new ABTestManager(alertService);
 const marketArchive = new MarketDataArchive();
 const signalReplay = new SignalReplay(marketArchive);
@@ -302,6 +325,8 @@ log('EXECUTION_CONFIG', {
     execEnabled: EXECUTION_ENABLED,
     killSwitch: KILL_SWITCH,
     env: EXECUTION_ENV,
+    decisionMode: DECISION_MODE,
+    decisionEnabled: DECISION_MODE === 'orchestrator_v1',
     hasApiKey: hasEnvApiKey,
     hasApiSecret: hasEnvApiSecret,
     executionAllowed: initialGate.executionAllowed,
@@ -314,6 +339,201 @@ const EXCHANGE_INFO_TTL_MS = 1000 * 60 * 60; // 1 hr
 let globalBackoffUntil = 0; // Starts at 0 to allow fresh attempts on restart
 let symbolConcurrencyLimit = Math.max(AUTO_SCALE_MIN_SYMBOLS, Number(process.env.SYMBOL_CONCURRENCY || 20));
 let autoScaleLastUpTs = 0;
+const decisionRuntimeStats = {
+    legacyDecisionCalls: 0,
+    executorEntrySkipped: 0,
+    orchestratorEvaluations: 0,
+    ordersAttempted: 0,
+    makerOrdersPlaced: 0,
+    takerOrdersPlaced: 0,
+    entryTakerNotionalPct: 0,
+    addsUsed: 0,
+    exitRiskTriggeredCount: 0,
+    gateB_fail_cvd_count: 0,
+    gateB_fail_obi_count: 0,
+    gateB_fail_deltaZ_count: 0,
+    gateA_fail_trendiness_count: 0,
+    allGatesTrue_count: 0,
+    entryCandidateCount: 0,
+    chaseStartedCount: 0,
+    chaseTimedOutCount: 0,
+    impulseTrueCount: 0,
+    fallbackEligibleCount: 0,
+    fallbackTriggeredCount: 0,
+    fallbackBlockedReasonCounts: {} as Record<string, number>,
+    makerFillsCount: 0,
+    takerFillsCount: 0,
+    positionSide: null as OrchestratorV1Side | null,
+    positionQty: 0,
+    entryVwap: null as number | null,
+    postOnlyRejectCount: 0,
+    cancelCount: 0,
+    replaceCount: 0,
+};
+
+type FallbackBlockedReason =
+    | 'NO_TIMEOUT'
+    | 'IMPULSE_FALSE'
+    | 'GATES_FALSE'
+    | 'DRYRUN_BLOCK'
+    | 'CONFIG_BLOCK'
+    | 'OTHER';
+
+const fallbackReasonPriority: FallbackBlockedReason[] = [
+    'IMPULSE_FALSE',
+    'GATES_FALSE',
+    'NO_TIMEOUT',
+    'DRYRUN_BLOCK',
+    'CONFIG_BLOCK',
+    'OTHER',
+];
+
+const orchestratorDiagState = {
+    chaseActiveBySymbol: new Map<string, boolean>(),
+    chaseExpiresAtBySymbol: new Map<string, number | null>(),
+    blockReasonCountsBySymbol: new Map<string, Record<string, number>>(),
+};
+
+function incrementCounter(map: Record<string, number>, key: string): void {
+    map[key] = Number(map[key] || 0) + 1;
+}
+
+function topFallbackBlockedReason(): string {
+    const counts = decisionRuntimeStats.fallbackBlockedReasonCounts;
+    let top = 'OTHER';
+    let max = -1;
+    for (const reason of fallbackReasonPriority) {
+        const value = Number(counts[reason] || 0);
+        if (value > max) {
+            max = value;
+            top = reason;
+        }
+    }
+    return top;
+}
+
+function deriveOrchestratorBlockReason(decision: OrchestratorV1Decision, nowMs: number): string {
+    if (!decision.readiness.ready) return 'READINESS';
+    if (!decision.gateA.passed) {
+        if (decision.gateA.checks.trendiness === false) return 'GateA.trendiness';
+        if (decision.gateA.checks.chop === false) return 'GateA.chop';
+        if (decision.gateA.checks.volOfVol === false) return 'GateA.volOfVol';
+        if (decision.gateA.checks.spread === false) return 'GateA.spread';
+        if (decision.gateA.checks.oiDrop === false) return 'GateA.oiDrop';
+        return 'GateA.other';
+    }
+    if (!decision.gateB.passed) {
+        if (decision.gateB.checks.cvd === false) return 'GateB.cvd';
+        if (decision.gateB.checks.obiSupport === false) return 'GateB.obiSupport';
+        if (decision.gateB.checks.deltaZ === false) return 'GateB.deltaZ';
+        if (decision.gateB.checks.side === false) return 'GateB.side';
+        return 'GateB.other';
+    }
+    if (!decision.gateC.passed) {
+        if (decision.gateC.checks.vwapDistance === false) return 'GateC.vwapDistance';
+        if (decision.gateC.checks.vol1m === false) return 'GateC.vol1m';
+        return 'GateC.other';
+    }
+    if (Number(decision.position?.cooldownUntilTs || 0) > nowMs) return 'COOLDOWN';
+    return 'NONE';
+}
+
+function recordSymbolBlockReason(symbol: string, blockReason: string): void {
+    const current = orchestratorDiagState.blockReasonCountsBySymbol.get(symbol) || {};
+    incrementCounter(current, blockReason);
+    orchestratorDiagState.blockReasonCountsBySymbol.set(symbol, current);
+}
+
+function updateOrchestratorDiagnostics(symbol: string, decision: OrchestratorV1Decision, nowMs: number): {
+    blockReason: string;
+    gateA: boolean;
+    gateB: boolean;
+    gateC: boolean;
+    impulse: boolean;
+    chaseActive: boolean;
+} {
+    const gateA = Boolean(decision.gateA.passed);
+    const gateB = Boolean(decision.gateB.passed);
+    const gateC = Boolean(decision.gateC.passed);
+    const impulse = Boolean(decision.impulse?.passed);
+    const chaseActive = Boolean(decision.chase?.active);
+    const entryCandidate = Boolean(decision.readiness.ready && gateA && gateB && gateC);
+
+    if (decision.gateB.checks.cvd === false) decisionRuntimeStats.gateB_fail_cvd_count += 1;
+    if (decision.gateB.checks.obiSupport === false) decisionRuntimeStats.gateB_fail_obi_count += 1;
+    if (decision.gateB.checks.deltaZ === false) decisionRuntimeStats.gateB_fail_deltaZ_count += 1;
+    if (decision.gateA.checks.trendiness === false) decisionRuntimeStats.gateA_fail_trendiness_count += 1;
+    if (decision.allGatesPassed) decisionRuntimeStats.allGatesTrue_count += 1;
+    if (entryCandidate) decisionRuntimeStats.entryCandidateCount += 1;
+    if (impulse) decisionRuntimeStats.impulseTrueCount += 1;
+
+    const prevChaseActive = Boolean(orchestratorDiagState.chaseActiveBySymbol.get(symbol));
+    const prevExpiresAt = orchestratorDiagState.chaseExpiresAtBySymbol.get(symbol) ?? null;
+
+    if (!prevChaseActive && chaseActive) {
+        decisionRuntimeStats.chaseStartedCount += 1;
+    }
+
+    const timedOutNow = prevChaseActive && !chaseActive && (
+        (Number.isFinite(Number(prevExpiresAt)) && Number(prevExpiresAt) > 0 && nowMs >= Number(prevExpiresAt))
+        || Number(decision.chase?.repricesUsed || 0) >= Number(decision.chase?.maxReprices || 0)
+    );
+    if (timedOutNow) {
+        decisionRuntimeStats.chaseTimedOutCount += 1;
+    }
+
+    const fallbackTriggered = Array.isArray(decision.orders)
+        && decision.orders.some((order) => order.kind === 'TAKER_ENTRY_FALLBACK');
+    if (fallbackTriggered) {
+        decisionRuntimeStats.fallbackTriggeredCount += 1;
+    }
+
+    const fallbackEligible = Boolean(timedOutNow && impulse && entryCandidate);
+    if (fallbackEligible) {
+        decisionRuntimeStats.fallbackEligibleCount += 1;
+    }
+
+    let fallbackBlockedReason: FallbackBlockedReason | null = null;
+    if (!fallbackTriggered) {
+        if (chaseActive && !timedOutNow) fallbackBlockedReason = 'NO_TIMEOUT';
+        else if (timedOutNow && !impulse) fallbackBlockedReason = 'IMPULSE_FALSE';
+        else if (timedOutNow && !entryCandidate) fallbackBlockedReason = 'GATES_FALSE';
+        else if (timedOutNow && DECISION_MODE !== 'orchestrator_v1') fallbackBlockedReason = 'CONFIG_BLOCK';
+        else if (timedOutNow) fallbackBlockedReason = 'OTHER';
+    }
+    if (fallbackBlockedReason) {
+        incrementCounter(decisionRuntimeStats.fallbackBlockedReasonCounts, fallbackBlockedReason);
+    }
+
+    if (decision.position.isOpen && Number(decision.position.qty || 0) > 0) {
+        decisionRuntimeStats.positionSide = decision.side || null;
+        decisionRuntimeStats.positionQty = Number(decision.position.qty || 0);
+        decisionRuntimeStats.entryVwap = Number.isFinite(Number(decision.position.entryVwap))
+            ? Number(decision.position.entryVwap)
+            : null;
+    } else if (!decision.position.isOpen) {
+        decisionRuntimeStats.positionSide = null;
+        decisionRuntimeStats.positionQty = 0;
+        decisionRuntimeStats.entryVwap = null;
+    }
+
+    orchestratorDiagState.chaseActiveBySymbol.set(symbol, chaseActive);
+    orchestratorDiagState.chaseExpiresAtBySymbol.set(
+        symbol,
+        Number.isFinite(Number(decision.chase?.expiresAtMs)) ? Number(decision.chase?.expiresAtMs) : null
+    );
+
+    const blockReason = deriveOrchestratorBlockReason(decision, nowMs);
+    recordSymbolBlockReason(symbol, blockReason);
+    return {
+        blockReason,
+        gateA,
+        gateB,
+        gateC,
+        impulse,
+        chaseActive,
+    };
+}
 
 // =============================================================================
 // Helpers
@@ -430,192 +650,6 @@ function buildSymbolFallbackList(): string[] {
     return Array.from(seeds).sort();
 }
 
-interface KlineSample1m {
-    openTimeMs: number;
-    closeTimeMs: number;
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number;
-}
-
-interface BootstrapTrendSeed {
-    bias: 'LONG' | 'SHORT';
-    strength: number;
-    asOfMs: number;
-}
-
-function clampNumber(value: number, min: number, max: number): number {
-    if (!Number.isFinite(value)) return min;
-    return Math.min(max, Math.max(min, value));
-}
-
-function computeEmaSeries(values: number[], period: number): number[] {
-    if (values.length === 0) return [];
-    const p = Math.max(1, Math.round(period));
-    const alpha = 2 / (p + 1);
-    const out = new Array<number>(values.length);
-    out[0] = values[0];
-    for (let i = 1; i < values.length; i++) {
-        out[i] = (values[i] * alpha) + (out[i - 1] * (1 - alpha));
-    }
-    return out;
-}
-
-async function fetchRecent1mKlines(symbol: string, limit: number): Promise<KlineSample1m[]> {
-    const safeLimit = clampNumber(Math.round(limit), AI_TREND_BOOTSTRAP_MIN_BARS, 1000);
-    const url = `${BINANCE_REST_BASE}/fapi/v1/klines?symbol=${symbol}&interval=1m&limit=${safeLimit}`;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
-    try {
-        const res = await fetch(url, { signal: controller.signal });
-        if (!res.ok) {
-            throw new Error(`kline_http_${res.status}`);
-        }
-        const raw = await res.json();
-        if (!Array.isArray(raw)) {
-            throw new Error('kline_payload_invalid');
-        }
-        const parsed: KlineSample1m[] = [];
-        for (const row of raw) {
-            if (!Array.isArray(row) || row.length < 7) continue;
-            const openTimeMs = Number(row[0]);
-            const open = Number(row[1]);
-            const high = Number(row[2]);
-            const low = Number(row[3]);
-            const close = Number(row[4]);
-            const volume = Number(row[5]);
-            const closeTimeMs = Number(row[6]);
-            if (
-                !Number.isFinite(openTimeMs) || !Number.isFinite(closeTimeMs) ||
-                !Number.isFinite(open) || !Number.isFinite(high) || !Number.isFinite(low) ||
-                !Number.isFinite(close) || !Number.isFinite(volume) ||
-                open <= 0 || high <= 0 || low <= 0 || close <= 0
-            ) {
-                continue;
-            }
-            parsed.push({
-                openTimeMs,
-                closeTimeMs,
-                open,
-                high,
-                low,
-                close,
-                volume,
-            });
-        }
-        return parsed;
-    } finally {
-        clearTimeout(timeout);
-    }
-}
-
-function deriveBootstrapTrendSeed(klines: KlineSample1m[]): BootstrapTrendSeed | null {
-    if (klines.length < AI_TREND_BOOTSTRAP_MIN_BARS) return null;
-    const closes = klines.map((k) => k.close);
-    const closeFirst = closes[0];
-    const closeLast = closes[closes.length - 1];
-    if (!Number.isFinite(closeFirst) || !Number.isFinite(closeLast) || closeFirst <= 0 || closeLast <= 0) {
-        return null;
-    }
-
-    const emaFast = computeEmaSeries(closes, 21);
-    const emaSlow = computeEmaSeries(closes, 89);
-    const fastNow = emaFast[emaFast.length - 1];
-    const slowNow = emaSlow[emaSlow.length - 1];
-    if (!Number.isFinite(fastNow) || !Number.isFinite(slowNow) || slowNow <= 0) {
-        return null;
-    }
-
-    const slopeLookback = Math.min(60, Math.max(5, emaSlow.length - 1));
-    const slowPrev = emaSlow[Math.max(0, emaSlow.length - 1 - slopeLookback)];
-    if (!Number.isFinite(slowPrev) || slowPrev <= 0) {
-        return null;
-    }
-
-    const driftPct = ((closeLast - closeFirst) / closeFirst) * 100;
-    const recentLookback = Math.min(45, closes.length - 1);
-    const recentBase = closes[Math.max(0, closes.length - 1 - recentLookback)];
-    const recentDriftPct = recentBase > 0 ? ((closeLast - recentBase) / recentBase) * 100 : 0;
-    const emaGapPct = ((fastNow - slowNow) / closeLast) * 100;
-    const emaSlopePct = ((slowNow - slowPrev) / slowPrev) * 100;
-
-    let aboveSlowCount = 0;
-    let upBars = 0;
-    for (let i = 1; i < closes.length; i++) {
-        if (closes[i] > emaSlow[i]) aboveSlowCount++;
-        if (closes[i] > closes[i - 1]) upBars++;
-    }
-    const aboveSlowRatio = aboveSlowCount / Math.max(1, closes.length - 1);
-    const upBarRatio = upBars / Math.max(1, closes.length - 1);
-
-    const driftNorm = clampNumber(driftPct / 1.8, -1, 1);
-    const recentNorm = clampNumber(recentDriftPct / 0.6, -1, 1);
-    const gapNorm = clampNumber(emaGapPct / 0.35, -1, 1);
-    const slopeNorm = clampNumber(emaSlopePct / 0.45, -1, 1);
-    const structureNorm = clampNumber((aboveSlowRatio - 0.5) * 2, -1, 1);
-    const flowNorm = clampNumber((upBarRatio - 0.5) * 2, -1, 1);
-
-    const directionalScore =
-        (driftNorm * 0.28) +
-        (recentNorm * 0.08) +
-        (gapNorm * 0.24) +
-        (slopeNorm * 0.20) +
-        (structureNorm * 0.14) +
-        (flowNorm * 0.06);
-    const confidenceBase = Math.abs(directionalScore);
-    const consistency = (Math.abs(structureNorm) * 0.55) + (Math.abs(flowNorm) * 0.45);
-    const strength = clampNumber((confidenceBase * 0.78) + (consistency * 0.22), 0, 1);
-    const side = directionalScore > 0 ? 'LONG' : directionalScore < 0 ? 'SHORT' : null;
-
-    if (!side || strength < 0.34) {
-        return null;
-    }
-
-    return {
-        bias: side,
-        strength: Number(strength.toFixed(4)),
-        asOfMs: klines[klines.length - 1].closeTimeMs,
-    };
-}
-
-async function buildBootstrapTrendBySymbol(symbols: string[], hours: number): Promise<Record<string, BootstrapTrendSeed>> {
-    const boundedHours = clampNumber(Math.round(hours), 1, AI_TREND_BOOTSTRAP_MAX_HOURS);
-    const limit = clampNumber(boundedHours * 60, AI_TREND_BOOTSTRAP_MIN_BARS, 1000);
-    const result: Record<string, BootstrapTrendSeed> = {};
-    const settled = await Promise.allSettled(symbols.map(async (symbol) => {
-        const klines = await fetchRecent1mKlines(symbol, limit);
-        const seed = deriveBootstrapTrendSeed(klines);
-        if (!seed) {
-            log('AI_TREND_BOOTSTRAP_NO_BIAS', { symbol, bars: klines.length, hours: boundedHours });
-            return;
-        }
-        result[symbol] = seed;
-        log('AI_TREND_BOOTSTRAP_SEED', { symbol, bias: seed.bias, strength: seed.strength, asOfMs: seed.asOfMs, bars: klines.length });
-    }));
-
-    let failed = 0;
-    for (let i = 0; i < settled.length; i++) {
-        const s = settled[i];
-        if (s.status === 'fulfilled') continue;
-        failed++;
-        log('AI_TREND_BOOTSTRAP_FAIL', {
-            symbol: symbols[i],
-            hours: boundedHours,
-            error: s.reason instanceof Error ? s.reason.message : String(s.reason || 'bootstrap_fetch_failed'),
-        });
-    }
-    log('AI_TREND_BOOTSTRAP_DONE', {
-        symbols: symbols.length,
-        seeded: Object.keys(result).length,
-        failed,
-        hours: boundedHours,
-        barsPerSymbol: limit,
-    });
-    return result;
-}
-
 function recordLiveSample(symbol: string, live: boolean): void {
     const meta = getMeta(symbol);
     const now = Date.now();
@@ -670,7 +704,7 @@ const getIntegrity = (s: string) => {
 };
 
 // [PHASE 1 & 2] New Getters
-const getBackfill = (s: string) => { if (!backfillMap.has(s)) backfillMap.set(s, new KlineBackfill(s, BINANCE_REST_BASE)); return backfillMap.get(s)!; };
+const getBackfill = (s: string) => { if (!backfillMap.has(s)) backfillMap.set(s, new KlineBackfill(s)); return backfillMap.get(s)!; };
 const getOICalc = (s: string) => { if (!oiCalculatorMap.has(s)) oiCalculatorMap.set(s, new OICalculator(s, BINANCE_REST_BASE)); return oiCalculatorMap.get(s)!; };
 const getStrategy = (s: string) => { if (!strategyMap.has(s)) strategyMap.set(s, new NewStrategyV11({}, decisionLog)); return strategyMap.get(s)!; };
 const getSpotReference = (s: string) => {
@@ -681,29 +715,29 @@ const getSpotReference = (s: string) => {
     }
     return spotReferenceMonitors.get(s)!;
 };
+const getHtfMonitor = (s: string) => {
+    if (!htfMonitors.has(s)) {
+        const monitor = new HtfStructureMonitor(s, BINANCE_REST_BASE);
+        monitor.start();
+        htfMonitors.set(s, monitor);
+    }
+    return htfMonitors.get(s)!;
+};
 
 function ensureMonitors(symbol: string) {
     getAdvancedMicro(symbol);
+    getHtfMonitor(symbol);
 
     const backfill = getBackfill(symbol);
-    const backfillState = backfill.getState();
-    const lastBackfillAttempt = backfillLastAttemptMs.get(symbol) || 0;
-    const shouldRetryBackfill =
-        !backfillState.ready &&
-        !backfillInFlight.has(symbol) &&
-        (
-            backfillState.vetoReason === 'INITIALIZING' ||
-            Date.now() - lastBackfillAttempt >= BACKFILL_RETRY_INTERVAL_MS
-        );
-
-    if (shouldRetryBackfill) {
-        backfillInFlight.add(symbol);
-        backfillLastAttemptMs.set(symbol, Date.now());
-        backfill.performBackfill()
-            .catch(e => log('BACKFILL_ERROR', { symbol, error: e.message }))
-            .finally(() => {
-                backfillInFlight.delete(symbol);
-            });
+    const bootstrapState = backfillCoordinator.getState(symbol);
+    if (!bootstrapState.done || bootstrapState.barsLoaded1m <= 0) {
+        void backfillCoordinator.ensure(symbol);
+    }
+    const klines = backfillCoordinator.getKlines(symbol);
+    if (klines && klines.length > 0) {
+        backfill.updateFromKlines(klines);
+    } else if (!bootstrapState.inProgress && bootstrapState.lastError) {
+        backfill.markBackfillError(bootstrapState.lastError);
     }
 
     if (!oiCalculatorMap.has(symbol)) {
@@ -1332,13 +1366,16 @@ async function processSymbolEvent(s: string, d: any) {
         const strategy = getStrategy(s);
         const backfill = getBackfill(s);
         const oiMetrics = leg.getOpenInterestMetrics();
-        let decision = meta.lastStrategyDecision;
+        const decisionFlowEnabled = decisionProvider.isDecisionEnabled();
+        let decision = decisionFlowEnabled ? meta.lastStrategyDecision : null;
         let tasMetrics: any = null;
         let legMetrics: any = null;
         let spreadPct: number | null = null;
+        let spreadRatio: number | null = null;
         let mid = p;
 
-        const shouldEvaluateStrategy = !decision || (now - meta.lastStrategyEvalTs) >= STRATEGY_EVAL_MIN_INTERVAL_MS;
+        const shouldEvaluateStrategy = decisionFlowEnabled
+            && (!decision || (now - meta.lastStrategyEvalTs) >= STRATEGY_EVAL_MIN_INTERVAL_MS);
         if (shouldEvaluateStrategy) {
             const calcStart = Date.now();
             legMetrics = leg.computeMetrics(ob);
@@ -1347,9 +1384,10 @@ async function processSymbolEvent(s: string, d: any) {
             const bestBidPx = bestBid(ob);
             const bestAskPx = bestAsk(ob);
             mid = (bestBidPx && bestAskPx) ? (bestBidPx + bestAskPx) / 2 : p;
-            spreadPct = (bestBidPx && bestAskPx && mid)
-                ? ((bestAskPx - bestBidPx) / mid) * 100
+            spreadRatio = (bestBidPx && bestAskPx && mid)
+                ? ((bestAskPx - bestBidPx) / mid)
                 : null;
+            spreadPct = spreadRatio == null ? null : (spreadRatio * 100);
 
             decision = strategy.evaluate({
                 symbol: s,
@@ -1462,7 +1500,7 @@ async function processSymbolEvent(s: string, d: any) {
                     market: {
                         price: p,
                         vwap: legMetrics?.vwap || mid || p,
-                        spreadPct,
+                        spreadPct: spreadRatio,
                         delta1s: legMetrics?.delta1s || 0,
                         delta5s: legMetrics?.delta5s || 0,
                         deltaZ: legMetrics?.deltaZ || 0,
@@ -1537,6 +1575,185 @@ function classifyCVDState(delta: number): 'Normal' | 'High Vol' | 'Extreme' {
     return 'Normal';
 }
 
+function defaultOrchestratorDecision(symbol: string, nowMs: number): OrchestratorV1Decision {
+    return {
+        symbol,
+        timestampMs: nowMs,
+        intent: 'HOLD',
+        side: null,
+        readiness: { ready: false, reasons: ['ORCHESTRATOR_INPUT_MISSING'] },
+        gateA: { passed: false, reason: 'GATE_A_BLOCK', checks: {} },
+        gateB: { passed: false, reason: 'GATE_B_BLOCK', checks: {} },
+        gateC: { passed: false, reason: 'GATE_C_BLOCK', checks: {} },
+        allGatesPassed: false,
+        impulse: {
+            passed: false,
+            checks: {
+                printsPerSecond: false,
+                deltaZ: false,
+                spread: false,
+            },
+        },
+        add: {
+            triggered: false,
+            step: null,
+            gatePassed: false,
+            rateLimitPassed: false,
+            thresholdPrice: null,
+        },
+        exitRisk: {
+            triggered: false,
+            triggeredThisTick: false,
+            reason: null,
+            makerAttemptsUsed: 0,
+            takerUsed: false,
+        },
+        position: {
+            isOpen: false,
+            qty: 0,
+            entryVwap: null,
+            baseQty: 0,
+            addsUsed: 0,
+            lastAddTs: null,
+            cooldownUntilTs: 0,
+            atr3m: 0,
+            atrSource: 'UNKNOWN',
+        },
+        orders: [],
+        chase: {
+            active: false,
+            startedAtMs: null,
+            expiresAtMs: null,
+            repriceMs: 0,
+            maxReprices: 0,
+            repricesUsed: 0,
+            chaseMaxSeconds: 0,
+            ttlMs: 0,
+        },
+        telemetry: {
+            sideFlipCount5m: 0,
+            sideFlipPerMin: 0,
+            allGatesTrueCount5m: 0,
+            entryIntentCount5m: 0,
+            smoothed: {
+                deltaZ: 0,
+                cvdSlope: 0,
+                obiWeighted: 0,
+            },
+            hysteresis: {
+                confirmCountLong: 0,
+                confirmCountShort: 0,
+                entryConfirmCount: 0,
+            },
+        },
+    };
+}
+
+function buildDecisionViewFromOrchestrator(decision: OrchestratorV1Decision, nowMs: number) {
+    const side = decision.side === 'BUY' ? 'LONG' : (decision.side === 'SELL' ? 'SHORT' : 'NONE');
+    const signal = decision.intent === 'ENTRY'
+        ? (side === 'LONG' ? 'ENTRY_LONG' : (side === 'SHORT' ? 'ENTRY_SHORT' : 'NONE'))
+        : decision.intent === 'ADD'
+            ? (side === 'LONG' ? 'POSITION_LONG' : (side === 'SHORT' ? 'POSITION_SHORT' : 'NONE'))
+            : 'NONE';
+    const score = decision.intent === 'ENTRY'
+        ? 100
+        : decision.intent === 'ADD'
+            ? 80
+            : 0;
+    const vetoReason = decision.intent === 'HOLD'
+        ? (decision.readiness.reasons[0] || decision.gateA.reason || decision.gateB.reason || decision.gateC.reason || 'HOLD')
+        : decision.intent === 'EXIT_RISK'
+            ? (decision.exitRisk.reason || 'EXIT_RISK')
+            : null;
+    const reasonTag = decision.intent === 'ENTRY'
+        ? 'ORCHESTRATOR_V1_ENTRY'
+        : decision.intent === 'ADD'
+            ? `ORCHESTRATOR_V1_ADD_${decision.add.step ?? 'NA'}`
+            : decision.intent === 'EXIT_RISK'
+                ? `ORCHESTRATOR_V1_EXIT_${decision.exitRisk.reason || 'RISK'}`
+                : (decision.readiness.reasons[0] || 'ORCHESTRATOR_V1_HOLD');
+
+    return {
+        aiTrend: {
+            side,
+            score: Number((decision.allGatesPassed ? 1 : (decision.position.isOpen ? 0.7 : 0)).toFixed(4)),
+            intact: decision.chase.active || decision.position.isOpen,
+            ageMs: decision.chase.startedAtMs ? Math.max(0, nowMs - decision.chase.startedAtMs) : 0,
+            breakConfirm: decision.chase.repricesUsed + decision.position.addsUsed,
+            source: 'runtime' as const,
+        },
+        aiBias: {
+            side,
+            confidence: Number((decision.position.isOpen ? 1 : (decision.allGatesPassed ? 0.8 : 0)).toFixed(4)),
+            source: 'STATE' as const,
+            lockedByPosition: decision.position.isOpen,
+            breakConfirm: decision.chase.repricesUsed + decision.position.addsUsed,
+            reason: vetoReason,
+            timestampMs: nowMs,
+        },
+        signalDisplay: {
+            signal,
+            score,
+            confidence: score >= 75 ? 'HIGH' as const : score >= 50 ? 'MEDIUM' as const : 'LOW' as const,
+            vetoReason,
+            candidate: null,
+            regime: null,
+            dfsPercentile: null,
+            actions: decision.orders,
+            reasons: [reasonTag],
+            gatePassed: decision.allGatesPassed,
+        },
+        suppressDryRunPosition: true,
+    };
+}
+
+function applyOrchestratorOrders(symbol: string, decision: OrchestratorV1Decision): void {
+    decisionRuntimeStats.addsUsed = Math.max(
+        decisionRuntimeStats.addsUsed,
+        Number(decision?.position?.addsUsed || 0)
+    );
+    if (decision.exitRisk.triggeredThisTick) {
+        decisionRuntimeStats.exitRiskTriggeredCount += 1;
+    }
+    if (!decision || !Array.isArray(decision.orders) || decision.orders.length === 0) {
+        return;
+    }
+    for (const order of decision.orders) {
+        decisionRuntimeStats.ordersAttempted += 1;
+        if (order.kind === 'MAKER') {
+            decisionRuntimeStats.makerOrdersPlaced += 1;
+        } else {
+            decisionRuntimeStats.takerOrdersPlaced += 1;
+        }
+        if (order.kind === 'TAKER_ENTRY_FALLBACK') {
+            decisionRuntimeStats.entryTakerNotionalPct = Math.max(
+                decisionRuntimeStats.entryTakerNotionalPct,
+                Number(order.notionalPct || 0)
+            );
+            decisionRuntimeStats.takerFillsCount += 1;
+        }
+    }
+    log('ORCHESTRATOR_V1_ORDERS', {
+        symbol,
+        intent: decision.intent,
+        side: decision.side,
+        orders: decision.orders.map((order: OrchestratorV1Order) => ({
+            id: order.id,
+            kind: order.kind,
+            side: order.side,
+            role: order.role,
+            notionalPct: order.notionalPct,
+            qty: order.qty,
+            price: order.price,
+            postOnly: order.postOnly,
+            repriceAttempt: order.repriceAttempt,
+        })),
+        addsUsed: decision.position.addsUsed,
+        exitRisk: decision.exitRisk,
+    });
+}
+
 function handleMsg(raw: any) {
     let msg: any;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -1590,6 +1807,8 @@ function broadcastMetrics(
     const spreadPct = (bestBidPx && bestAskPx && mid && mid > 0)
         ? ((bestAskPx - bestBidPx) / mid) * 100
         : null;
+    const sessionVwap = leg.getSessionVwapSnapshot(now, mid);
+    const htfSnapshot = getHtfMonitor(s).getSnapshot();
 
     const oiM = getOICalc(s).getMetrics();
     const oiLegacy = leg.getOpenInterestMetrics();
@@ -1611,9 +1830,17 @@ function broadcastMetrics(
         stabilityMsg: oiM.stabilityMsg
     };
     const bf = getBackfill(s).getState();
+    const bootstrapState = backfillCoordinator.getState(s);
+    const bootstrapSnapshot = {
+        backfillInProgress: Boolean(bootstrapState.inProgress),
+        backfillDone: Boolean(bootstrapState.done),
+        barsLoaded1m: Number(bootstrapState.barsLoaded1m || 0),
+        startedAtMs: Number.isFinite(Number(bootstrapState.startedAtMs)) ? Number(bootstrapState.startedAtMs) : null,
+        doneAtMs: Number.isFinite(Number(bootstrapState.doneAtMs)) ? Number(bootstrapState.doneAtMs) : null,
+    };
     const integrity = getIntegrity(s).getStatus(now);
-    const aiTrend = aiDryRun.getTrendStatus(s, now);
-    const aiBias = aiDryRun.getBiasStatus(s, now);
+    const aiTrendStatus = decisionProvider.isDecisionEnabled() ? aiDryRun.getTrendStatus(s, now) : null;
+    const aiBiasStatus = decisionProvider.isDecisionEnabled() ? aiDryRun.getBiasStatus(s, now) : null;
     const tf1m = cvdM.find((x: any) => x.timeframe === '1m') || null;
     const tf5m = cvdM.find((x: any) => x.timeframe === '5m') || null;
     const tf15m = cvdM.find((x: any) => x.timeframe === '15m') || null;
@@ -1650,26 +1877,90 @@ function broadcastMetrics(
     const advancedBundle = precomputed?.advancedBundle ?? advancedMicro.getMetrics(now);
     const dryRunPosition = dryRunSession.getStrategyPosition(s);
     const liveExecutionPosition = orchestrator.getSymbolPosition(s);
-    const strategyPosition = dryRunPosition || liveExecutionPosition;
+    const rawStrategyPosition = dryRunPosition || liveExecutionPosition;
+    const rawPositionSource: 'dryrun' | 'live' | null = liveExecutionPosition
+        ? 'live'
+        : (dryRunPosition ? 'dryrun' : null);
+    const spreadRatio = spreadPct == null ? null : (spreadPct / 100);
+    const integrityLevelNumeric = integrity.level === 'CRITICAL'
+        ? 2
+        : integrity.level === 'DEGRADED'
+            ? 1
+            : 0;
+    const selectedAtr3m = Number(advancedBundle.regimeMetrics?.microATR || 0) > 0
+        ? Number(advancedBundle.regimeMetrics?.microATR || 0)
+        : Number(bf.atr || 0);
+    const selectedAtrSource = Number(advancedBundle.regimeMetrics?.microATR || 0) > 0
+        ? 'MICRO_ATR'
+        : Number(bf.atr || 0) > 0
+            ? 'BACKFILL_ATR'
+            : 'UNKNOWN';
+    const cvdTf5mState = Number(tf5m?.delta || 0) > 0
+        ? 'BUY'
+        : Number(tf5m?.delta || 0) < 0
+            ? 'SELL'
+            : 'NEUTRAL';
+    let orchestratorV1Decision: OrchestratorV1Decision | null = null;
+    if (DECISION_MODE === 'orchestrator_v1') {
+        decisionRuntimeStats.orchestratorEvaluations += 1;
+        orchestratorV1Decision = orchestratorV1.evaluate({
+            symbol: s,
+            nowMs: Number(eventTimeMs || now),
+            price: Number(mid || legacyM?.price || 0),
+            bestBid: bestBidPx,
+            bestAsk: bestAskPx,
+            spreadPct: spreadRatio,
+            printsPerSecond: Number(tasMetrics?.printsPerSecond || 0),
+            deltaZ: Number(legacyM?.deltaZ ?? tf1m?.delta ?? 0),
+            cvdSlope: Number(legacyM?.cvdSlope ?? tf5m?.delta ?? 0),
+            cvdTf5mState,
+            obiDeep: Number(legacyM?.obiDeep || 0),
+            obiWeighted: Number(legacyM?.obiWeighted || 0),
+            trendinessScore: Number(advancedBundle.regimeMetrics?.trendinessScore || 0),
+            chopScore: Number(advancedBundle.regimeMetrics?.chopScore || 0),
+            volOfVol: Number(advancedBundle.regimeMetrics?.volOfVol || 0),
+            realizedVol1m: Number(advancedBundle.regimeMetrics?.realizedVol1m || 0),
+            atr3m: selectedAtr3m,
+            atrSource: selectedAtrSource as 'MICRO_ATR' | 'BACKFILL_ATR' | 'UNKNOWN',
+            orderbookIntegrityLevel: integrityLevelNumeric,
+            oiChangePct: Number.isFinite(Number(resolvedOpenInterest.oiChangePct)) ? Number(resolvedOpenInterest.oiChangePct) : null,
+            sessionVwapValue: Number.isFinite(Number(sessionVwap?.value)) ? Number(sessionVwap?.value) : null,
+            htfH1BarStartMs: Number.isFinite(Number(htfSnapshot?.h1?.barStartMs)) ? Number(htfSnapshot?.h1?.barStartMs) : null,
+            htfH4BarStartMs: Number.isFinite(Number(htfSnapshot?.h4?.barStartMs)) ? Number(htfSnapshot?.h4?.barStartMs) : null,
+            backfillDone: bootstrapSnapshot.backfillDone,
+            barsLoaded1m: bootstrapSnapshot.barsLoaded1m,
+        });
+    }
+    const resolvedOrchestratorDecision = orchestratorV1Decision || defaultOrchestratorDecision(s, now);
+    const orchestratorDebug = DECISION_MODE === 'orchestrator_v1'
+        ? updateOrchestratorDiagnostics(s, resolvedOrchestratorDecision, Number(eventTimeMs || now))
+        : {
+            blockReason: 'DISABLED',
+            gateA: false,
+            gateB: false,
+            gateC: false,
+            impulse: false,
+            chaseActive: false,
+        };
+    const decisionView = DECISION_MODE === 'orchestrator_v1'
+        ? buildDecisionViewFromOrchestrator(resolvedOrchestratorDecision, now)
+        : decisionProvider.evaluate({
+            symbol: s,
+            nowMs: now,
+            decision,
+            aiTrendStatus,
+            aiBiasStatus,
+            strategyPosition: rawStrategyPosition,
+            defaultVetoReason: bf.vetoReason || 'BIAS_NEUTRAL',
+        });
+    const strategyPosition = decisionView.suppressDryRunPosition && rawPositionSource === 'dryrun'
+        ? null
+        : rawStrategyPosition;
     const hasOpenStrategyPosition = Boolean(
         strategyPosition
         && (strategyPosition.side === 'LONG' || strategyPosition.side === 'SHORT')
         && Number(strategyPosition.qty || 0) > 0
     );
-    const biasSignal = aiBias?.side === 'LONG' || aiBias?.side === 'SHORT'
-        ? `BIAS_${aiBias.side}`
-        : null;
-    const signal = hasOpenStrategyPosition
-        ? `POSITION_${strategyPosition!.side}`
-        : (biasSignal || null);
-    const signalScore = hasOpenStrategyPosition
-        ? 100
-        : biasSignal
-            ? Math.round(clampNumber(Number(aiBias?.confidence || 0) * 100, 0, 100))
-            : 0;
-    const signalVeto = signal
-        ? null
-        : (aiBias?.reason || bf.vetoReason || 'BIAS_NEUTRAL');
 
     const payload: any = {
         type: 'metrics',
@@ -1687,23 +1978,8 @@ function broadcastMetrics(
         absorption: absVal,
         openInterest: resolvedOpenInterest,
         funding: lastFunding.get(s) || null,
-        aiTrend: aiTrend ? {
-            side: aiTrend.side,
-            score: Number(aiTrend.score.toFixed(4)),
-            intact: aiTrend.intact,
-            ageMs: aiTrend.ageMs,
-            breakConfirm: aiTrend.breakConfirm,
-            source: aiTrend.source,
-        } : null,
-        aiBias: aiBias ? {
-            side: aiBias.side,
-            confidence: Number(aiBias.confidence.toFixed(4)),
-            source: aiBias.source,
-            lockedByPosition: Boolean(aiBias.lockedByPosition),
-            breakConfirm: Number(aiBias.breakConfirm || 0),
-            reason: aiBias.reason || null,
-            timestampMs: Number(aiBias.timestampMs || now),
-        } : null,
+        aiTrend: decisionView.aiTrend,
+        aiBias: decisionView.aiBias,
         strategyPosition: hasOpenStrategyPosition
             ? {
                 side: strategyPosition!.side,
@@ -1715,19 +1991,31 @@ function broadcastMetrics(
             }
             : null,
         legacyMetrics: legacyM,
-        orderbookIntegrity: integrity,
-        signalDisplay: {
-            signal,
-            score: signalScore,
-            confidence: signalScore >= 75 ? 'HIGH' : signalScore >= 50 ? 'MEDIUM' : 'LOW',
-            vetoReason: signalVeto,
-            candidate: null,
-            regime: decision?.regime ?? null,
-            dfsPercentile: decision?.dfsPercentile ?? null,
-            actions: decision?.actions ?? [],
-            reasons: decision?.reasons ?? [],
-            gatePassed: Boolean(decision?.gatePassed),
+        sessionVwap,
+        htf: {
+            h1: htfSnapshot.h1,
+            h4: htfSnapshot.h4,
         },
+        bootstrap: bootstrapSnapshot,
+        orderbookIntegrity: integrity,
+        signalDisplay: decisionView.signalDisplay,
+        orchestratorV1: DECISION_MODE === 'orchestrator_v1' ? {
+            intent: resolvedOrchestratorDecision.intent,
+            side: resolvedOrchestratorDecision.side,
+            readiness: resolvedOrchestratorDecision.readiness,
+            gateA: resolvedOrchestratorDecision.gateA,
+            gateB: resolvedOrchestratorDecision.gateB,
+            gateC: resolvedOrchestratorDecision.gateC,
+            allGatesPassed: resolvedOrchestratorDecision.allGatesPassed,
+            impulse: resolvedOrchestratorDecision.impulse,
+            add: resolvedOrchestratorDecision.add,
+            exitRisk: resolvedOrchestratorDecision.exitRisk,
+            position: resolvedOrchestratorDecision.position,
+            orders: resolvedOrchestratorDecision.orders,
+            chase: resolvedOrchestratorDecision.chase,
+            telemetry: resolvedOrchestratorDecision.telemetry,
+            debug: orchestratorDebug,
+        } : null,
         advancedMetrics: {
             sweepFadeScore: decision?.dfsPercentile || 0,
             breakoutScore: decision?.dfsPercentile || 0,
@@ -1786,45 +2074,10 @@ function broadcastMetrics(
         });
     }
 
-    if (eventTimeMs > 0) {
-        const canonicalTimeMs = Date.now();
-        const m1TrendScore = Number(legacyM?.deltaZ ?? tf1m?.delta ?? 0);
-        const m5TrendScore = Number(tf5m?.delta ?? legacyM?.cvdSlope ?? m1TrendScore);
-        const m15TrendScore = Number(tf15m?.delta ?? m5TrendScore);
-        const m3TrendScore = Number(((m1TrendScore * 0.5) + (m5TrendScore * 0.5)).toFixed(6));
-        // Mainnet market data is ingested here only for signal/intent generation.
-        // Execution state remains testnet-only via execution events in orchestrator.
-        orchestrator.ingest({
-            symbol: s,
-            strategyRegime: typeof decision?.regime === 'string' ? String(decision.regime).toUpperCase() : null,
-            canonical_time_ms: canonicalTimeMs,
-            exchange_event_time_ms: eventTimeMs,
-            spread_pct: spreadPct,
-            prints_per_second: tasMetrics.printsPerSecond,
-            best_bid: bestBidPx,
-            best_ask: bestAskPx,
-            advancedMetrics: {
-                volatilityIndex: bf.atr
-            },
-            funding: lastFunding.get(s)
-                ? {
-                    rate: lastFunding.get(s)?.rate ?? null,
-                    timeToFundingMs: lastFunding.get(s)?.timeToFundingMs ?? null,
-                    trend: lastFunding.get(s)?.trend ?? null,
-                }
-                : null,
-            multiTimeframe: {
-                m1TrendScore,
-                m3TrendScore,
-                m5TrendScore,
-                m15TrendScore,
-            },
-            legacyMetrics: legacyM ? {
-                obiDeep: legacyM.obiDeep,
-                deltaZ: legacyM.deltaZ,
-                cvdSlope: legacyM.cvdSlope
-            } : null
-        });
+    if (eventTimeMs > 0 && DECISION_MODE === 'orchestrator_v1') {
+        applyOrchestratorOrders(s, resolvedOrchestratorDecision);
+    } else if (eventTimeMs > 0) {
+        decisionRuntimeStats.executorEntrySkipped += 1;
     }
 }
 
@@ -1890,6 +2143,47 @@ app.get('/api/health', (req, res) => {
         ok: true,
         executionEnabled: EXECUTION_ENABLED,
         killSwitch: KILL_SWITCH,
+        decisionMode: DECISION_MODE,
+        decisionEnabled: DECISION_MODE === 'orchestrator_v1',
+        decisionRuntime: {
+            legacyDecisionCalls: decisionRuntimeStats.legacyDecisionCalls,
+            executorEntrySkipped: decisionRuntimeStats.executorEntrySkipped,
+            orchestratorEvaluations: decisionRuntimeStats.orchestratorEvaluations,
+            ordersAttempted: decisionRuntimeStats.ordersAttempted,
+            makerOrdersPlaced: decisionRuntimeStats.makerOrdersPlaced,
+            takerOrdersPlaced: decisionRuntimeStats.takerOrdersPlaced,
+            entryTakerNotionalPct: decisionRuntimeStats.entryTakerNotionalPct,
+            addsUsed: decisionRuntimeStats.addsUsed,
+            exitRiskTriggeredCount: decisionRuntimeStats.exitRiskTriggeredCount,
+            gateB_fail_cvd_count: decisionRuntimeStats.gateB_fail_cvd_count,
+            gateB_fail_obi_count: decisionRuntimeStats.gateB_fail_obi_count,
+            gateB_fail_deltaZ_count: decisionRuntimeStats.gateB_fail_deltaZ_count,
+            gateA_fail_trendiness_count: decisionRuntimeStats.gateA_fail_trendiness_count,
+            allGatesTrue_count: decisionRuntimeStats.allGatesTrue_count,
+            entryCandidateCount: decisionRuntimeStats.entryCandidateCount,
+            chaseStartedCount: decisionRuntimeStats.chaseStartedCount,
+            chaseTimedOutCount: decisionRuntimeStats.chaseTimedOutCount,
+            impulseTrueCount: decisionRuntimeStats.impulseTrueCount,
+            fallbackEligibleCount: decisionRuntimeStats.fallbackEligibleCount,
+            fallbackTriggeredCount: decisionRuntimeStats.fallbackTriggeredCount,
+            fallbackBlockedReasonTop: topFallbackBlockedReason(),
+            fallbackBlockedReasonCounts: decisionRuntimeStats.fallbackBlockedReasonCounts,
+            makerFillsCount: decisionRuntimeStats.makerFillsCount,
+            takerFillsCount: decisionRuntimeStats.takerFillsCount,
+            positionSide: decisionRuntimeStats.positionSide,
+            positionQty: decisionRuntimeStats.positionQty,
+            entryVwap: decisionRuntimeStats.entryVwap,
+            postOnlyRejectCount: decisionRuntimeStats.postOnlyRejectCount,
+            cancelCount: decisionRuntimeStats.cancelCount,
+            replaceCount: decisionRuntimeStats.replaceCount,
+            blockReasonCountsBySymbol: Object.fromEntries(orchestratorDiagState.blockReasonCountsBySymbol.entries()),
+            orchestratorRuntime: DECISION_MODE === 'orchestrator_v1' ? orchestratorV1.getRuntimeSnapshot() : null,
+        },
+        bootstrapRuntime: {
+            limit1m: BOOTSTRAP_1M_LIMIT,
+            totalFetches: backfillCoordinator.getTotalFetches(),
+            symbols: backfillCoordinator.getStates(),
+        },
         activeSymbols: Array.from(activeSymbols),
         wsClients: wsManager.getClientCount(),
         wsState
@@ -2124,7 +2418,7 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
             ? req.body.symbols.map((s: any) => String(s || '').toUpperCase())
             : [];
         const fallbackSymbol = String(req.body?.symbol || '').toUpperCase();
-        const symbolsRequested = rawSymbols.length > 0
+        const symbolsRequested: string[] = rawSymbols.length > 0
             ? rawSymbols.filter((s: string, idx: number, arr: string[]) => Boolean(s) && arr.indexOf(s) === idx)
             : (fallbackSymbol ? [fallbackSymbol] : []);
 
@@ -2135,7 +2429,9 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
 
         const apiKey = String(req.body?.apiKey || '').trim();
         const model = String(req.body?.model || '').trim();
-        const localOnly = Boolean(req.body?.localOnly) || !apiKey || !model;
+        const localPolicyTestMode = ['1', 'true', 'yes', 'on']
+            .includes(String(process.env.AI_TEST_LOCAL_POLICY || 'false').trim().toLowerCase());
+        const localOnly = localPolicyTestMode && Boolean(req.body?.localOnly);
 
         const info = await fetchExchangeInfo();
         const symbols = Array.isArray(info?.symbols) ? info.symbols : [];
@@ -2146,13 +2442,9 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
         }
 
         const bootstrapTrendEnabled = req.body?.bootstrapTrendEnabled !== false;
-        const requestedBootstrapHours = Number(req.body?.bootstrapTrendHours ?? AI_TREND_BOOTSTRAP_DEFAULT_HOURS);
-        const bootstrapTrendHours = Number.isFinite(requestedBootstrapHours)
-            ? clampNumber(Math.round(requestedBootstrapHours), 1, AI_TREND_BOOTSTRAP_MAX_HOURS)
-            : AI_TREND_BOOTSTRAP_DEFAULT_HOURS;
-        const bootstrapTrendBySymbol = bootstrapTrendEnabled
-            ? await buildBootstrapTrendBySymbol(symbolsRequested, bootstrapTrendHours)
-            : {};
+        if (bootstrapTrendEnabled) {
+            await Promise.allSettled(symbolsRequested.map((symbol: string) => backfillCoordinator.ensure(symbol)));
+        }
 
         const fundingRates: Record<string, number> = {};
         for (const symbol of symbolsRequested) {
@@ -2182,7 +2474,7 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
             temperature: Number(req.body?.temperature ?? 0),
             maxOutputTokens: Number(req.body?.maxOutputTokens ?? 256),
             localOnly,
-            bootstrapTrendBySymbol,
+            bootstrapTrendBySymbol: {},
         });
 
         updateDryRunHealthFlag();
@@ -2208,8 +2500,15 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
             ai: aiDryRun.getStatus(),
             bootstrapTrend: {
                 enabled: bootstrapTrendEnabled,
-                hours: bootstrapTrendHours,
-                seededSymbols: Object.keys(bootstrapTrendBySymbol),
+                mode: 'DISABLED_FOR_DECISION',
+                seededSymbols: [],
+            },
+            bootstrapBackfill: {
+                limit1m: BOOTSTRAP_1M_LIMIT,
+                symbols: symbolsRequested.reduce((acc: Record<string, any>, symbol: string) => {
+                    acc[symbol] = backfillCoordinator.getState(symbol);
+                    return acc;
+                }, {}),
             },
         });
     } catch (e: any) {
@@ -2496,7 +2795,16 @@ app.get('/api/abtest/results', (_req, res) => {
 
 app.get('/api/backfill/status', async (_req, res) => {
     const symbols = await marketArchive.listSymbols();
-    res.json({ ok: true, recordingEnabled: BACKFILL_RECORDING_ENABLED, symbols });
+    res.json({
+        ok: true,
+        recordingEnabled: BACKFILL_RECORDING_ENABLED,
+        symbols,
+        bootstrap1m: {
+            limit: BOOTSTRAP_1M_LIMIT,
+            totalFetches: backfillCoordinator.getTotalFetches(),
+            states: backfillCoordinator.getStates(),
+        },
+    });
 });
 
 app.post('/api/backfill/replay', async (req, res) => {
@@ -2794,6 +3102,12 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 function shutdown(): void {
     wsManager.shutdown();
     marketDataMonitor.stopMonitoring();
+    for (const monitor of spotReferenceMonitors.values()) {
+        monitor.stop();
+    }
+    for (const monitor of htfMonitors.values()) {
+        monitor.stop();
+    }
     if (ws) {
         ws.close();
         ws = null;

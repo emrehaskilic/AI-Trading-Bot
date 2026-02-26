@@ -1,0 +1,733 @@
+{
+  "generatedAt": "2026-02-26T14:16:03.812Z",
+  "decisionMode": "orchestrator_v1",
+  "phase": "phase2_entry_validation",
+  "checks": {
+    "holdWhenBackfillNotReady": true,
+    "entryProducedWhenReady": true,
+    "makerChaseMetadataPresent": true,
+    "takerFallbackTriggered": true,
+    "takerNotionalWithin25Pct": true,
+    "ordersAttemptedGtZero": true,
+    "legacyDecisionCallsZero": true
+  },
+  "samples": {
+    "holdSamples": [
+      {
+        "idx": 0,
+        "ts": 1772115363812,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 1,
+        "ts": 1772115364062,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 2,
+        "ts": 1772115364312,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 3,
+        "ts": 1772115364562,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 4,
+        "ts": 1772115364812,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 5,
+        "ts": 1772115365062,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 6,
+        "ts": 1772115365312,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 7,
+        "ts": 1772115365562,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 8,
+        "ts": 1772115365812,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      },
+      {
+        "idx": 9,
+        "ts": 1772115366062,
+        "intent": "HOLD",
+        "orders": 0,
+        "readiness": {
+          "ready": false,
+          "reasons": [
+            "BACKFILL_NOT_DONE",
+            "INSUFFICIENT_1M_BARS"
+          ]
+        }
+      }
+    ],
+    "entrySample": {
+      "ts": 1772115366812,
+      "intent": "ENTRY",
+      "side": "BUY",
+      "orders": [
+        {
+          "id": "BTCUSDT-maker-l1-1772115366812-0",
+          "kind": "MAKER",
+          "side": "BUY",
+          "qty": 0.6,
+          "notionalPct": 0.6,
+          "price": 68099.9,
+          "postOnly": true,
+          "ttlMs": 8000,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repriceAttempt": 0,
+          "role": "ENTRY_L1"
+        },
+        {
+          "id": "BTCUSDT-maker-l2-1772115366812-0",
+          "kind": "MAKER",
+          "side": "BUY",
+          "qty": 0.4,
+          "notionalPct": 0.4,
+          "price": 68096.49500499999,
+          "postOnly": true,
+          "ttlMs": 8000,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repriceAttempt": 0,
+          "role": "ENTRY_L2"
+        }
+      ],
+      "chase": {
+        "active": true,
+        "startedAtMs": 1772115366812,
+        "expiresAtMs": 1772115384812,
+        "repriceMs": 1200,
+        "maxReprices": 6,
+        "repricesUsed": 0,
+        "chaseMaxSeconds": 18,
+        "ttlMs": 8000
+      },
+      "readiness": {
+        "ready": true,
+        "reasons": []
+      },
+      "gateA": {
+        "passed": true,
+        "reason": null,
+        "checks": {
+          "trendiness": true,
+          "chop": true,
+          "volOfVol": true,
+          "spread": true,
+          "oiDrop": true
+        }
+      },
+      "gateB": {
+        "passed": true,
+        "reason": null,
+        "checks": {
+          "side": true,
+          "obiSupport": true,
+          "deltaZ": true,
+          "cvd": true
+        }
+      },
+      "gateC": {
+        "passed": true,
+        "reason": null,
+        "checks": {
+          "vwapDistance": true,
+          "vol1m": true
+        }
+      }
+    },
+    "chaseSamples": [
+      {
+        "step": 1,
+        "ts": 1772115368012,
+        "intent": "ENTRY",
+        "orders": [
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L1",
+            "notionalPct": 0.6,
+            "postOnly": true,
+            "repriceAttempt": 1
+          },
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L2",
+            "notionalPct": 0.4,
+            "postOnly": true,
+            "repriceAttempt": 1
+          }
+        ],
+        "chase": {
+          "active": true,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 1,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      },
+      {
+        "step": 2,
+        "ts": 1772115369212,
+        "intent": "ENTRY",
+        "orders": [
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L1",
+            "notionalPct": 0.6,
+            "postOnly": true,
+            "repriceAttempt": 2
+          },
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L2",
+            "notionalPct": 0.4,
+            "postOnly": true,
+            "repriceAttempt": 2
+          }
+        ],
+        "chase": {
+          "active": true,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 2,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      },
+      {
+        "step": 3,
+        "ts": 1772115370412,
+        "intent": "ENTRY",
+        "orders": [
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L1",
+            "notionalPct": 0.6,
+            "postOnly": true,
+            "repriceAttempt": 3
+          },
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L2",
+            "notionalPct": 0.4,
+            "postOnly": true,
+            "repriceAttempt": 3
+          }
+        ],
+        "chase": {
+          "active": true,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 3,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      },
+      {
+        "step": 4,
+        "ts": 1772115371612,
+        "intent": "ENTRY",
+        "orders": [
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L1",
+            "notionalPct": 0.6,
+            "postOnly": true,
+            "repriceAttempt": 4
+          },
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L2",
+            "notionalPct": 0.4,
+            "postOnly": true,
+            "repriceAttempt": 4
+          }
+        ],
+        "chase": {
+          "active": true,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 4,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      },
+      {
+        "step": 5,
+        "ts": 1772115372812,
+        "intent": "ENTRY",
+        "orders": [
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L1",
+            "notionalPct": 0.6,
+            "postOnly": true,
+            "repriceAttempt": 5
+          },
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L2",
+            "notionalPct": 0.4,
+            "postOnly": true,
+            "repriceAttempt": 5
+          }
+        ],
+        "chase": {
+          "active": true,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 5,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      },
+      {
+        "step": 6,
+        "ts": 1772115374012,
+        "intent": "ENTRY",
+        "orders": [
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L1",
+            "notionalPct": 0.6,
+            "postOnly": true,
+            "repriceAttempt": 6
+          },
+          {
+            "kind": "MAKER",
+            "role": "ENTRY_L2",
+            "notionalPct": 0.4,
+            "postOnly": true,
+            "repriceAttempt": 6
+          }
+        ],
+        "chase": {
+          "active": true,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 6,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      },
+      {
+        "step": 7,
+        "ts": 1772115375212,
+        "intent": "ENTRY",
+        "orders": [
+          {
+            "kind": "TAKER_ENTRY_FALLBACK",
+            "role": "ENTRY_FALLBACK",
+            "notionalPct": 0.25,
+            "postOnly": false,
+            "repriceAttempt": 6
+          }
+        ],
+        "chase": {
+          "active": false,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 6,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      },
+      {
+        "step": 8,
+        "ts": 1772115376412,
+        "intent": "HOLD",
+        "orders": [],
+        "chase": {
+          "active": false,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 6,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      },
+      {
+        "step": 9,
+        "ts": 1772115377612,
+        "intent": "HOLD",
+        "orders": [],
+        "chase": {
+          "active": false,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 6,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      },
+      {
+        "step": 10,
+        "ts": 1772115378812,
+        "intent": "HOLD",
+        "orders": [],
+        "chase": {
+          "active": false,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 6,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      },
+      {
+        "step": 11,
+        "ts": 1772115380012,
+        "intent": "HOLD",
+        "orders": [],
+        "chase": {
+          "active": false,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 6,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      },
+      {
+        "step": 12,
+        "ts": 1772115381212,
+        "intent": "HOLD",
+        "orders": [],
+        "chase": {
+          "active": false,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 6,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      },
+      {
+        "step": 13,
+        "ts": 1772115382412,
+        "intent": "HOLD",
+        "orders": [],
+        "chase": {
+          "active": false,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 6,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      },
+      {
+        "step": 14,
+        "ts": 1772115383612,
+        "intent": "HOLD",
+        "orders": [],
+        "chase": {
+          "active": false,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 6,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      },
+      {
+        "step": 15,
+        "ts": 1772115384812,
+        "intent": "HOLD",
+        "orders": [],
+        "chase": {
+          "active": false,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 6,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      },
+      {
+        "step": 16,
+        "ts": 1772115386012,
+        "intent": "HOLD",
+        "orders": [],
+        "chase": {
+          "active": false,
+          "startedAtMs": 1772115366812,
+          "expiresAtMs": 1772115384812,
+          "repriceMs": 1200,
+          "maxReprices": 6,
+          "repricesUsed": 6,
+          "chaseMaxSeconds": 18,
+          "ttlMs": 8000
+        },
+        "impulse": {
+          "passed": true,
+          "checks": {
+            "printsPerSecond": true,
+            "deltaZ": true,
+            "spread": true
+          }
+        },
+        "allGatesPassed": true
+      }
+    ]
+  },
+  "counters": {
+    "ordersAttempted": 15,
+    "makerOrdersCount": 14,
+    "takerOrdersCount": 1,
+    "takerNotionalPct": 0.25,
+    "legacyDecisionCallCount": 0
+  }
+}

@@ -29,6 +29,8 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
     aiTrend,
     aiBias,
     strategyPosition,
+    sessionVwap,
+    htf,
     liquidityMetrics,
     passiveFlowMetrics,
     derivativesMetrics,
@@ -136,17 +138,17 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
   const asNumber = (v: unknown): number | null => (Number.isFinite(Number(v)) ? Number(v) : null);
   const fmt = (v: unknown, d = 2) => {
     const n = asNumber(v);
-    if (n == null) return '-';
+    if (n == null) return '—';
     return n.toFixed(d);
   };
   const fmtSigned = (v: unknown, d = 2) => {
     const n = asNumber(v);
-    if (n == null) return '-';
+    if (n == null) return '—';
     return `${n > 0 ? '+' : ''}${n.toFixed(d)}`;
   };
   const fmtPct = (v: unknown, d = 2) => {
     const n = asNumber(v);
-    if (n == null) return '-';
+    if (n == null) return '—';
     return `${n > 0 ? '+' : ''}${n.toFixed(d)}%`;
   };
   const formatVol = (v: number) => {
@@ -154,6 +156,48 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
     if (v >= 1e3) return (v / 1e3).toFixed(1) + 'k';
     return v.toFixed(2);
   };
+  const inferTickSize = (): number => {
+    const levels = [...(bids || []), ...(asks || [])]
+      .map((lvl) => Number(lvl?.[0]))
+      .filter((px) => Number.isFinite(px) && px > 0)
+      .sort((a, b) => a - b);
+    let minDiff = Number.POSITIVE_INFINITY;
+    for (let i = 1; i < levels.length; i += 1) {
+      const diff = Math.abs(levels[i] - levels[i - 1]);
+      if (diff > 0 && diff < minDiff) {
+        minDiff = diff;
+      }
+    }
+    if (!Number.isFinite(minDiff)) {
+      return legacyMetrics.price >= 1000 ? 0.1 : legacyMetrics.price >= 1 ? 0.01 : 0.0001;
+    }
+    return minDiff;
+  };
+  const tickSize = inferTickSize();
+  const priceDecimals = Math.max(0, Math.min(8, Math.ceil(-Math.log10(tickSize))));
+  const fmtPrice = (value: unknown) => {
+    const n = asNumber(value);
+    if (n == null) return '—';
+    return n.toLocaleString(undefined, {
+      minimumFractionDigits: priceDecimals,
+      maximumFractionDigits: priceDecimals,
+    });
+  };
+  const formatSessionStart = (ts: number | null | undefined) => {
+    const n = asNumber(ts);
+    if (n == null || n <= 0) return '—';
+    const d = new Date(n);
+    const hh = String(d.getUTCHours()).padStart(2, '0');
+    const mm = String(d.getUTCMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+  };
+  const formatElapsedMinutes = (elapsedMs: number | null | undefined) => {
+    const n = asNumber(elapsedMs);
+    if (n == null || n < 0) return '—';
+    return `${Math.floor(n / 60000)}m`;
+  };
+  const h1Brk = htf?.h1?.structureBreakUp ? '↑' : htf?.h1?.structureBreakDn ? '↓' : '-';
+  const h4Brk = htf?.h4?.structureBreakUp ? '↑' : htf?.h4?.structureBreakDn ? '↓' : '-';
   const markDev = asNumber(derivativesMetrics?.markLastDeviationPct);
   const indexDev = asNumber(derivativesMetrics?.indexLastDeviationPct);
   const perpBasis = asNumber(derivativesMetrics?.perpBasis);
@@ -162,29 +206,39 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
     <div className="border-b border-zinc-800/50 hover:bg-zinc-900/30 transition-colors">
       {/* Main Row - Fixed Height & Width */}
       <div
-        className="grid gap-0 px-5 items-center cursor-pointer select-none h-16"
+        className="grid gap-0 px-5 items-center cursor-pointer select-none h-20"
         style={{ gridTemplateColumns: 'minmax(140px, 1fr) 110px 130px 90px 90px 90px 90px 90px 120px' }}
         onClick={() => setExpanded(!expanded)}
       >
         {/* Symbol */}
-        <div className="flex items-center gap-2">
-          <button className="text-zinc-500 hover:text-white transition-colors flex-shrink-0">
-            <svg className={`w-3 h-3 transform transition-transform ${expanded ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7 7" />
-            </svg>
-          </button>
-          <span className="font-bold text-white text-sm truncate">{symbol}</span>
-          <span className="text-[8px] px-1 py-0.5 bg-zinc-800 text-zinc-500 rounded flex-shrink-0 uppercase tracking-tighter">PERP</span>
-          {(aiTrend || aiBias || positionSide) && (
-            <span className={`text-[8px] px-1 py-0.5 rounded border flex-shrink-0 uppercase tracking-tight ${trendClass}`}>
-              {positionSide ? 'POS' : (aiBias ? 'BIAS' : 'TR')} {trendLabel} {trendDisplayScore}
-            </span>
-          )}
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center gap-2">
+            <button className="text-zinc-500 hover:text-white transition-colors flex-shrink-0">
+              <svg className={`w-3 h-3 transform transition-transform ${expanded ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7 7" />
+              </svg>
+            </button>
+            <span className="font-bold text-white text-sm truncate">{symbol}</span>
+            <span className="text-[8px] px-1 py-0.5 bg-zinc-800 text-zinc-500 rounded flex-shrink-0 uppercase tracking-tighter">PERP</span>
+            {(aiTrend || aiBias || positionSide) && (
+              <span className={`text-[8px] px-1 py-0.5 rounded border flex-shrink-0 uppercase tracking-tight ${trendClass}`}>
+                {positionSide ? 'POS' : (aiBias ? 'BIAS' : 'TR')} {trendLabel} {trendDisplayScore}
+              </span>
+            )}
+          </div>
+          <div className="text-[9px] text-zinc-500 font-mono">
+            Session {sessionVwap?.name || '—'} | sVWAP {fmtPrice(sessionVwap?.value)} | Δbps {fmtSigned(sessionVwap?.priceDistanceBps, 1)} | Rng {fmtPct(sessionVwap?.sessionRangePct, 2)}
+          </div>
         </div>
 
         {/* Price */}
-        <div className="text-right font-mono text-base text-zinc-100 font-semibold">
-          {legacyMetrics.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+        <div className="text-right font-mono">
+          <div className="text-base text-zinc-100 font-semibold">
+            {fmtPrice(legacyMetrics.price)}
+          </div>
+          <div className="text-[9px] text-zinc-500">
+            start {formatSessionStart(sessionVwap?.sessionStartMs)} | elapsed {formatElapsedMinutes(sessionVwap?.elapsedMs)}
+          </div>
         </div>
 
         {/* OI / Change */}
@@ -231,7 +285,7 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
         </div>
 
         {/* Signal Column */}
-        <div className="flex items-center justify-center">
+        <div className="flex flex-col items-center justify-center gap-1">
           {displaySignal ? (
             <div className={`px-2 py-0.5 rounded text-[10px] font-bold border flex flex-col items-center ${displaySignal.includes('LONG')
               ? 'bg-emerald-900/20 text-emerald-300 border-emerald-700/30'
@@ -245,6 +299,11 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
               {displaySignalReason || 'MONITORING'}
             </span>
           )}
+          <div className="text-[8px] text-zinc-500 font-mono leading-tight text-center">
+            H1 ATR {fmt(htf?.h1?.atr, priceDecimals)} Sw {fmtPrice(htf?.h1?.lastSwingHigh)}/{fmtPrice(htf?.h1?.lastSwingLow)} Brk {h1Brk}
+            <br />
+            H4 ATR {fmt(htf?.h4?.atr, priceDecimals)} Sw {fmtPrice(htf?.h4?.lastSwingHigh)}/{fmtPrice(htf?.h4?.lastSwingLow)} Brk {h4Brk}
+          </div>
         </div>
       </div>
 
@@ -252,6 +311,90 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, data, showLatency = false
       {expanded && (
         <div className="bg-zinc-950/40 border-t border-zinc-800 p-6 animate-in fade-in slide-in-from-top-2 duration-200">
           <div className="space-y-8">
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <div className="bg-zinc-900/40 p-4 rounded-lg border border-zinc-800/50 space-y-2">
+                <h3 className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Session VWAP</h3>
+                <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
+                  <div>
+                    <div className="text-zinc-500">Session</div>
+                    <div className="text-zinc-100">{sessionVwap?.name || '—'}</div>
+                  </div>
+                  <div>
+                    <div className="text-zinc-500">sVWAP</div>
+                    <div className="text-zinc-100">{fmtPrice(sessionVwap?.value)}</div>
+                  </div>
+                  <div>
+                    <div className="text-zinc-500">Δbps</div>
+                    <div className={posNegClass(asNumber(sessionVwap?.priceDistanceBps) || 0)}>{fmtSigned(sessionVwap?.priceDistanceBps, 1)}</div>
+                  </div>
+                  <div>
+                    <div className="text-zinc-500">Rng%</div>
+                    <div className="text-zinc-100">{fmtPct(sessionVwap?.sessionRangePct, 2)}</div>
+                  </div>
+                  <div>
+                    <div className="text-zinc-500">Start (UTC)</div>
+                    <div className="text-zinc-100">{formatSessionStart(sessionVwap?.sessionStartMs)}</div>
+                  </div>
+                  <div>
+                    <div className="text-zinc-500">Elapsed</div>
+                    <div className="text-zinc-100">{formatElapsedMinutes(sessionVwap?.elapsedMs)}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-zinc-900/40 p-4 rounded-lg border border-zinc-800/50 space-y-2">
+                <h3 className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">HTF 1H</h3>
+                <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
+                  <div>
+                    <div className="text-zinc-500">Close</div>
+                    <div className="text-zinc-100">{fmtPrice(htf?.h1?.close)}</div>
+                  </div>
+                  <div>
+                    <div className="text-zinc-500">ATR</div>
+                    <div className="text-zinc-100">{fmtPrice(htf?.h1?.atr)}</div>
+                  </div>
+                  <div>
+                    <div className="text-zinc-500">Swing High</div>
+                    <div className="text-zinc-100">{fmtPrice(htf?.h1?.lastSwingHigh)}</div>
+                  </div>
+                  <div>
+                    <div className="text-zinc-500">Swing Low</div>
+                    <div className="text-zinc-100">{fmtPrice(htf?.h1?.lastSwingLow)}</div>
+                  </div>
+                  <div className="col-span-2">
+                    <div className="text-zinc-500">Break</div>
+                    <div className="text-zinc-100">{h1Brk}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-zinc-900/40 p-4 rounded-lg border border-zinc-800/50 space-y-2">
+                <h3 className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">HTF 4H</h3>
+                <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
+                  <div>
+                    <div className="text-zinc-500">Close</div>
+                    <div className="text-zinc-100">{fmtPrice(htf?.h4?.close)}</div>
+                  </div>
+                  <div>
+                    <div className="text-zinc-500">ATR</div>
+                    <div className="text-zinc-100">{fmtPrice(htf?.h4?.atr)}</div>
+                  </div>
+                  <div>
+                    <div className="text-zinc-500">Swing High</div>
+                    <div className="text-zinc-100">{fmtPrice(htf?.h4?.lastSwingHigh)}</div>
+                  </div>
+                  <div>
+                    <div className="text-zinc-500">Swing Low</div>
+                    <div className="text-zinc-100">{fmtPrice(htf?.h4?.lastSwingLow)}</div>
+                  </div>
+                  <div className="col-span-2">
+                    <div className="text-zinc-500">Break</div>
+                    <div className="text-zinc-100">{h4Brk}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
 
 
             {/* 2. Trade Analysis & CVD */}

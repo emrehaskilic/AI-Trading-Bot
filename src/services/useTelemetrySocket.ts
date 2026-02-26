@@ -3,6 +3,8 @@ import { MetricsMessage, MetricsState } from '../types/metrics';
 import { getViewerToken, proxyWebSocketProtocols } from './proxyAuth';
 import { getProxyWsBase } from './proxyBase';
 
+export type TelemetrySocketStatus = 'connecting' | 'open' | 'closed';
+
 /**
  * Hook that connects to the backend telemetry WebSocket and
  * accumulates per‑symbol metrics.  The server emits both raw Binance
@@ -15,7 +17,10 @@ import { getProxyWsBase } from './proxyBase';
  * latest ``MetricsMessage`` for that symbol.  The UI should treat
  * this object as immutable and re-render when it changes.
  */
-export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
+export function useTelemetrySocket(
+  activeSymbols: string[],
+  onStatusChange?: (status: TelemetrySocketStatus) => void,
+): MetricsState {
   const [state, setState] = useState<MetricsState>({});
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
@@ -63,6 +68,7 @@ export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
 
     const connect = () => {
       if (disposed || activeSymbols.length === 0) {
+        onStatusChange?.('closed');
         return;
       }
 
@@ -80,6 +86,7 @@ export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
       console.log(`[Telemetry] Connecting to WS: ${url} (attempt ${reconnectAttempts.current + 1})`);
 
       try {
+        onStatusChange?.('connecting');
         const ws = new WebSocket(url, proxyWebSocketProtocols());
         wsRef.current = ws;
 
@@ -88,6 +95,7 @@ export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
             return;
           }
           console.log('[Telemetry] WebSocket connected');
+          onStatusChange?.('open');
           reconnectAttempts.current = 0;
         };
 
@@ -117,6 +125,7 @@ export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
             return;
           }
           console.log(`[Telemetry] WebSocket closed (code: ${event.code})`);
+          onStatusChange?.('closed');
           scheduleReconnect();
         };
 
@@ -125,6 +134,7 @@ export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
             return;
           }
           console.error('[Telemetry] WebSocket error:', error);
+          onStatusChange?.('closed');
           // onclose handles reconnect.
         };
       } catch (error) {
@@ -132,6 +142,7 @@ export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
           return;
         }
         console.error('[Telemetry] Failed to create WebSocket:', error);
+        onStatusChange?.('closed');
         scheduleReconnect();
       }
     };
@@ -142,8 +153,9 @@ export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
       disposed = true;
       clearReconnectTimer();
       closeActiveSocket('effect_cleanup');
+      onStatusChange?.('closed');
     };
-  }, [symbolsKey]);
+  }, [symbolsKey, onStatusChange]);
 
   return state;
 }

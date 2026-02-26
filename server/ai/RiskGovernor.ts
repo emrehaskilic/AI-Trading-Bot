@@ -3,12 +3,23 @@ import { PolicyDecision, PolicyIntent, PolicySide } from './PolicyEngine';
 import { DeterministicStateSnapshot } from './StateExtractor';
 
 const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(max, value));
+const isEnabled = (value: string | undefined, fallback: boolean): boolean => {
+  if (value == null) return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+};
 
 type RiskGovernorConfig = {
   slippageHardBps: number;
   volHardPercentile: number;
   reducePct: number;
   maxExposureMultiplier: number;
+  blockLoserRealize: boolean;
+  drawdownReduceEnabled: boolean;
+  drawdownReducePct: number;
+  entryTrendGuardMinTrendiness: number;
+  entryTrendGuardMinScore: number;
+  entryTrendGuardMinScoreGap: number;
+  entryTrendGuardMinVwapGapPct: number;
   liquidationMarginHealthThreshold: number;
   liquidationProximityPctThreshold: number;
   maintenanceMarginRatioThreshold: number;
@@ -44,6 +55,13 @@ export class RiskGovernor {
       volHardPercentile: clamp(Number(process.env.AI_VOL_HARD_LIMIT_PCT || 97), 90, 100),
       reducePct: clamp(Number(process.env.AI_STRICT_REDUCE_PCT || 0.5), 0.1, 1),
       maxExposureMultiplier: Math.max(1, Number(process.env.AI_MAX_EXPOSURE_MULTIPLIER || 1.5)),
+      blockLoserRealize: isEnabled(process.env.AI_BLOCK_LOSER_REALIZE, true),
+      drawdownReduceEnabled: isEnabled(process.env.AI_DRAWDOWN_REDUCE_ENABLED, false),
+      drawdownReducePct: clamp(Number(process.env.AI_DRAWDOWN_REDUCE_PCT || 8), 1, 50),
+      entryTrendGuardMinTrendiness: clamp(Number(process.env.AI_ENTRY_TREND_GUARD_MIN_TRENDINESS || 0.58), 0, 1),
+      entryTrendGuardMinScore: Math.max(3, Math.trunc(Number(process.env.AI_ENTRY_TREND_GUARD_MIN_SCORE || 4))),
+      entryTrendGuardMinScoreGap: Math.max(1, Math.trunc(Number(process.env.AI_ENTRY_TREND_GUARD_MIN_SCORE_GAP || 2))),
+      entryTrendGuardMinVwapGapPct: Math.max(0, Number(process.env.AI_ENTRY_TREND_GUARD_MIN_VWAP_GAP_PCT || 0.03)),
       liquidationMarginHealthThreshold: clamp(Number(process.env.AI_HARD_LIQ_MARGIN_HEALTH_THRESHOLD || 0.1), -1, 1),
       liquidationProximityPctThreshold: clamp(Number(process.env.AI_HARD_LIQ_PROXIMITY_PCT || 8), 0, 100),
       maintenanceMarginRatioThreshold: clamp(Number(process.env.AI_HARD_LIQ_MAINT_MARGIN_RATIO_THRESHOLD || 0.9), 0, 5),
@@ -72,11 +90,20 @@ export class RiskGovernor {
     const toxicityHard = input.deterministicState.toxicityState === 'TOXIC';
     const volHard = Number(input.deterministicState.volatilityPercentile || 0) >= this.config.volHardPercentile;
     const liquidationHard = this.isHardLiquidationRisk(input.snapshot.riskState);
+    const drawdownPct = Number(input.snapshot.riskState.drawdownPct || 0);
+    const drawdownLossCap = this.config.drawdownReduceEnabled
+      && Number.isFinite(drawdownPct)
+      && drawdownPct <= -(this.config.drawdownReducePct / 100);
+    const dailyLossCap = Boolean(input.snapshot.riskState.dailyLossLock) || drawdownLossCap;
 
     if (slippageHard) reasons.push('SLIPPAGE_HARD_LIMIT');
-    if (toxicityHard) reasons.push('TOXICITY_HARD_LIMIT');
+    if (toxicityHard) {
+      reasons.push('TOXICITY_HARD_LIMIT');
+      reasons.push('TOXICITY_LIMIT');
+    }
     if (volHard) reasons.push('VOL_HARD_LIMIT');
     if (liquidationHard) reasons.push('HARD_LIQUIDATION_RISK');
+    if (dailyLossCap) reasons.push('DAILY_LOSS_CAP');
 
     if (slippageHard || toxicityHard || volHard || liquidationHard) {
       if (position) {
@@ -87,6 +114,10 @@ export class RiskGovernor {
         intent = 'HOLD';
         side = null;
       }
+    } else if (dailyLossCap) {
+      intent = 'HOLD';
+      side = null;
+      reducePct = null;
     }
 
     if ((intent === 'ENTER' || intent === 'ADD') && input.deterministicState.executionState !== 'HEALTHY') {
@@ -105,6 +136,15 @@ export class RiskGovernor {
         reasons.push('INVALID_NOTIONAL_LIMIT');
         intent = 'HOLD';
         side = null;
+      }
+
+      if (intent === 'ENTER' && side) {
+        const dominantTrendSide = this.detectDominantTrendSide(input.snapshot, input.deterministicState);
+        if (dominantTrendSide && dominantTrendSide !== side) {
+          reasons.push('ENTRY_COUNTERTREND_GUARD');
+          intent = 'HOLD';
+          side = null;
+        }
       }
     }
 
@@ -147,6 +187,17 @@ export class RiskGovernor {
         side = null;
       } else {
         side = position.side;
+      }
+    }
+
+    if (this.config.blockLoserRealize && position && (intent === 'REDUCE' || intent === 'EXIT')) {
+      const unrealizedPnlPct = Number(position.unrealizedPnlPct || 0);
+      const hardRiskActive = slippageHard || toxicityHard || volHard || liquidationHard;
+      if (Number.isFinite(unrealizedPnlPct) && unrealizedPnlPct < 0 && !hardRiskActive) {
+        reasons.push('LOSER_REALIZE_BLOCK');
+        intent = 'HOLD';
+        side = null;
+        reducePct = null;
       }
     }
 
@@ -199,5 +250,50 @@ export class RiskGovernor {
       return true;
     }
     return false;
+  }
+
+  private detectDominantTrendSide(
+    snapshot: AIMetricsSnapshot,
+    state: DeterministicStateSnapshot
+  ): PolicySide {
+    const trendiness = Number(snapshot.regimeMetrics.trendinessScore || 0);
+    if (!Number.isFinite(trendiness) || trendiness < this.config.entryTrendGuardMinTrendiness) {
+      return null;
+    }
+
+    const price = Number(snapshot.market.price || 0);
+    const vwap = Number(snapshot.market.vwap || 0);
+    const safeVwap = Number.isFinite(vwap) && vwap > 0 ? vwap : price;
+    const vwapGapRatio = safeVwap > 0 ? ((price - safeVwap) / safeVwap) : 0;
+    const minVwapGapRatio = this.config.entryTrendGuardMinVwapGapPct / 100;
+
+    let upScore = 0;
+    let downScore = 0;
+
+    if (state.cvdSlopeSign === 'UP') upScore += 1;
+    if (state.cvdSlopeSign === 'DOWN') downScore += 1;
+
+    if (state.oiDirection !== 'DOWN') upScore += 1;
+    if (state.oiDirection !== 'UP') downScore += 1;
+
+    if (vwapGapRatio >= minVwapGapRatio) upScore += 1;
+    if (vwapGapRatio <= -minVwapGapRatio) downScore += 1;
+
+    if (state.flowState === 'EXPANSION') {
+      if (state.cvdSlopeSign === 'UP') upScore += 1;
+      if (state.cvdSlopeSign === 'DOWN') downScore += 1;
+    }
+
+    const deltaZ = Number(snapshot.market.deltaZ || 0);
+    if (deltaZ > 0.4) upScore += 1;
+    if (deltaZ < -0.4) downScore += 1;
+
+    if (upScore >= this.config.entryTrendGuardMinScore && upScore >= (downScore + this.config.entryTrendGuardMinScoreGap)) {
+      return 'LONG';
+    }
+    if (downScore >= this.config.entryTrendGuardMinScore && downScore >= (upScore + this.config.entryTrendGuardMinScoreGap)) {
+      return 'SHORT';
+    }
+    return null;
   }
 }

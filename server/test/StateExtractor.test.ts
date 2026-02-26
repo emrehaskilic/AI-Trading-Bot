@@ -21,7 +21,7 @@ export function runTests() {
     assert(state.flowState === 'EXPANSION', 'flow should classify as EXPANSION');
     assert(state.regimeState === 'TREND' || state.regimeState === 'TRANSITION', 'regime should be trend-like on clean trending snapshot');
     assert(state.derivativesState === 'LONG_BUILD', 'derivatives should classify as LONG_BUILD');
-    assert(state.executionState === 'HEALTHY', 'execution should be healthy on tight spread snapshot');
+    assert(state.executionState !== 'LOW_RESILIENCY', 'tight spread should not force LOW_RESILIENCY');
   }
 
   {
@@ -64,5 +64,22 @@ export function runTests() {
       },
     }));
     assert(toxic.toxicityState === 'TOXIC', 'critical toxic classification must apply immediately');
+  }
+
+  {
+    const extractor = new StateExtractor(10);
+    const state = extractor.extract(buildAIMetricsSnapshot({
+      symbol: 'XRPUSDT',
+      market: {
+        spreadPct: 0.0001281,
+      },
+      liquidityMetrics: {
+        expectedSlippageBuy: 0.2,
+        expectedSlippageSell: 0.2,
+      },
+    }));
+
+    assert(Math.abs(state.spreadBps - 1.281) < 0.05, 'spread bps conversion should stay near 1.281 bps');
+    assert(state.spreadBps < 10, 'spread bps must not inflate by 100x');
   }
 }

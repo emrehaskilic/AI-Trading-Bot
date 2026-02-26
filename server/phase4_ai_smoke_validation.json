@@ -1,0 +1,321 @@
+{
+  "generatedAt": "2026-02-26T14:29:36.133Z",
+  "decisionMode": "orchestrator_v1",
+  "snapshots": 20,
+  "summary": {
+    "totalOrders": 8,
+    "makerOrders": 6,
+    "takerOrders": 2,
+    "makerRatio": 0.75,
+    "addsUsedMax": 2,
+    "entryTakerMaxPctObserved": 0.25,
+    "exitRiskCount": 1,
+    "legacyDecisionCalls": 0
+  },
+  "telemetry": {
+    "makerOrdersPlaced": 6,
+    "takerOrdersPlaced": 2,
+    "entryTakerNotionalPct": 0.25,
+    "addsUsed": 2,
+    "exitRiskTriggeredCount": 1,
+    "legacyDecisionCalls": 0
+  },
+  "checks": {
+    "legacyDecisionCallsZero": true,
+    "readinessSeen": true,
+    "entrySeen": true,
+    "addsUsedMaxLe2": true,
+    "entryTakerPctOk": true,
+    "exitRiskTakerOnlyOne": true,
+    "makerRatioOk": true
+  },
+  "verdict": "PASS",
+  "snapshotRows": [
+    {
+      "index": 0,
+      "ts": 1772116173318,
+      "intent": "ENTRY",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 2,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 0,
+      "entryTakerNotionalPct": 0,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 1,
+      "ts": 1772116193318,
+      "intent": "ENTRY",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 0,
+      "takerOrdersPlacedDelta": 1,
+      "addsUsed": 0,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 2,
+      "ts": 1772116213318,
+      "intent": "HOLD",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 0,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 0,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 3,
+      "ts": 1772116233318,
+      "intent": "HOLD",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 0,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 0,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 4,
+      "ts": 1772116253318,
+      "intent": "HOLD",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 0,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 0,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 5,
+      "ts": 1772116273318,
+      "intent": "HOLD",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 0,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 0,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 6,
+      "ts": 1772116293318,
+      "intent": "HOLD",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 0,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 0,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 7,
+      "ts": 1772116313318,
+      "intent": "HOLD",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 0,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 0,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 8,
+      "ts": 1772116333318,
+      "intent": "ADD",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 1,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 1,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 9,
+      "ts": 1772116353318,
+      "intent": "HOLD",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 0,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 1,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 10,
+      "ts": 1772116373318,
+      "intent": "HOLD",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 0,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 1,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 11,
+      "ts": 1772116393318,
+      "intent": "HOLD",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 0,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 1,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 12,
+      "ts": 1772116413318,
+      "intent": "HOLD",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 0,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 1,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 13,
+      "ts": 1772116433318,
+      "intent": "ADD",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 1,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 2,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 14,
+      "ts": 1772116453318,
+      "intent": "HOLD",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 0,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 2,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 15,
+      "ts": 1772116473318,
+      "intent": "HOLD",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 0,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 2,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 16,
+      "ts": 1772116493318,
+      "intent": "EXIT_RISK",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 1,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 2,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 17,
+      "ts": 1772116513318,
+      "intent": "EXIT_RISK",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 1,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 2,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 18,
+      "ts": 1772116533318,
+      "intent": "EXIT_RISK",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 0,
+      "takerOrdersPlacedDelta": 1,
+      "addsUsed": 0,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    },
+    {
+      "index": 19,
+      "ts": 1772116553318,
+      "intent": "HOLD",
+      "side": "BUY",
+      "makerOrdersPlacedDelta": 0,
+      "takerOrdersPlacedDelta": 0,
+      "addsUsed": 0,
+      "entryTakerNotionalPct": 0.25,
+      "readinessFlags": {
+        "ready": true,
+        "reasons": []
+      }
+    }
+  ],
+  "ai": {
+    "model": "gemini-2.0-flash",
+    "ok": true,
+    "error": null,
+    "text": "**Genel Değerlendirme: PASS**\n\n**Teknik Gerekçeler (5 Madde):**\n\n1.  **`legacyDecisionCallsZero: true`**: Eski karar alma mekanizmalarına ait çağrı yapılmamış, modern sisteme geçiş başarılı.\n2.  **`addsUsedMaxLe2: true`**: Maksimum ek pozisyon sayısı (adds) 2 veya altında, risk yönetimi kabul edilebilir seviyede.\n3.  **`entryTakerPctOk: true`**: Giriş emirlerinde taker emirlerinin yüzdesi kabul edilebilir sınırlar içinde.\n4.  **`exitRiskTakerOnlyOne: true`**: Riskli çıkış senaryolarında sadece bir taker emri kullanılmış, ani piyasa hareketlerine karşı kontrollü çıkış yapılmış.\n5.  **`makerRatioOk: true`**: Maker emirlerinin oranı (%75) belirlenen eşiği aşıyor, piyasaya likidite sağlama hedefi tutturulmuş."
+  }
+}

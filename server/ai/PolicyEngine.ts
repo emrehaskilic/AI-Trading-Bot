@@ -16,6 +16,7 @@ export interface PolicyEvaluationInput {
   symbol: string;
   timestampMs: number;
   state: DeterministicStateSnapshot;
+  snapshot: AIMetricsSnapshot;
   position: AIMetricsSnapshot['position'];
   directionLockBlocked: boolean;
   lockReason?: string | null;
@@ -37,6 +38,7 @@ type PolicyEngineConfig = {
   temperature: number;
   maxOutputTokens: number;
   localOnly: boolean;
+  allowTestLocalPolicy?: boolean;
   fallbackLocalOnLLMFailure?: boolean;
 };
 
@@ -52,6 +54,10 @@ const POLICY_SCHEMA: Record<string, unknown> = {
 };
 
 const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(max, value));
+const isEnabled = (value: string | undefined, fallback: boolean): boolean => {
+  if (value == null) return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+};
 
 const HOLD_DECISION: PolicyDecision = {
   intent: 'HOLD',
@@ -64,13 +70,26 @@ export class PolicyEngine {
   constructor(private readonly config: PolicyEngineConfig) {}
 
   async evaluate(input: PolicyEvaluationInput): Promise<PolicyEvaluationResult> {
+    const allowTestLocalPolicy = this.config.allowTestLocalPolicy != null
+      ? Boolean(this.config.allowTestLocalPolicy)
+      : isEnabled(process.env.AI_TEST_LOCAL_POLICY, false);
     const fallbackLocalOnFailure =
-      this.config.fallbackLocalOnLLMFailure != null
+      allowTestLocalPolicy && (this.config.fallbackLocalOnLLMFailure != null
         ? Boolean(this.config.fallbackLocalOnLLMFailure)
-        : !['0', 'false', 'no', 'off'].includes(String(process.env.AI_LLM_FAILURE_USE_LOCAL_POLICY || 'true').trim().toLowerCase());
+        : isEnabled(process.env.AI_LLM_FAILURE_USE_LOCAL_POLICY, false));
 
-    if (this.config.localOnly || !this.config.apiKey || !this.config.model) {
-      return this.localPolicy(input);
+    if (this.config.localOnly) {
+      if (allowTestLocalPolicy) {
+        return this.localPolicy(input);
+      }
+      return this.hold('LOCAL_POLICY_DISABLED', 0, null);
+    }
+
+    if (!this.config.apiKey || !this.config.model) {
+      if (allowTestLocalPolicy) {
+        return this.localPolicy(input);
+      }
+      return this.hold('LLM_NOT_CONFIGURED', 0, null);
     }
 
     const timeoutMs = this.resolveTimeout(input);
@@ -152,6 +171,7 @@ export class PolicyEngine {
   }
 
   private buildPrompt(input: PolicyEvaluationInput): string {
+    const snapshot = input.snapshot;
     const payload = {
       symbol: input.symbol,
       timestampMs: input.timestampMs,
@@ -168,6 +188,64 @@ export class PolicyEngine {
         volatilityPercentile: input.state.volatilityPercentile,
         expectedSlippageBps: input.state.expectedSlippageBps,
         spreadBps: input.state.spreadBps,
+      },
+      liveOrderflowMetrics: {
+        volumeAnalysis: {
+          delta1s: snapshot.market.delta1s,
+          delta5s: snapshot.market.delta5s,
+          deltaZ: snapshot.market.deltaZ,
+          aggressiveBuyVolume: snapshot.trades.aggressiveBuyVolume,
+          aggressiveSellVolume: snapshot.trades.aggressiveSellVolume,
+          printsPerSecond: snapshot.trades.printsPerSecond,
+          tradeCount: snapshot.trades.tradeCount,
+        },
+        orderflowDynamics: {
+          cvdSlope: snapshot.market.cvdSlope,
+          burstCount: snapshot.trades.burstCount,
+          burstSide: snapshot.trades.burstSide,
+          obiWeighted: snapshot.market.obiWeighted,
+          obiDeep: snapshot.market.obiDeep,
+          obiDivergence: snapshot.market.obiDivergence,
+          vwap: snapshot.market.vwap,
+          price: snapshot.market.price,
+          spreadRatio: snapshot.market.spreadPct,
+        },
+      },
+      advancedMicrostructure: {
+        liquidity: {
+          expectedSlippageBuyBps: snapshot.liquidityMetrics.expectedSlippageBuy,
+          expectedSlippageSellBps: snapshot.liquidityMetrics.expectedSlippageSell,
+          resiliencyMs: snapshot.liquidityMetrics.resiliencyMs,
+          liquidityWallScore: snapshot.liquidityMetrics.liquidityWallScore,
+          voidGapScore: snapshot.liquidityMetrics.voidGapScore,
+          effectiveSpread: snapshot.liquidityMetrics.effectiveSpread,
+        },
+        passiveFlow: {
+          bidAddRate: snapshot.passiveFlowMetrics.bidAddRate,
+          askAddRate: snapshot.passiveFlowMetrics.askAddRate,
+          bidCancelRate: snapshot.passiveFlowMetrics.bidCancelRate,
+          askCancelRate: snapshot.passiveFlowMetrics.askCancelRate,
+          queueDeltaBestBid: snapshot.passiveFlowMetrics.queueDeltaBestBid,
+          queueDeltaBestAsk: snapshot.passiveFlowMetrics.queueDeltaBestAsk,
+          spoofScore: snapshot.passiveFlowMetrics.spoofScore,
+          refreshRate: snapshot.passiveFlowMetrics.refreshRate,
+        },
+        toxicity: {
+          vpinApprox: snapshot.toxicityMetrics.vpinApprox,
+          priceImpactPerSignedNotional: snapshot.toxicityMetrics.priceImpactPerSignedNotional,
+          burstPersistenceScore: snapshot.toxicityMetrics.burstPersistenceScore,
+        },
+        regime: {
+          realizedVol5m: snapshot.regimeMetrics.realizedVol5m,
+          volOfVol: snapshot.regimeMetrics.volOfVol,
+          chopScore: snapshot.regimeMetrics.chopScore,
+          trendinessScore: snapshot.regimeMetrics.trendinessScore,
+        },
+      },
+      openInterest5mWindow: {
+        oiChangePct: snapshot.openInterest.oiChangePct,
+        perpBasisZScore: snapshot.derivativesMetrics.perpBasisZScore,
+        liquidationProxyScore: snapshot.derivativesMetrics.liquidationProxyScore,
       },
       position: input.position
         ? {
@@ -186,6 +264,9 @@ export class PolicyEngine {
       'You are a policy engine. Return JSON only, no text.',
       'Allowed output:',
       '{"intent":"HOLD|ENTER|ADD|REDUCE|EXIT","side":"LONG|SHORT|null","riskMultiplier":0.2-2.0,"confidence":0.0-1.0}',
+      'Decide freely using the provided live orderflow and advanced microstructure metrics.',
+      'You may ENTER, ADD, REDUCE, EXIT, or HOLD based on trend continuation and take-profit opportunities.',
+      'If position is losing but trend/microstructure still supports current side and no hard-risk evidence, prefer HOLD/ADD over REDUCE/EXIT.',
       'Hard constraints:',
       '- ENTER only if flat',
       '- ADD only if same direction position exists',

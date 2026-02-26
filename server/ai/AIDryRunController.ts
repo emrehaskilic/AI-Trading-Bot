@@ -23,7 +23,8 @@ const DEFAULT_TREND_BREAK_CONFIRM_TICKS = Math.max(1, Math.trunc(clamp(Number(pr
 const DEFAULT_MIN_REDUCE_GAP_MS = Math.max(0, Math.trunc(Number(process.env.AI_MIN_REDUCE_GAP_MS || 30_000)));
 const REENTRY_COOLDOWN_BARS = Math.max(0, Math.trunc(Number(process.env.AI_REENTRY_COOLDOWN_BARS || 2)));
 
-const STRICT_3M_MODE_ENABLED = isEnabled(process.env.AI_STRICT_3M_TREND_MODE, true);
+const STRICT_3M_MODE_ENABLED = isEnabled(process.env.AI_STRICT_3M_TREND_MODE, false);
+const AI_TEST_LOCAL_POLICY_ENABLED = isEnabled(process.env.AI_TEST_LOCAL_POLICY, false);
 const BAR_MS = Math.max(1, Math.trunc(Number(process.env.AI_BAR_INTERVAL_MS || 180_000)));
 const MIN_TREND_DURATION_BARS = Math.max(1, Math.trunc(Number(process.env.AI_MIN_TREND_DURATION_BARS || 3)));
 const DCA_MAX_COUNT = Math.max(0, Math.trunc(Number(process.env.AI_DCA_MAX_COUNT || 3)));
@@ -37,6 +38,12 @@ const VOL_HARD_LIMIT = clamp(Number(process.env.AI_VOL_HARD_LIMIT_PCT || 97), 90
 const CRASH_EXIT_VOL_PCT = clamp(Number(process.env.AI_CRASH_EXIT_MIN_VOL_PCT || 90), 70, 100);
 const CRASH_EXIT_OPPOSING_STRENGTH = clamp(Number(process.env.AI_CRASH_EXIT_MIN_OPPOSING_STRENGTH || 62), 50, 90);
 const CRASH_EXIT_CONFIRM_BARS = Math.max(1, Math.trunc(Number(process.env.AI_CRASH_EXIT_CONFIRM_BARS || 2)));
+const SOFT_CRASH_EXIT_ENABLED = isEnabled(process.env.AI_SOFT_CRASH_EXIT, false);
+const CRASH_EXIT_ON_LOSS_ENABLED = isEnabled(process.env.AI_CRASH_EXIT_ON_LOSS, false);
+const LOSER_DCA_MIN_LOSS_PCT = Math.max(0, Number(process.env.AI_LOSER_DCA_MIN_LOSS_PCT || 0.2));
+const TREND_REVERSAL_EXIT_MIN_STRENGTH_PCT = clamp(Number(process.env.AI_TREND_REVERSAL_EXIT_MIN_STRENGTH_PCT || 72), 55, 95);
+const TREND_REVERSAL_MIN_BARS = Math.max(1, Math.trunc(Number(process.env.AI_TREND_REVERSAL_MIN_BARS || 3)));
+const DIRECTION_LOCK_BYPASS_STRENGTH_PCT = clamp(Number(process.env.AI_DIRECTION_LOCK_BYPASS_STRENGTH_PCT || 70), 55, 95);
 const BIAS_MIN_HOLD_BARS = Math.max(1, Math.trunc(Number(process.env.AI_BIAS_MIN_HOLD_BARS || 4)));
 const BIAS_ENTRY_CONFIRM_BARS = Math.max(1, Math.trunc(Number(process.env.AI_BIAS_ENTRY_CONFIRM_BARS || 2)));
 const BIAS_FLIP_CONFIRM_BARS = Math.max(1, Math.trunc(Number(process.env.AI_BIAS_FLIP_CONFIRM_BARS || 3)));
@@ -150,7 +157,7 @@ export class AIDryRunController {
     const symbols = input.symbols.map((s) => String(s || '').toUpperCase()).filter(Boolean);
     const apiKey = String(input.apiKey || '').trim();
     const model = String(input.model || '').trim();
-    const localOnly = STRICT_3M_MODE_ENABLED ? true : (Boolean(input.localOnly) || !apiKey || !model);
+    const localOnly = AI_TEST_LOCAL_POLICY_ENABLED && Boolean(input.localOnly);
 
     this.symbols = new Set(symbols);
     this.config = {
@@ -175,6 +182,7 @@ export class AIDryRunController {
       temperature: this.config.temperature,
       maxOutputTokens: this.config.maxOutputTokens,
       localOnly,
+      allowTestLocalPolicy: AI_TEST_LOCAL_POLICY_ENABLED,
     });
 
     this.active = true;
@@ -278,17 +286,17 @@ export class AIDryRunController {
         startupExecutionPass
         && deterministicState.toxicityState !== 'TOXIC'
         && deterministicState.volatilityPercentile < 95;
-      const canEvaluateForEntry = confidenceEnough && startupSafetyPass;
+      const canEvaluateForEntry = confidenceEnough;
       const canEvaluatePolicy = ready && (hasOpenPosition || canEvaluateForEntry);
 
       let policy: PolicyDecision = { intent: 'HOLD', side: null, riskMultiplier: 0.2, confidence: 0 };
-      let policySource: 'LLM' | 'LOCAL_POLICY' | 'HOLD_FALLBACK' = 'LOCAL_POLICY';
+      let policySource: 'LLM' | 'LOCAL_POLICY' | 'HOLD_FALLBACK' = 'HOLD_FALLBACK';
       let policyError: string | null = null;
       let policyGateReason: string | null = null;
       let rawPolicyText: string | null = null;
 
       if (canEvaluatePolicy) {
-        if (STRICT_3M_MODE_ENABLED) {
+        if (STRICT_3M_MODE_ENABLED && AI_TEST_LOCAL_POLICY_ENABLED) {
           policy = this.computeStrict3MPolicy(snapshot, deterministicState, runtime, barId, dfsPct);
           policySource = 'LOCAL_POLICY';
           policyError = null;
@@ -297,6 +305,7 @@ export class AIDryRunController {
             symbol,
             timestampMs: nowMs,
             state: deterministicState,
+            snapshot,
             position: snapshot.position,
             directionLockBlocked: false,
             lockReason: null,
@@ -310,9 +319,17 @@ export class AIDryRunController {
           if (policyResult.source === 'HOLD_FALLBACK') {
             this.telemetry.invalidLLMResponses += 1;
           }
+
+          if (!AI_TEST_LOCAL_POLICY_ENABLED && policyResult.source !== 'LLM') {
+            policy = { intent: 'HOLD', side: null, riskMultiplier: 0.2, confidence: 0 };
+            policySource = 'HOLD_FALLBACK';
+            policyGateReason = 'POLICY_NOT_FROM_LLM';
+            policyError = policyError || 'policy_not_from_llm';
+            this.telemetry.holdOverrides += 1;
+          }
         }
       } else {
-        policySource = 'LOCAL_POLICY';
+        policySource = 'HOLD_FALLBACK';
         policyError = null;
         if (!ready) {
           policyGateReason = 'state_not_ready';
@@ -344,9 +361,11 @@ export class AIDryRunController {
         snapshot.position,
         deterministicState
       );
+      const directionLockBypass = lockEvaluation.blocked
+        && this.shouldBypassDirectionLock(lockEvaluation, governed.side, deterministicState, snapshot, runtime, dfsPct);
 
       let finalDecision = governed;
-      if (lockEvaluation.blocked) {
+      if (lockEvaluation.blocked && !directionLockBypass) {
         this.telemetry.guardrailBlocks += 1;
         finalDecision = {
           ...governed,
@@ -354,6 +373,11 @@ export class AIDryRunController {
           side: null,
           reducePct: null,
           reasons: [...governed.reasons, lockEvaluation.reason || 'DIRECTION_LOCK'],
+        };
+      } else if (directionLockBypass) {
+        finalDecision = {
+          ...governed,
+          reasons: [...governed.reasons, 'DIRECTION_LOCK_BYPASS_TREND'],
         };
       }
 
@@ -371,16 +395,28 @@ export class AIDryRunController {
         snapshot.position
         && this.shouldForceCrashExit(snapshot.position.side, deterministicState, snapshot, runtime, dfsPct, barId)
       ) {
-        finalDecision = {
-          ...finalDecision,
-          intent: 'EXIT',
-          side: snapshot.position.side,
-          reducePct: null,
-          reasons: [...finalDecision.reasons, 'CRASH_REVERSAL_EXIT'],
-        };
+        const unrealizedPnlPct = Number(snapshot.position.unrealizedPnlPct || 0);
+        const hardCrashRisk = this.isHardCrashRisk(deterministicState);
+        if (!hardCrashRisk && unrealizedPnlPct < 0 && !CRASH_EXIT_ON_LOSS_ENABLED) {
+          finalDecision = {
+            ...finalDecision,
+            intent: 'HOLD',
+            side: null,
+            reducePct: null,
+            reasons: [...finalDecision.reasons, 'CRASH_EXIT_SUPPRESSED_LOSER'],
+          };
+        } else {
+          finalDecision = {
+            ...finalDecision,
+            intent: 'EXIT',
+            side: snapshot.position.side,
+            reducePct: null,
+            reasons: [...finalDecision.reasons, 'CRASH_REVERSAL_EXIT'],
+          };
+        }
       }
 
-      if (snapshot.position) {
+      if (snapshot.position && STRICT_3M_MODE_ENABLED) {
         const hardRisk = finalDecision.reasons.some((reason) => HARD_RISK_REASONS.has(reason));
         const trendIntact = this.isTrendIntact(snapshot.position.side, deterministicState, snapshot, runtime);
 
@@ -414,11 +450,46 @@ export class AIDryRunController {
             };
           }
         }
+      } else if (snapshot.position) {
+        runtime.trendBreakStreak = 0;
+        runtime.lastTrendBreakBarId = -1;
+        runtime.lastTrendBreakTs = 0;
       } else {
         runtime.trendBreakStreak = 0;
         runtime.lastTrendBreakBarId = -1;
         runtime.lastTrendBreakTs = 0;
         runtime.lastReduceTs = 0;
+      }
+
+      const reversalConfirmed = Boolean(
+        snapshot.position
+        && this.isTrendReversalConfirmed(snapshot.position.side, deterministicState, snapshot, runtime, dfsPct)
+      );
+      if (snapshot.position && reversalConfirmed) {
+        finalDecision = {
+          ...finalDecision,
+          intent: 'EXIT',
+          side: snapshot.position.side,
+          reducePct: null,
+          reasons: [...finalDecision.reasons, 'TREND_REVERSAL_CONFIRMED'],
+        };
+      }
+
+      if (
+        snapshot.position
+        && !reversalConfirmed
+        && this.shouldForceLoserDca(snapshot.position.side, deterministicState, snapshot, runtime, finalDecision, barId, dfsPct)
+      ) {
+        const addRisk = clamp(Math.max(Number(finalDecision.riskMultiplier || 0.35), 0.35), 0.1, 1.25);
+        finalDecision = {
+          ...finalDecision,
+          intent: 'ADD',
+          side: snapshot.position.side,
+          reducePct: null,
+          riskMultiplier: Number(addRisk.toFixed(6)),
+          sizeMultiplier: Number(addRisk.toFixed(6)),
+          reasons: [...finalDecision.reasons, 'LOSER_DCA_TREND_CONTINUATION'],
+        };
       }
 
       if (snapshot.position && finalDecision.intent === 'REDUCE') {
@@ -1011,11 +1082,120 @@ export class AIDryRunController {
       || (side === 'SHORT' && state.oiDirection === 'UP');
     const cvdOpposingAccel = this.isCvdOpposingAccelerating(side, Number(snapshot.market.cvdSlope || 0), runtime.lastCvdSlope);
     const flowBreak = state.flowState === 'EXHAUSTION' || (state.flowState === 'ABSORPTION' && this.isOpposingPressure(side, state));
-    const severeVol = Number(state.volatilityPercentile || 0) >= CRASH_EXIT_VOL_PCT;
-    const severeExec = state.executionState === 'LOW_RESILIENCY';
+    const hardCrashRisk = this.isHardCrashRisk(state);
 
     if (!(opposingBias || oiOpposing || cvdOpposingAccel)) return false;
-    return severeVol || severeExec || flowBreak;
+    if (hardCrashRisk) return true;
+    if (!SOFT_CRASH_EXIT_ENABLED) return false;
+    return flowBreak;
+  }
+
+  private shouldBypassDirectionLock(
+    lockEvaluation: { blocked: boolean; reason: string | null },
+    side: StrategySide | null,
+    state: ReturnType<StateExtractor['extract']>,
+    snapshot: AIMetricsSnapshot,
+    runtime: RuntimeSymbolState,
+    dfsPct: number
+  ): boolean {
+    if (!lockEvaluation.blocked || !side) return false;
+    if (!lockEvaluation.reason || !lockEvaluation.reason.startsWith('DIRECTION_LOCK')) return false;
+    if (!runtime.lastClosedSide || runtime.lastClosedSide === side) return false;
+    if (state.regimeState !== 'TREND') return false;
+    if (state.directionalBias !== side) return false;
+    if (state.executionState !== 'HEALTHY') return false;
+    if (state.toxicityState === 'TOXIC') return false;
+    if (this.isHardCrashRisk(state)) return false;
+    if (this.isOpposingPressure(side, state)) return false;
+    if (this.isCvdOpposingAccelerating(side, Number(snapshot.market.cvdSlope || 0), runtime.lastCvdSlope)) return false;
+    const strength = this.sideStrengthPct(side, dfsPct);
+    return strength >= DIRECTION_LOCK_BYPASS_STRENGTH_PCT;
+  }
+
+  private isTrendReversalConfirmed(
+    side: StrategySide,
+    state: ReturnType<StateExtractor['extract']>,
+    snapshot: AIMetricsSnapshot,
+    runtime: RuntimeSymbolState,
+    dfsPct: number
+  ): boolean {
+    const oppositeSide: StrategySide = side === 'LONG' ? 'SHORT' : 'LONG';
+    if (state.regimeState !== 'TREND') return false;
+    if (state.executionState !== 'HEALTHY') return false;
+    if (state.toxicityState === 'TOXIC') return false;
+    if (state.directionalBias !== oppositeSide) return false;
+    if (state.flowState !== 'EXPANSION') return false;
+
+    const trendAgeBars =
+      runtime.trendSide === oppositeSide && runtime.trendStartBarId >= 0
+        ? Math.max(0, runtime.lastBarId - runtime.trendStartBarId + 1)
+        : 0;
+    if (trendAgeBars < TREND_REVERSAL_MIN_BARS) return false;
+
+    const oppositeStrength = this.sideStrengthPct(oppositeSide, dfsPct);
+    if (oppositeStrength < TREND_REVERSAL_EXIT_MIN_STRENGTH_PCT) return false;
+
+    const cvdOpposing = side === 'LONG'
+      ? Number(snapshot.market.cvdSlope || 0) < 0
+      : Number(snapshot.market.cvdSlope || 0) > 0;
+    const oiOpposing = side === 'LONG' ? state.oiDirection === 'DOWN' : state.oiDirection === 'UP';
+    const flowOpposing = this.isOpposingPressure(side, state);
+    const cvdAccelOpposing = this.isCvdOpposingAccelerating(side, Number(snapshot.market.cvdSlope || 0), runtime.lastCvdSlope);
+    const structuralOpposing = cvdOpposing && oiOpposing;
+    return flowOpposing && (structuralOpposing || cvdAccelOpposing) && (cvdAccelOpposing || oppositeStrength >= (TREND_REVERSAL_EXIT_MIN_STRENGTH_PCT + 8));
+  }
+
+  private shouldForceLoserDca(
+    side: StrategySide,
+    state: ReturnType<StateExtractor['extract']>,
+    snapshot: AIMetricsSnapshot,
+    runtime: RuntimeSymbolState,
+    decision: {
+      intent: 'HOLD' | 'ENTER' | 'ADD' | 'REDUCE' | 'EXIT';
+      reasons: string[];
+      maxExposureNotional: number;
+    },
+    barId: number,
+    dfsPct: number
+  ): boolean {
+    const position = snapshot.position;
+    if (!position) return false;
+    if (decision.intent === 'EXIT') return false;
+    if (decision.intent === 'ADD') return false;
+
+    const hardRisk = decision.reasons.some((reason) => HARD_RISK_REASONS.has(reason));
+    if (hardRisk) return false;
+    if (state.executionState !== 'HEALTHY') return false;
+    if (state.toxicityState === 'TOXIC') return false;
+    if (this.isHardCrashRisk(state)) return false;
+    if (state.regimeState !== 'TREND') return false;
+
+    const minLossRatio = LOSER_DCA_MIN_LOSS_PCT / 100;
+    const unrealizedPnlPct = Number(position.unrealizedPnlPct || 0);
+    if (!Number.isFinite(unrealizedPnlPct) || unrealizedPnlPct > -minLossRatio) return false;
+
+    if (runtime.dcaCount >= DCA_MAX_COUNT) return false;
+    if (runtime.lastDcaBarId >= 0 && (barId - runtime.lastDcaBarId) < DCA_BAR_GAP) return false;
+
+    const sideStrength = this.sideStrengthPct(side, dfsPct);
+    if (sideStrength < 52) return false;
+    if (state.directionalBias !== side && state.directionalBias !== 'NEUTRAL') return false;
+    if (this.isOpposingPressure(side, state)) return false;
+    if (this.isCvdOpposingAccelerating(side, Number(snapshot.market.cvdSlope || 0), runtime.lastCvdSlope)) return false;
+
+    const price = Math.max(0, Number(snapshot.market.price || 0));
+    const currentNotional = Math.max(0, Number(position.qty || 0) * price);
+    const maxExposureNotional = Math.max(0, Number(decision.maxExposureNotional || 0));
+    if (maxExposureNotional > 0 && currentNotional >= (maxExposureNotional - 1e-6)) return false;
+
+    return true;
+  }
+
+  private isHardCrashRisk(state: ReturnType<StateExtractor['extract']>): boolean {
+    const severeVol = Number(state.volatilityPercentile || 0) >= CRASH_EXIT_VOL_PCT;
+    const severeExec = state.executionState === 'LOW_RESILIENCY';
+    const toxic = state.toxicityState === 'TOXIC';
+    return severeVol || severeExec || toxic;
   }
 
   private isTrendIntact(

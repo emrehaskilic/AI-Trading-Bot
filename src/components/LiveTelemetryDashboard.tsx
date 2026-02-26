@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { useTelemetrySocket } from '../services/useTelemetrySocket';
+import { TelemetrySocketStatus, useTelemetrySocket } from '../services/useTelemetrySocket';
 import { MetricsState, MetricsMessage } from '../types/metrics';
 import SymbolRow from './SymbolRow';
 import MobileSymbolCard from './MobileSymbolCard';
@@ -76,9 +76,10 @@ export const Dashboard: React.FC = () => {
   const [settingsDirty, setSettingsDirty] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [settingsSavedAt, setSettingsSavedAt] = useState(0);
+  const [telemetryWsStatus, setTelemetryWsStatus] = useState<TelemetrySocketStatus>('connecting');
 
   const activeSymbols = useMemo(() => selectedPairs, [selectedPairs]);
-  const marketData: MetricsState = useTelemetrySocket(activeSymbols);
+  const marketData: MetricsState = useTelemetrySocket(activeSymbols, setTelemetryWsStatus);
 
   const proxyUrl = getProxyApiBase();
   const fetchWithAuth = (url: string, init?: RequestInit) => fetch(url, withProxyApiKey(init));
@@ -318,11 +319,34 @@ export const Dashboard: React.FC = () => {
   }, 0);
   const remainingMarginUsdt = totalMarginBudgetUsdt - allocatedInitialMarginUsdt;
 
-  const statusColor = executionStatus.connection.state === 'CONNECTED'
+  const latestTelemetryTs = activeSymbols.reduce((maxTs, symbol) => {
+    const msg = marketData[symbol];
+    const ts = Number(msg?.event_time_ms || msg?.snapshot?.ts || 0);
+    return ts > maxTs ? ts : maxTs;
+  }, 0);
+  const telemetryLagMs = latestTelemetryTs > 0 ? Math.max(0, Date.now() - latestTelemetryTs) : Number.POSITIVE_INFINITY;
+  const symbolsWithData = activeSymbols.filter((symbol) => Boolean(marketData[symbol])).length;
+  const telemetryState: ConnectionState = activeSymbols.length === 0
+    ? 'DISCONNECTED'
+    : telemetryWsStatus === 'connecting'
+      ? 'CONNECTING'
+      : telemetryWsStatus !== 'open'
+        ? 'DISCONNECTED'
+        : symbolsWithData === 0
+          ? 'CONNECTING'
+          : telemetryLagMs <= 10_000
+            ? 'CONNECTED'
+            : telemetryLagMs <= 30_000
+              ? 'CONNECTING'
+              : 'ERROR';
+
+  const statusColor = telemetryState === 'CONNECTED'
     ? 'text-green-400'
-    : executionStatus.connection.state === 'ERROR'
+    : telemetryState === 'ERROR'
       ? 'text-red-400'
-      : 'text-zinc-400';
+      : telemetryState === 'CONNECTING'
+        ? 'text-amber-400'
+        : 'text-zinc-400';
 
   return (
     <div className="min-h-screen bg-[#09090b] text-zinc-200 font-sans p-6">
@@ -336,7 +360,8 @@ export const Dashboard: React.FC = () => {
             )}
           </div>
           <div className="text-xs rounded border border-zinc-700 px-3 py-2 bg-zinc-900">
-            <span className={statusColor}>{executionStatus.connection.state}</span>
+            <div className={`font-semibold ${statusColor}`}>{telemetryState}</div>
+            <div className="text-[10px] text-zinc-500 mt-0.5">WS Telemetry</div>
           </div>
         </div>
 
