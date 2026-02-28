@@ -1,9 +1,29 @@
 import { OrchestratorV1Params } from './params';
 
-export type OrchestratorV1Intent = 'HOLD' | 'ENTRY' | 'ADD' | 'EXIT_RISK';
+export type OrchestratorV1Intent = 'HOLD' | 'ENTRY' | 'ADD' | 'EXIT_RISK' | 'EXIT_FLIP';
 export type OrchestratorV1Side = 'BUY' | 'SELL';
 export type OrchestratorV1CvdState = 'BUY' | 'SELL' | 'NEUTRAL';
 export type OrchestratorV1AtrSource = 'MICRO_ATR' | 'BACKFILL_ATR' | 'UNKNOWN';
+
+export interface OrchestratorV1BtcContext {
+  h1BarStartMs: number | null;
+  h4BarStartMs: number | null;
+  h1StructureUp: boolean;
+  h1StructureDn: boolean;
+  h4StructureUp: boolean;
+  h4StructureDn: boolean;
+  trendiness: number;
+  chop: number;
+}
+
+export interface OrchestratorV1DryRunPositionSnapshot {
+  hasPosition: boolean;
+  side: 'LONG' | 'SHORT' | null;
+  qty: number;
+  entryPrice: number;
+  notional: number;
+  addsUsed: number;
+}
 
 export interface OrchestratorV1Input {
   symbol: string;
@@ -28,9 +48,18 @@ export interface OrchestratorV1Input {
   oiChangePct: number | null;
   sessionVwapValue: number | null;
   htfH1BarStartMs: number | null;
+  htfH1SwingLow: number | null;
+  htfH1SwingHigh: number | null;
+  htfH1StructureBreakUp: boolean;
+  htfH1StructureBreakDn: boolean;
   htfH4BarStartMs: number | null;
   backfillDone: boolean;
   barsLoaded1m: number;
+  btcContext?: OrchestratorV1BtcContext | null;
+  /** P0: DryRun position snapshot for this symbol (single source of truth) */
+  dryRunPosition?: OrchestratorV1DryRunPositionSnapshot | null;
+  /** P1: BTC DryRun position for anchor-side derivation in NEUTRAL btcBias */
+  btcDryRunPosition?: OrchestratorV1DryRunPositionSnapshot | null;
 }
 
 export interface OrchestratorV1GateView {
@@ -68,6 +97,18 @@ export interface OrchestratorV1ChaseView {
   repricesUsed: number;
   chaseMaxSeconds: number;
   ttlMs: number;
+}
+
+// ── NEW: per-symbol chase debug view exposed in decision ──────────────────────
+export interface OrchestratorV1ChaseDebugView {
+  chaseActive: boolean;
+  chaseStartTs: number | null;
+  chaseElapsedMs: number;
+  chaseAttempts: number;
+  chaseTimedOut: boolean;
+  impulse: boolean;
+  fallbackEligible: boolean;
+  fallbackBlockedReason: 'NONE' | 'NO_TIMEOUT' | 'IMPULSE_FALSE' | 'GATES_FALSE';
 }
 
 export interface OrchestratorV1PositionView {
@@ -121,6 +162,23 @@ export interface OrchestratorV1Decision {
   position: OrchestratorV1PositionView;
   orders: OrchestratorV1Order[];
   chase: OrchestratorV1ChaseView;
+  // ── NEW ──────────────────────────────────────────────────────────────────────
+  chaseDebug: OrchestratorV1ChaseDebugView;
+  crossMarketBlockReason?: {
+    refSymbol: string;
+    btcBias: 'LONG' | 'SHORT' | 'NEUTRAL';
+    anchorSide: 'BUY' | 'SELL' | 'NONE';
+    anchorMode: 'BIAS' | 'ANCHOR_POSITION' | 'NONE';
+    candidateSymbol: string;
+    candidateSide: 'BUY' | 'SELL';
+    h1BarStartMs: number | null;
+    h4BarStartMs: number | null;
+    h1Up: boolean;
+    h1Dn: boolean;
+    h4Up: boolean;
+    h4Dn: boolean;
+    btcHasPosition: boolean;
+  } | null;
   telemetry: {
     sideFlipCount5m: number;
     sideFlipPerMin: number;
@@ -135,6 +193,47 @@ export interface OrchestratorV1Decision {
       confirmCountLong: number;
       confirmCountShort: number;
       entryConfirmCount: number;
+    };
+    // ── NEW: aggregate chase counters ────────────────────────────────────────
+    chase: {
+      chaseStartedCount: number;
+      chaseTimedOutCount: number;
+      chaseElapsedMaxMs: number;
+      fallbackEligibleCount: number;
+      fallbackTriggeredCount: number;
+      fallbackBlocked_NO_TIMEOUT: number;
+      fallbackBlocked_IMPULSE_FALSE: number;
+      fallbackBlocked_GATES_FALSE: number;
+    };
+    crossMarket: {
+      crossMarketVetoCount: number;
+      crossMarketNeutralCount: number;
+      crossMarketAllowedCount: number;
+      anchorSide: 'BUY' | 'SELL' | 'NONE';
+      anchorMode: 'BIAS' | 'ANCHOR_POSITION' | 'NONE';
+      btcHasPosition: boolean;
+    };
+    reversal: {
+      reversalAttempted: number;
+      reversalBlocked: number;
+      reversalConvertedToExit: number;
+      exitOnFlipCount: number;
+      currentPositionSide: 'BUY' | 'SELL' | null;
+      sideCandidate: 'BUY' | 'SELL' | null;
+      flipPersistenceCount: number;
+      flipFirstDetectedMs: number | null;
+      minFlipIntervalMs: number;
+      entryConfirmations: number;
+    };
+    htf: {
+      price: number;
+      h1SwingLow: number | null;
+      h1SwingHigh: number | null;
+      h1SBUp: boolean;
+      h1SBDn: boolean;
+      vetoed: boolean;
+      softBiasApplied: boolean;
+      reason: 'H1_STRUCTURE_BREAK_DN' | 'H1_STRUCTURE_BREAK_UP' | 'H1_SWING_BELOW_SOFT' | 'H1_SWING_ABOVE_SOFT' | null;
     };
   };
 }
@@ -171,6 +270,34 @@ export interface OrchestratorV1RuntimeState {
   sideFlipEvents5m: number[];
   gateTrueEvents5m: number[];
   entryIntentEvents5m: number[];
+  // ── NEW: sticky chase state ──────────────────────────────────────────────────
+  chaseActive: boolean;
+  chaseStartTs: number | null;
+  chaseLastRepriceTs: number | null;
+  chaseAttempts: number;
+  chaseTimedOut: boolean;
+  // ── NEW: aggregate telemetry counters ────────────────────────────────────────
+  chaseStartedCount: number;
+  chaseTimedOutCount: number;
+  chaseElapsedMaxMs: number;
+  fallbackEligibleCount: number;
+  fallbackTriggeredCount: number;
+  fallbackBlocked_NO_TIMEOUT: number;
+  fallbackBlocked_IMPULSE_FALSE: number;
+  fallbackBlocked_GATES_FALSE: number;
+  // ── aggregate counters for cross market
+  crossMarketVetoCount: number;
+  crossMarketNeutralCount: number;
+  crossMarketAllowedCount: number;
+  // ── flip tracking for 2-step reversal ──
+  flipDetectedSide: OrchestratorV1Side | null;
+  flipFirstDetectedMs: number | null;
+  flipPersistenceCount: number;
+  // ── reversal telemetry counters ──
+  reversalAttempted: number;
+  reversalBlocked: number;
+  reversalConvertedToExit: number;
+  exitOnFlipCount: number;
 }
 
 export interface OrchestratorV1RuntimeSnapshot {

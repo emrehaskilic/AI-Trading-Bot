@@ -83,6 +83,12 @@ export interface OrchestratorV1SmoothingParams {
   obiWeightedEwmaAlpha: number;
 }
 
+export interface OrchestratorV1CrossMarketParams {
+  enabled: boolean;
+  mode: 'hard_veto' | 'soft_bias';
+  applyTo: string[];
+}
+
 export interface OrchestratorV1Params {
   readiness: OrchestratorV1ReadinessParams;
   atr: OrchestratorV1AtrParams;
@@ -96,6 +102,7 @@ export interface OrchestratorV1Params {
   fallback: OrchestratorV1FallbackParams;
   hysteresis: OrchestratorV1HysteresisParams;
   smoothing: OrchestratorV1SmoothingParams;
+  crossMarket: OrchestratorV1CrossMarketParams;
 }
 
 export const ORCHESTRATOR_V1_PARAMS: OrchestratorV1Params = {
@@ -171,5 +178,10 @@ export const ORCHESTRATOR_V1_PARAMS: OrchestratorV1Params = {
     deltaZEwmaAlpha: 0.30,
     cvdSlopeMedianWindow: 3,
     obiWeightedEwmaAlpha: 0.35,
+  },
+  crossMarket: {
+    enabled: true,
+    mode: 'hard_veto',
+    applyTo: ['ETHUSDT', 'SOLUSDT', 'XRPUSDT'],
   },
 };

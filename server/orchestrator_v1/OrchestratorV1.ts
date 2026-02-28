@@ -2,6 +2,7 @@ import { ORCHESTRATOR_V1_PARAMS, OrchestratorV1Params } from './params';
 import {
   OrchestratorV1AddView,
   OrchestratorV1AtrSource,
+  OrchestratorV1ChaseDebugView,
   OrchestratorV1CvdState,
   OrchestratorV1Decision,
   OrchestratorV1GateView,
@@ -80,13 +81,40 @@ function defaultRuntime(): OrchestratorV1RuntimeState {
     sideFlipEvents5m: [],
     gateTrueEvents5m: [],
     entryIntentEvents5m: [],
+    // ── Chase sticky state ────────────────────────────────────────────────────
+    chaseActive: false,
+    chaseStartTs: null,
+    chaseLastRepriceTs: null,
+    chaseAttempts: 0,
+    chaseTimedOut: false,
+    // ── Aggregate telemetry counters ──────────────────────────────────────────
+    chaseStartedCount: 0,
+    chaseTimedOutCount: 0,
+    chaseElapsedMaxMs: 0,
+    fallbackEligibleCount: 0,
+    fallbackTriggeredCount: 0,
+    fallbackBlocked_NO_TIMEOUT: 0,
+    fallbackBlocked_IMPULSE_FALSE: 0,
+    fallbackBlocked_GATES_FALSE: 0,
+    crossMarketVetoCount: 0,
+    crossMarketNeutralCount: 0,
+    crossMarketAllowedCount: 0,
+    // ── flip tracking for 2-step reversal ──
+    flipDetectedSide: null,
+    flipFirstDetectedMs: null,
+    flipPersistenceCount: 0,
+    // ── reversal telemetry counters ──
+    reversalAttempted: 0,
+    reversalBlocked: 0,
+    reversalConvertedToExit: 0,
+    exitOnFlipCount: 0,
   };
 }
 
 export class OrchestratorV1 {
   private readonly runtime = new Map<string, OrchestratorV1RuntimeState>();
 
-  constructor(private readonly params: OrchestratorV1Params = ORCHESTRATOR_V1_PARAMS) {}
+  constructor(private readonly params: OrchestratorV1Params = ORCHESTRATOR_V1_PARAMS) { }
 
   public evaluate(inputRaw: OrchestratorV1Input): OrchestratorV1Decision {
     const input: OrchestratorV1Input = {
@@ -122,6 +150,10 @@ export class OrchestratorV1 {
       oiChangePct: isFiniteNumber(inputRaw.oiChangePct) ? inputRaw.oiChangePct : null,
       sessionVwapValue: isFiniteNumber(inputRaw.sessionVwapValue) ? inputRaw.sessionVwapValue : null,
       htfH1BarStartMs: isFiniteNumber(inputRaw.htfH1BarStartMs) ? inputRaw.htfH1BarStartMs : null,
+      htfH1SwingLow: isFiniteNumber(inputRaw.htfH1SwingLow) ? inputRaw.htfH1SwingLow : null,
+      htfH1SwingHigh: isFiniteNumber(inputRaw.htfH1SwingHigh) ? inputRaw.htfH1SwingHigh : null,
+      htfH1StructureBreakUp: Boolean(inputRaw.htfH1StructureBreakUp),
+      htfH1StructureBreakDn: Boolean(inputRaw.htfH1StructureBreakDn),
       htfH4BarStartMs: isFiniteNumber(inputRaw.htfH4BarStartMs) ? inputRaw.htfH4BarStartMs : null,
       backfillDone: Boolean(inputRaw.backfillDone),
       barsLoaded1m: Math.max(0, Math.trunc(toNumber(inputRaw.barsLoaded1m, 0))),
@@ -133,10 +165,27 @@ export class OrchestratorV1 {
     runtime.lastAtrSource = input.atrSource;
     this.pruneTelemetry(runtime, input.nowMs);
 
+    // ── P0: Sync runtime from DryRun position (single source of truth) ──
+    const drp = input.dryRunPosition;
+    if (drp && drp.hasPosition && drp.qty > 0 && drp.side) {
+      const drpSide: OrchestratorV1Side = drp.side === 'LONG' ? 'BUY' : 'SELL';
+      runtime.positionQty = drp.qty;
+      runtime.entryVwap = drp.entryPrice;
+      runtime.side = drpSide;
+      runtime.addsUsed = drp.addsUsed;
+    } else if (drp && !drp.hasPosition) {
+      // DryRun says flat → reset orchestrator position tracking
+      runtime.positionQty = 0;
+      runtime.entryVwap = null;
+      // NOTE: do NOT reset runtime.side — micro score still tracks direction
+    }
+
     const smoothed = this.computeSmoothed(input, runtime);
     const isPositionOpen = runtime.positionQty > 0 && runtime.entryVwap != null && runtime.side != null;
     const candidateSide = nextSide(smoothed.deltaZ, smoothed.cvdSlope, input.obiDeep);
-    const sideForEntry = this.resolveSideWithHysteresis(runtime, candidateSide, input.nowMs, isPositionOpen);
+
+    // Pass false for freezeByPosition so we can detect flips in the 2-step state machine
+    const sideForEntry = this.resolveSideWithHysteresis(runtime, candidateSide, input.nowMs, false);
 
     const readinessReasons: string[] = [];
     if (!input.backfillDone) readinessReasons.push('BACKFILL_NOT_DONE');
@@ -149,12 +198,42 @@ export class OrchestratorV1 {
       reasons: readinessReasons,
     };
 
+    const htfLevelState = {
+      price: input.price,
+      h1SwingLow: input.htfH1SwingLow,
+      h1SwingHigh: input.htfH1SwingHigh,
+      h1SBUp: input.htfH1StructureBreakUp,
+      h1SBDn: input.htfH1StructureBreakDn,
+    };
+    let htfVetoed = false;
+    let htfSoftBiasApplied = false;
+    let htfReason: 'H1_STRUCTURE_BREAK_DN' | 'H1_STRUCTURE_BREAK_UP' | 'H1_SWING_BELOW_SOFT' | 'H1_SWING_ABOVE_SOFT' | null = null;
+
+    if (sideForEntry === 'BUY') {
+      if (input.htfH1StructureBreakDn) {
+        htfVetoed = true;
+        htfReason = 'H1_STRUCTURE_BREAK_DN';
+      } else if (input.htfH1SwingLow != null && input.price <= input.htfH1SwingLow) {
+        htfSoftBiasApplied = true;
+        htfReason = 'H1_SWING_BELOW_SOFT';
+      }
+    } else if (sideForEntry === 'SELL') {
+      if (input.htfH1StructureBreakUp) {
+        htfVetoed = true;
+        htfReason = 'H1_STRUCTURE_BREAK_UP';
+      } else if (input.htfH1SwingHigh != null && input.price >= input.htfH1SwingHigh) {
+        htfSoftBiasApplied = true;
+        htfReason = 'H1_SWING_ABOVE_SOFT';
+      }
+    }
+
     const gateAChecks = {
       trendiness: input.trendinessScore >= this.params.gateA.trendinessMin,
       chop: input.chopScore <= this.params.gateA.chopMax,
       volOfVol: input.volOfVol <= this.params.gateA.volOfVolMax,
       spread: input.spreadPct != null && input.spreadPct <= this.params.gateA.spreadPctMax,
       oiDrop: input.oiChangePct == null || input.oiChangePct > this.params.gateA.oiDropBlock,
+      htfLevelAligned: !htfVetoed,
     };
     const gateA = buildGate(
       Object.values(gateAChecks).every(Boolean),
@@ -214,7 +293,141 @@ export class OrchestratorV1 {
     runtime.entryConfirmCount = allGatesRaw && sideForEntry != null
       ? runtime.entryConfirmCount + 1
       : 0;
-    const allGatesPassed = allGatesRaw && runtime.entryConfirmCount >= this.params.hysteresis.entryConfirmations;
+    const targetConfirmations = htfSoftBiasApplied
+      ? this.params.hysteresis.entryConfirmations + 1
+      : this.params.hysteresis.entryConfirmations;
+    const allGatesPassed = allGatesRaw && runtime.entryConfirmCount >= targetConfirmations;
+
+    // ── BTC Cross Market Veto Derivation (P1: anchor-side aware) ──
+    const btcContext = input.btcContext;
+    let btcBias: 'LONG' | 'SHORT' | 'NEUTRAL' = 'NEUTRAL';
+    const checkCrossMarket = this.params.crossMarket && this.params.crossMarket.enabled && this.params.crossMarket.applyTo.includes(symbol);
+
+    if (checkCrossMarket && btcContext) {
+      if (!btcContext.h1BarStartMs || !btcContext.h4BarStartMs) {
+        btcBias = 'NEUTRAL';
+      } else if (btcContext.chop > this.params.gateA.chopMax || btcContext.trendiness < this.params.gateA.trendinessMin) {
+        btcBias = 'NEUTRAL';
+      } else {
+        const h4Up = btcContext.h4StructureUp;
+        const h4Dn = btcContext.h4StructureDn;
+        const h1Up = btcContext.h1StructureUp;
+        const h1Dn = btcContext.h1StructureDn;
+        if (h4Up && h1Up && !h4Dn && !h1Dn) btcBias = 'LONG';
+        else if (h4Dn && h1Dn && !h4Up && !h1Up) btcBias = 'SHORT';
+      }
+    }
+
+    // ── P1: Derive anchorSide — fallback to BTC DryRun position when NEUTRAL ──
+    const btcDrp = input.btcDryRunPosition;
+    const btcHasPosition = Boolean(btcDrp && btcDrp.hasPosition && btcDrp.qty > 0);
+    let anchorSide: 'BUY' | 'SELL' | 'NONE' = 'NONE';
+    let anchorMode: 'BIAS' | 'ANCHOR_POSITION' | 'NONE' = 'NONE';
+
+    if (btcBias === 'LONG') {
+      anchorSide = 'BUY';
+      anchorMode = 'BIAS';
+    } else if (btcBias === 'SHORT') {
+      anchorSide = 'SELL';
+      anchorMode = 'BIAS';
+    } else if (btcBias === 'NEUTRAL' && btcHasPosition && btcDrp) {
+      // NEUTRAL bias but BTC has open position → use position as anchor
+      anchorSide = btcDrp.side === 'LONG' ? 'BUY' : btcDrp.side === 'SHORT' ? 'SELL' : 'NONE';
+      anchorMode = anchorSide !== 'NONE' ? 'ANCHOR_POSITION' : 'NONE';
+    }
+    // else: btcBias=NEUTRAL, BTC flat → anchorSide=NONE, anchorMode=NONE (truly free)
+
+    let isCrossMarketVetoed = false;
+    let crossMarketBlockReason: OrchestratorV1Decision['crossMarketBlockReason'] = null;
+
+    if (checkCrossMarket && sideForEntry) {
+      if (this.params.crossMarket.mode === 'hard_veto' && anchorSide !== 'NONE') {
+        if (anchorSide === 'BUY' && sideForEntry === 'SELL') {
+          isCrossMarketVetoed = true;
+        } else if (anchorSide === 'SELL' && sideForEntry === 'BUY') {
+          isCrossMarketVetoed = true;
+        }
+      }
+
+      if (isCrossMarketVetoed) {
+        crossMarketBlockReason = {
+          refSymbol: 'BTCUSDT',
+          btcBias,
+          anchorSide,
+          anchorMode,
+          candidateSymbol: symbol,
+          candidateSide: sideForEntry,
+          h1BarStartMs: btcContext?.h1BarStartMs ?? null,
+          h4BarStartMs: btcContext?.h4BarStartMs ?? null,
+          h1Up: btcContext?.h1StructureUp ?? false,
+          h1Dn: btcContext?.h1StructureDn ?? false,
+          h4Up: btcContext?.h4StructureUp ?? false,
+          h4Dn: btcContext?.h4StructureDn ?? false,
+          btcHasPosition,
+        };
+      }
+    }
+
+    // ── P2: Side mismatch guard ──
+    // If DryRun has an open position on the OPPOSITE side of sideForEntry,
+    // block entry to prevent hedged/conflicting positions.
+    let isSideMismatchBlocked = false;
+    if (drp && drp.hasPosition && drp.qty > 0 && drp.side && sideForEntry) {
+      const posOrchSide: OrchestratorV1Side = drp.side === 'LONG' ? 'BUY' : 'SELL';
+      if (posOrchSide !== sideForEntry) {
+        isSideMismatchBlocked = true;
+      }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 2-STEP REVERSAL STATE Machine
+    // ══════════════════════════════════════════════════════════════════════
+    // When position is open and candidateSide is opposite: track flip,
+    // convert to EXIT_FLIP after persistence conditions, never direct ENTRY.
+    let isFlipExitTriggered = false;
+    const positionSideAsBuySell: OrchestratorV1Side | null = isPositionOpen && runtime.side ? runtime.side : null;
+
+    if (isPositionOpen && candidateSide && positionSideAsBuySell && candidateSide !== positionSideAsBuySell) {
+      // Opposite side detected while position open
+      if (runtime.flipDetectedSide !== candidateSide) {
+        // New flip direction — reset tracking
+        runtime.flipDetectedSide = candidateSide;
+        runtime.flipFirstDetectedMs = input.nowMs;
+        runtime.flipPersistenceCount = 1;
+      } else {
+        // Same flip direction — increment persistence
+        runtime.flipPersistenceCount += 1;
+      }
+
+      const flipElapsedMs = runtime.flipFirstDetectedMs != null
+        ? Math.max(0, input.nowMs - runtime.flipFirstDetectedMs)
+        : 0;
+      const flipIntervalMet = flipElapsedMs >= this.params.hysteresis.minFlipIntervalMs;
+      const flipConfirmMet = runtime.flipPersistenceCount >= this.params.hysteresis.entryConfirmations;
+
+      if (flipIntervalMet && flipConfirmMet) {
+        // Persistence conditions met → convert to EXIT_FLIP
+        isFlipExitTriggered = true;
+        runtime.reversalConvertedToExit += 1;
+      } else {
+        // Not yet persistent → block, count as reversalBlocked
+        runtime.reversalBlocked += 1;
+      }
+    } else if (isPositionOpen) {
+      // Side matches or no candidate → reset flip tracking
+      runtime.flipDetectedSide = null;
+      runtime.flipFirstDetectedMs = null;
+      runtime.flipPersistenceCount = 0;
+    } else if (!isPositionOpen) {
+      // Position flat → reset flip tracking, allow normal entry
+      if (runtime.flipDetectedSide != null) {
+        // Was tracking a flip, now flat → this is the re-entry opportunity
+        runtime.reversalAttempted += 1;
+      }
+      runtime.flipDetectedSide = null;
+      runtime.flipFirstDetectedMs = null;
+      runtime.flipPersistenceCount = 0;
+    }
 
     const orders: OrchestratorV1Order[] = [];
     const chaseMaxMs = this.params.entry.chaseMaxSeconds * 1000;
@@ -230,17 +443,17 @@ export class OrchestratorV1 {
     let exitRiskTriggeredThisTick = false;
     let exitRiskReason: 'REGIME' | 'FLOW_FLIP' | 'INTEGRITY' | null = null;
     const exitRiskEval = this.evaluateExitRisk(input, runtime);
-    if (isPositionOpen && exitRiskEval.triggered) {
-      intent = 'EXIT_RISK';
-      exitRiskReason = exitRiskEval.reason;
+
+    // ── EXIT_FLIP takes priority over normal exit risk ──
+    if (isFlipExitTriggered) {
+      intent = 'EXIT_FLIP';
+      runtime.exitOnFlipCount += 1;
+      // Use the exit risk machinery to close the position
       if (!runtime.exitRiskActive) {
         runtime.exitRiskActive = true;
         runtime.exitMakerAttempts = 0;
         runtime.exitTakerUsed = false;
-        runtime.exitRiskTriggeredCount += 1;
-        exitRiskTriggeredThisTick = true;
       }
-
       if (runtime.exitMakerAttempts < this.params.exitRisk.makerAttempts) {
         runtime.exitMakerAttempts += 1;
         orders.push(this.buildExitMakerOrder(input, runtime, runtime.exitMakerAttempts));
@@ -251,78 +464,218 @@ export class OrchestratorV1 {
       }
       runtime.active = false;
     } else {
-      if (runtime.exitRiskActive) {
-        runtime.exitRiskActive = false;
-        runtime.exitMakerAttempts = 0;
-        runtime.exitTakerUsed = false;
-      }
 
-      if (isPositionOpen) {
-        addView = this.evaluateAdd(input, runtime, gateA, smoothed);
-        if (addView.triggered && addView.step != null && runtime.side) {
-          const addQty = addView.step === 1
-            ? runtime.baseQty * this.params.add.add1QtyFactor
-            : runtime.baseQty * this.params.add.add2QtyFactor;
-          const prevQty = runtime.positionQty;
-          runtime.positionQty = prevQty + addQty;
-          runtime.entryVwap = this.weightedAverage(
-            runtime.entryVwap || input.price,
-            prevQty,
-            input.price,
-            addQty
-          );
-          runtime.addsUsed = addView.step;
-          runtime.lastAddTs = input.nowMs;
-          orders.push(this.buildAddOrder(input, runtime.side, addView.step, addQty));
-          intent = 'ADD';
+      if (isPositionOpen && exitRiskEval.triggered) {
+        intent = 'EXIT_RISK';
+        exitRiskReason = exitRiskEval.reason;
+        if (!runtime.exitRiskActive) {
+          runtime.exitRiskActive = true;
+          runtime.exitMakerAttempts = 0;
+          runtime.exitTakerUsed = false;
+          runtime.exitRiskTriggeredCount += 1;
+          exitRiskTriggeredThisTick = true;
         }
-      } else if (runtime.active) {
-        const startedAt = runtime.startedAtMs || input.nowMs;
-        const elapsedMs = Math.max(0, input.nowMs - startedAt);
-        const expiredByTime = elapsedMs >= chaseMaxMs;
-        const expiredByReprices = runtime.repricesUsed >= this.params.entry.maxReprices;
-        const canReprice = !expiredByTime
-          && !expiredByReprices
-          && (runtime.lastRepriceAtMs == null || (input.nowMs - runtime.lastRepriceAtMs) >= this.params.entry.repriceMs);
 
-        if (allGatesPassed && canReprice && runtime.side) {
-          runtime.repricesUsed += 1;
-          runtime.lastRepriceAtMs = input.nowMs;
-          orders.push(...this.buildMakerOrders(input, runtime.side, runtime.repricesUsed, runtime.baseQty));
-          intent = 'ENTRY';
-        } else if (allGatesPassed && impulse.passed && !runtime.takerFallbackUsed && (expiredByTime || expiredByReprices) && runtime.side) {
-          runtime.takerFallbackUsed = true;
-          runtime.active = false;
-          runtime.cooldownUntilMs = input.nowMs + this.params.entry.cooldownMs;
-          runtime.cooldownUntilTs = runtime.cooldownUntilMs;
-          const fallbackQty = runtime.baseQty * this.params.fallback.maxNotionalPct;
-          orders.push(this.buildTakerFallbackOrder(runtime.side, runtime.repricesUsed, fallbackQty));
-          runtime.positionQty = runtime.baseQty;
-          runtime.entryVwap = input.price;
-          runtime.addsUsed = 0;
-          runtime.lastAddTs = null;
-          intent = 'ENTRY';
-        } else if (expiredByTime || expiredByReprices || !allGatesPassed) {
-          runtime.active = false;
-          runtime.cooldownUntilMs = input.nowMs + this.params.entry.cooldownMs;
-          runtime.cooldownUntilTs = runtime.cooldownUntilMs;
+        if (runtime.exitMakerAttempts < this.params.exitRisk.makerAttempts) {
+          runtime.exitMakerAttempts += 1;
+          orders.push(this.buildExitMakerOrder(input, runtime, runtime.exitMakerAttempts));
+        } else if (!runtime.exitTakerUsed) {
+          runtime.exitTakerUsed = true;
+          orders.push(this.buildExitTakerOrder(runtime));
+          this.closePosition(runtime, input.nowMs);
         }
+        runtime.active = false;
       } else {
-        const readyAfterCooldown = input.nowMs >= Math.max(runtime.cooldownUntilMs, runtime.cooldownUntilTs);
-        const canEnter = allGatesPassed && sideForEntry != null && readyAfterCooldown;
-        if (canEnter && sideForEntry) {
-          runtime.active = true;
-          runtime.side = sideForEntry;
-          runtime.baseQty = Math.max(this.params.entry.baseQty, this.params.atr.minAtr);
-          runtime.startedAtMs = input.nowMs;
-          runtime.lastRepriceAtMs = input.nowMs;
-          runtime.repricesUsed = 0;
-          runtime.takerFallbackUsed = false;
-          orders.push(...this.buildMakerOrders(input, sideForEntry, 0, runtime.baseQty));
-          intent = 'ENTRY';
+        if (runtime.exitRiskActive) {
+          runtime.exitRiskActive = false;
+          runtime.exitMakerAttempts = 0;
+          runtime.exitTakerUsed = false;
+        }
+
+        if (isPositionOpen) {
+          addView = this.evaluateAdd(input, runtime, gateA, smoothed);
+          if (addView.triggered && addView.step != null && runtime.side) {
+            const addQty = addView.step === 1
+              ? runtime.baseQty * this.params.add.add1QtyFactor
+              : runtime.baseQty * this.params.add.add2QtyFactor;
+            const prevQty = runtime.positionQty;
+            runtime.positionQty = prevQty + addQty;
+            runtime.entryVwap = this.weightedAverage(
+              runtime.entryVwap || input.price,
+              prevQty,
+              input.price,
+              addQty
+            );
+            runtime.addsUsed = addView.step;
+            runtime.lastAddTs = input.nowMs;
+            orders.push(this.buildAddOrder(input, runtime.side, addView.step, addQty));
+            intent = 'ADD';
+          }
+        } else if (runtime.active) {
+          // ════════════════════════════════════════════════════════════════════
+          // CHASE STATE MACHINE (with sticky startTs)
+          // ════════════════════════════════════════════════════════════════════
+
+          // 1.4 ── Timeout check (INDEPENDENT of fill / reprice)
+          const chaseElapsedMs = runtime.chaseStartTs != null
+            ? Math.max(0, input.nowMs - runtime.chaseStartTs)
+            : 0;
+
+          // Track max elapsed
+          if (chaseElapsedMs > runtime.chaseElapsedMaxMs) {
+            runtime.chaseElapsedMaxMs = chaseElapsedMs;
+          }
+
+          const expiredByTime = chaseElapsedMs >= chaseMaxMs;
+          const expiredByReprices = runtime.repricesUsed >= this.params.entry.maxReprices;
+
+          if (expiredByTime && !runtime.chaseTimedOut) {
+            // ── Fire TIMEOUT exactly once ──────────────────────────────────
+            runtime.chaseTimedOut = true;
+            runtime.chaseActive = false;
+            runtime.chaseTimedOutCount += 1;
+
+            // ── 2.2 Fallback eligibility ──────────────────────────────────
+            const gates = allGatesRaw; // use raw (not confirm-count gated) for fallback
+            const fallbackEligible = impulse.passed && gates;
+
+            if (fallbackEligible) {
+              runtime.fallbackEligibleCount += 1;
+
+              // ── 2.3 Trigger fallback (<= 25%) ─────────────────────────
+              if (!runtime.takerFallbackUsed && runtime.side) {
+                runtime.takerFallbackUsed = true;
+                runtime.active = false;
+                runtime.cooldownUntilMs = input.nowMs + this.params.entry.cooldownMs;
+                runtime.cooldownUntilTs = runtime.cooldownUntilMs;
+
+                // Guarantee <= 25%
+                const fallbackNotionalPct = Math.min(this.params.fallback.maxNotionalPct, 0.25);
+                const fallbackQty = runtime.baseQty * fallbackNotionalPct;
+
+                orders.push(this.buildTakerFallbackOrder(runtime.side, runtime.repricesUsed, fallbackQty, fallbackNotionalPct));
+                runtime.positionQty = runtime.baseQty;
+                runtime.entryVwap = input.price;
+                runtime.addsUsed = 0;
+                runtime.lastAddTs = null;
+                runtime.fallbackTriggeredCount += 1;
+                intent = 'ENTRY';
+              }
+            } else {
+              // Not eligible — record blocked reason
+              if (!impulse.passed) {
+                runtime.fallbackBlocked_IMPULSE_FALSE += 1;
+              } else {
+                runtime.fallbackBlocked_GATES_FALSE += 1;
+              }
+              // Deactivate chase, go to cooldown
+              runtime.active = false;
+              runtime.cooldownUntilMs = input.nowMs + this.params.entry.cooldownMs;
+              runtime.cooldownUntilTs = runtime.cooldownUntilMs;
+            }
+          } else if (!expiredByTime) {
+            // ── Still within chase window: reprice if possible ───────────
+            const canReprice = !expiredByReprices
+              && (runtime.chaseLastRepriceTs == null
+                || (input.nowMs - runtime.chaseLastRepriceTs) >= this.params.entry.repriceMs);
+
+            if (allGatesPassed && canReprice && runtime.side && !isCrossMarketVetoed) {
+              runtime.repricesUsed += 1;
+              runtime.chaseAttempts += 1;
+              // NOTE: chaseLastRepriceTs updates, but chaseStartTs NEVER changes (sticky)
+              runtime.chaseLastRepriceTs = input.nowMs;
+              runtime.lastRepriceAtMs = input.nowMs;
+              orders.push(...this.buildMakerOrders(input, runtime.side, runtime.repricesUsed, runtime.baseQty));
+              intent = 'ENTRY';
+            } else if (expiredByReprices && !runtime.chaseTimedOut) {
+              // Max reprices hit before time: treat like timeout for fallback path
+              runtime.chaseTimedOut = true;
+              runtime.chaseActive = false;
+              runtime.chaseTimedOutCount += 1;
+
+              const gates = allGatesRaw;
+              const fallbackEligible = impulse.passed && gates;
+
+              if (fallbackEligible) {
+                runtime.fallbackEligibleCount += 1;
+                if (!runtime.takerFallbackUsed && runtime.side) {
+                  runtime.takerFallbackUsed = true;
+                  runtime.active = false;
+                  runtime.cooldownUntilMs = input.nowMs + this.params.entry.cooldownMs;
+                  runtime.cooldownUntilTs = runtime.cooldownUntilMs;
+                  const fallbackNotionalPct = Math.min(this.params.fallback.maxNotionalPct, 0.25);
+                  const fallbackQty = runtime.baseQty * fallbackNotionalPct;
+                  orders.push(this.buildTakerFallbackOrder(runtime.side, runtime.repricesUsed, fallbackQty, fallbackNotionalPct));
+                  runtime.positionQty = runtime.baseQty;
+                  runtime.entryVwap = input.price;
+                  runtime.addsUsed = 0;
+                  runtime.lastAddTs = null;
+                  runtime.fallbackTriggeredCount += 1;
+                  intent = 'ENTRY';
+                }
+              } else {
+                if (!impulse.passed) {
+                  runtime.fallbackBlocked_IMPULSE_FALSE += 1;
+                } else {
+                  runtime.fallbackBlocked_GATES_FALSE += 1;
+                }
+                runtime.active = false;
+                runtime.cooldownUntilMs = input.nowMs + this.params.entry.cooldownMs;
+                runtime.cooldownUntilTs = runtime.cooldownUntilMs;
+              }
+            } else if (!allGatesPassed || isCrossMarketVetoed) {
+              // Gates dropped or vetoed while chasing: abort chase
+              runtime.active = false;
+              runtime.chaseActive = false;
+              runtime.cooldownUntilMs = input.nowMs + this.params.entry.cooldownMs;
+              runtime.cooldownUntilTs = runtime.cooldownUntilMs;
+            }
+          }
+          // if expiredByTime && chaseTimedOut already → do nothing (fallback path already executed)
+
+        } else {
+          // ── NEW CHASE: idle state, try to start ──────────────────────────
+          const readyAfterCooldown = input.nowMs >= Math.max(runtime.cooldownUntilMs, runtime.cooldownUntilTs);
+          const canEnterRaw = allGatesPassed && sideForEntry != null && readyAfterCooldown;
+          const canEnter = canEnterRaw && !isCrossMarketVetoed && !isSideMismatchBlocked;
+
+          // Telemetry
+          if (canEnterRaw && checkCrossMarket && sideForEntry) {
+            if (isCrossMarketVetoed) {
+              runtime.crossMarketVetoCount += 1;
+            } else if (btcBias === 'NEUTRAL') {
+              runtime.crossMarketNeutralCount += 1;
+            } else {
+              runtime.crossMarketAllowedCount += 1;
+            }
+          }
+
+          if (canEnter && sideForEntry) {
+            runtime.active = true;
+
+            // 1.2 ── Start chase (sticky: only set chaseStartTs on false→true)
+            if (!runtime.chaseActive) {
+              runtime.chaseActive = true;
+              runtime.chaseStartTs = input.nowMs;         // STICKY – never reset during reprice
+              runtime.chaseAttempts = 0;
+              runtime.chaseTimedOut = false;
+              runtime.chaseLastRepriceTs = input.nowMs;
+              runtime.chaseStartedCount += 1;
+            }
+
+            runtime.side = sideForEntry;
+            runtime.baseQty = Math.max(this.params.entry.baseQty, this.params.atr.minAtr);
+            runtime.startedAtMs = input.nowMs;
+            runtime.lastRepriceAtMs = input.nowMs;
+            runtime.repricesUsed = 0;
+            runtime.takerFallbackUsed = false;
+            orders.push(...this.buildMakerOrders(input, sideForEntry, 0, runtime.baseQty));
+            intent = 'ENTRY';
+          }
         }
       }
-    }
+
+    } // end of `else` block for isFlipExitTriggered
 
     if (intent === 'ENTRY') {
       this.pushWindowEvent(runtime.entryIntentEvents5m, input.nowMs);
@@ -338,6 +691,30 @@ export class OrchestratorV1 {
     const sideFlipCount5m = runtime.sideFlipEvents5m.length;
     const allGatesTrueCount5m = runtime.gateTrueEvents5m.length;
     const entryIntentCount5m = runtime.entryIntentEvents5m.length;
+
+    // ── Compute chase debug view for this tick ────────────────────────────────
+    const nowChaseElapsedMs = runtime.chaseStartTs != null
+      ? Math.max(0, input.nowMs - runtime.chaseStartTs)
+      : 0;
+
+    let fallbackBlockedReason: OrchestratorV1ChaseDebugView['fallbackBlockedReason'] = 'NONE';
+    if (!runtime.chaseTimedOut && !runtime.active) {
+      fallbackBlockedReason = 'NO_TIMEOUT';
+    } else if (runtime.chaseTimedOut && !runtime.takerFallbackUsed) {
+      if (!impulse.passed) fallbackBlockedReason = 'IMPULSE_FALSE';
+      else fallbackBlockedReason = 'GATES_FALSE';
+    }
+
+    const chaseDebug: OrchestratorV1ChaseDebugView = {
+      chaseActive: runtime.chaseActive,
+      chaseStartTs: runtime.chaseStartTs,
+      chaseElapsedMs: nowChaseElapsedMs,
+      chaseAttempts: runtime.chaseAttempts,
+      chaseTimedOut: runtime.chaseTimedOut,
+      impulse: impulse.passed,
+      fallbackEligible: runtime.chaseTimedOut && impulse.passed && allGatesRaw,
+      fallbackBlockedReason,
+    };
 
     return {
       symbol,
@@ -373,18 +750,20 @@ export class OrchestratorV1 {
       chase: {
         active: runtime.active,
         startedAtMs: runtime.startedAtMs,
-        expiresAtMs: runtime.startedAtMs != null ? runtime.startedAtMs + chaseMaxMs : null,
+        expiresAtMs: runtime.chaseStartTs != null ? runtime.chaseStartTs + chaseMaxMs : null,
         repriceMs: this.params.entry.repriceMs,
         maxReprices: this.params.entry.maxReprices,
         repricesUsed: runtime.repricesUsed,
         chaseMaxSeconds: this.params.entry.chaseMaxSeconds,
         ttlMs: this.params.entry.ttlMs,
       },
+      chaseDebug,
+      crossMarketBlockReason,
       telemetry: {
-        sideFlipCount5m,
-        sideFlipPerMin: Number((sideFlipCount5m / 5).toFixed(4)),
-        allGatesTrueCount5m,
-        entryIntentCount5m,
+        sideFlipCount5m: runtime.sideFlipEvents5m.length,
+        sideFlipPerMin: Number((runtime.sideFlipEvents5m.length / 5).toFixed(4)),
+        allGatesTrueCount5m: runtime.gateTrueEvents5m.length,
+        entryIntentCount5m: runtime.entryIntentEvents5m.length,
         smoothed: {
           deltaZ: smoothed.deltaZ,
           cvdSlope: smoothed.cvdSlope,
@@ -395,10 +774,45 @@ export class OrchestratorV1 {
           confirmCountShort: runtime.confirmCountShort,
           entryConfirmCount: runtime.entryConfirmCount,
         },
+        chase: {
+          chaseStartedCount: runtime.chaseStartedCount,
+          chaseTimedOutCount: runtime.chaseTimedOutCount,
+          chaseElapsedMaxMs: runtime.chaseElapsedMaxMs,
+          fallbackEligibleCount: runtime.fallbackEligibleCount,
+          fallbackTriggeredCount: runtime.fallbackTriggeredCount,
+          fallbackBlocked_NO_TIMEOUT: runtime.fallbackBlocked_NO_TIMEOUT,
+          fallbackBlocked_IMPULSE_FALSE: runtime.fallbackBlocked_IMPULSE_FALSE,
+          fallbackBlocked_GATES_FALSE: runtime.fallbackBlocked_GATES_FALSE,
+        },
+        crossMarket: {
+          crossMarketVetoCount: runtime.crossMarketVetoCount,
+          crossMarketNeutralCount: runtime.crossMarketNeutralCount,
+          crossMarketAllowedCount: runtime.crossMarketAllowedCount,
+          anchorSide,
+          anchorMode,
+          btcHasPosition,
+        },
+        reversal: {
+          reversalAttempted: runtime.reversalAttempted,
+          reversalBlocked: runtime.reversalBlocked,
+          reversalConvertedToExit: runtime.reversalConvertedToExit,
+          exitOnFlipCount: runtime.exitOnFlipCount,
+          currentPositionSide: positionSideAsBuySell,
+          sideCandidate: sideForEntry,
+          flipPersistenceCount: runtime.flipPersistenceCount,
+          flipFirstDetectedMs: runtime.flipFirstDetectedMs,
+          minFlipIntervalMs: this.params.hysteresis.minFlipIntervalMs,
+          entryConfirmations: this.params.hysteresis.entryConfirmations,
+        },
+        htf: {
+          ...htfLevelState,
+          vetoed: htfVetoed,
+          softBiasApplied: htfSoftBiasApplied,
+          reason: htfReason,
+        },
       },
     };
   }
-
   public seedPosition(symbolRaw: string, side: OrchestratorV1Side, entryVwap: number, baseQty = 1): void {
     const symbol = String(symbolRaw || '').toUpperCase();
     const runtime = this.getRuntime(symbol);
@@ -425,6 +839,12 @@ export class OrchestratorV1 {
     runtime.gateTrueEvents5m = [];
     runtime.entryIntentEvents5m = [];
     runtime.lastSideChangeTs = null;
+    // Chase state reset
+    runtime.chaseActive = false;
+    runtime.chaseStartTs = null;
+    runtime.chaseLastRepriceTs = null;
+    runtime.chaseAttempts = 0;
+    runtime.chaseTimedOut = false;
     this.runtime.set(symbol, runtime);
   }
 
@@ -667,6 +1087,12 @@ export class OrchestratorV1 {
     runtime.entryConfirmCount = 0;
     runtime.confirmCountLong = 0;
     runtime.confirmCountShort = 0;
+    // Chase state reset on position close
+    runtime.chaseActive = false;
+    runtime.chaseStartTs = null;
+    runtime.chaseLastRepriceTs = null;
+    runtime.chaseAttempts = 0;
+    runtime.chaseTimedOut = false;
   }
 
   private buildMakerOrders(input: OrchestratorV1Input, side: OrchestratorV1Side, repriceAttempt: number, baseQty: number): OrchestratorV1Order[] {
@@ -755,13 +1181,13 @@ export class OrchestratorV1 {
     };
   }
 
-  private buildTakerFallbackOrder(side: OrchestratorV1Side, repriceAttempt: number, qty: number): OrchestratorV1Order {
+  private buildTakerFallbackOrder(side: OrchestratorV1Side, repriceAttempt: number, qty: number, notionalPct: number): OrchestratorV1Order {
     return {
       id: `fallback-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
       kind: 'TAKER_ENTRY_FALLBACK',
       side,
       qty,
-      notionalPct: this.params.fallback.maxNotionalPct,
+      notionalPct,
       price: null,
       postOnly: false,
       ttlMs: this.params.entry.ttlMs,

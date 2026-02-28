@@ -1630,6 +1630,17 @@ function defaultOrchestratorDecision(symbol: string, nowMs: number): Orchestrato
             chaseMaxSeconds: 0,
             ttlMs: 0,
         },
+        chaseDebug: {
+            chaseActive: false,
+            chaseStartTs: null,
+            chaseElapsedMs: 0,
+            chaseAttempts: 0,
+            chaseTimedOut: false,
+            impulse: false,
+            fallbackEligible: false,
+            fallbackBlockedReason: 'NO_TIMEOUT' as const,
+        },
+        crossMarketBlockReason: null,
         telemetry: {
             sideFlipCount5m: 0,
             sideFlipPerMin: 0,
@@ -1644,6 +1655,46 @@ function defaultOrchestratorDecision(symbol: string, nowMs: number): Orchestrato
                 confirmCountLong: 0,
                 confirmCountShort: 0,
                 entryConfirmCount: 0,
+            },
+            chase: {
+                chaseStartedCount: 0,
+                chaseTimedOutCount: 0,
+                chaseElapsedMaxMs: 0,
+                fallbackEligibleCount: 0,
+                fallbackTriggeredCount: 0,
+                fallbackBlocked_NO_TIMEOUT: 0,
+                fallbackBlocked_IMPULSE_FALSE: 0,
+                fallbackBlocked_GATES_FALSE: 0,
+            },
+            crossMarket: {
+                crossMarketVetoCount: 0,
+                crossMarketNeutralCount: 0,
+                crossMarketAllowedCount: 0,
+                anchorSide: 'NONE' as const,
+                anchorMode: 'NONE' as const,
+                btcHasPosition: false,
+            },
+            reversal: {
+                reversalAttempted: 0,
+                reversalBlocked: 0,
+                reversalConvertedToExit: 0,
+                exitOnFlipCount: 0,
+                currentPositionSide: null,
+                sideCandidate: null,
+                flipPersistenceCount: 0,
+                flipFirstDetectedMs: null,
+                minFlipIntervalMs: 0,
+                entryConfirmations: 0,
+            },
+            htf: {
+                price: 0,
+                h1SwingLow: null,
+                h1SwingHigh: null,
+                h1SBUp: false,
+                h1SBDn: false,
+                vetoed: false,
+                softBiasApplied: false,
+                reason: null,
             },
         },
     };
@@ -1665,14 +1716,18 @@ function buildDecisionViewFromOrchestrator(decision: OrchestratorV1Decision, now
         ? (decision.readiness.reasons[0] || decision.gateA.reason || decision.gateB.reason || decision.gateC.reason || 'HOLD')
         : decision.intent === 'EXIT_RISK'
             ? (decision.exitRisk.reason || 'EXIT_RISK')
-            : null;
+            : decision.intent === 'EXIT_FLIP'
+                ? 'EXIT_FLIP'
+                : null;
     const reasonTag = decision.intent === 'ENTRY'
         ? 'ORCHESTRATOR_V1_ENTRY'
         : decision.intent === 'ADD'
             ? `ORCHESTRATOR_V1_ADD_${decision.add.step ?? 'NA'}`
             : decision.intent === 'EXIT_RISK'
                 ? `ORCHESTRATOR_V1_EXIT_${decision.exitRisk.reason || 'RISK'}`
-                : (decision.readiness.reasons[0] || 'ORCHESTRATOR_V1_HOLD');
+                : decision.intent === 'EXIT_FLIP'
+                    ? 'ORCHESTRATOR_V1_EXIT_FLIP'
+                    : (decision.readiness.reasons[0] || 'ORCHESTRATOR_V1_HOLD');
 
     return {
         aiTrend: {
@@ -1716,6 +1771,40 @@ function applyOrchestratorOrders(symbol: string, decision: OrchestratorV1Decisio
     if (decision.exitRisk.triggeredThisTick) {
         decisionRuntimeStats.exitRiskTriggeredCount += 1;
     }
+
+    // ── Dry Run integration: forward OrchestratorV1 decisions to dryRunSession ──
+    const isDryRunTracked = dryRunSession.isTrackingSymbol(symbol);
+    if (isDryRunTracked && (decision.intent === 'ENTRY' || decision.intent === 'ADD' || decision.intent === 'EXIT_RISK' || decision.intent === 'EXIT_FLIP')) {
+        const currentPos = dryRunSession.getStrategyPosition(symbol);
+        if (decision.intent === 'ENTRY' && decision.side) {
+            const signalType = decision.side === 'BUY' ? 'ENTRY_LONG' : 'ENTRY_SHORT';
+            dryRunSession.submitStrategySignal(symbol, {
+                signal: signalType,
+                score: 100,
+                vetoReason: null,
+                candidate: null,
+            }, decision.timestampMs);
+        } else if (decision.intent === 'ADD' && decision.side) {
+            const signalType = decision.side === 'BUY' ? 'ENTRY_LONG' : 'ENTRY_SHORT';
+            dryRunSession.submitStrategySignal(symbol, {
+                signal: signalType,
+                score: 80,
+                vetoReason: null,
+                candidate: null,
+            }, decision.timestampMs);
+        } else if ((decision.intent === 'EXIT_RISK' || decision.intent === 'EXIT_FLIP') && currentPos) {
+            if (currentPos.side === 'LONG' || currentPos.side === 'SHORT') {
+                const exitSignal = currentPos.side === 'LONG' ? 'ENTRY_SHORT' : 'ENTRY_LONG';
+                dryRunSession.submitStrategySignal(symbol, {
+                    signal: exitSignal,
+                    score: 0,
+                    vetoReason: null,
+                    candidate: null,
+                }, decision.timestampMs);
+            }
+        }
+    }
+
     if (!decision || !Array.isArray(decision.orders) || decision.orders.length === 0) {
         return;
     }
@@ -1902,7 +1991,50 @@ function broadcastMetrics(
             : 'NEUTRAL';
     let orchestratorV1Decision: OrchestratorV1Decision | null = null;
     if (DECISION_MODE === 'orchestrator_v1') {
-        decisionRuntimeStats.orchestratorEvaluations += 1;
+        let btcContext: any = null;
+        if (s !== 'BTCUSDT' && ENABLE_CROSS_MARKET_CONFIRMATION) {
+            try {
+                const btcHtf = getHtfMonitor('BTCUSDT').getSnapshot();
+                const btcAdvanced = advancedMicroMap.get('BTCUSDT')?.getMetrics(now);
+                if (btcHtf && btcAdvanced?.regimeMetrics) {
+                    btcContext = {
+                        h1BarStartMs: Number.isFinite(btcHtf.h1?.barStartMs) ? Number(btcHtf.h1?.barStartMs) : null,
+                        h4BarStartMs: Number.isFinite(btcHtf.h4?.barStartMs) ? Number(btcHtf.h4?.barStartMs) : null,
+                        h1StructureUp: Boolean(btcHtf.h1?.structureBreakUp),
+                        h1StructureDn: Boolean(btcHtf.h1?.structureBreakDn),
+                        h4StructureUp: Boolean(btcHtf.h4?.structureBreakUp),
+                        h4StructureDn: Boolean(btcHtf.h4?.structureBreakDn),
+                        trendiness: Number(btcAdvanced.regimeMetrics.trendinessScore || 0),
+                        chop: Number(btcAdvanced.regimeMetrics.chopScore || 0),
+                    };
+                }
+            } catch (err) {
+                // Ignore btc context derivation error
+            }
+        }
+
+        // ── P0: Build dryRunPosition snapshot for this symbol ──
+        const buildDrpSnapshot = (sym: string) => {
+            const pos = dryRunSession.getStrategyPosition(sym);
+            if (!pos || !pos.side || !(Number(pos.qty) > 0)) {
+                return { hasPosition: false, side: null, qty: 0, entryPrice: 0, notional: 0, addsUsed: 0 };
+            }
+            const refPrice = Number(pos.entryPrice) || 0;
+            return {
+                hasPosition: true,
+                side: pos.side as 'LONG' | 'SHORT',
+                qty: Number(pos.qty),
+                entryPrice: refPrice,
+                notional: Number(pos.qty) * refPrice,
+                addsUsed: Number(pos.addsUsed || 0),
+            };
+        };
+
+        const dryRunPosition = dryRunSession.isTrackingSymbol(s) ? buildDrpSnapshot(s) : null;
+        const btcDryRunPosition = (s !== 'BTCUSDT' && dryRunSession.isTrackingSymbol('BTCUSDT'))
+            ? buildDrpSnapshot('BTCUSDT')
+            : null;
+
         orchestratorV1Decision = orchestratorV1.evaluate({
             symbol: s,
             nowMs: Number(eventTimeMs || now),
@@ -1926,9 +2058,16 @@ function broadcastMetrics(
             oiChangePct: Number.isFinite(Number(resolvedOpenInterest.oiChangePct)) ? Number(resolvedOpenInterest.oiChangePct) : null,
             sessionVwapValue: Number.isFinite(Number(sessionVwap?.value)) ? Number(sessionVwap?.value) : null,
             htfH1BarStartMs: Number.isFinite(Number(htfSnapshot?.h1?.barStartMs)) ? Number(htfSnapshot?.h1?.barStartMs) : null,
+            htfH1SwingLow: Number.isFinite(Number(htfSnapshot?.h1?.lastSwingLow)) ? Number(htfSnapshot?.h1?.lastSwingLow) : null,
+            htfH1SwingHigh: Number.isFinite(Number(htfSnapshot?.h1?.lastSwingHigh)) ? Number(htfSnapshot?.h1?.lastSwingHigh) : null,
+            htfH1StructureBreakUp: Boolean(htfSnapshot?.h1?.structureBreakUp),
+            htfH1StructureBreakDn: Boolean(htfSnapshot?.h1?.structureBreakDn),
             htfH4BarStartMs: Number.isFinite(Number(htfSnapshot?.h4?.barStartMs)) ? Number(htfSnapshot?.h4?.barStartMs) : null,
             backfillDone: bootstrapSnapshot.backfillDone,
             barsLoaded1m: bootstrapSnapshot.barsLoaded1m,
+            btcContext,
+            dryRunPosition,
+            btcDryRunPosition,
         });
     }
     const resolvedOrchestratorDecision = orchestratorV1Decision || defaultOrchestratorDecision(s, now);
@@ -2013,6 +2152,7 @@ function broadcastMetrics(
             position: resolvedOrchestratorDecision.position,
             orders: resolvedOrchestratorDecision.orders,
             chase: resolvedOrchestratorDecision.chase,
+            chaseDebug: resolvedOrchestratorDecision.chaseDebug,
             telemetry: resolvedOrchestratorDecision.telemetry,
             debug: orchestratorDebug,
         } : null,

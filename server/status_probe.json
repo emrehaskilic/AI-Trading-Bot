@@ -1,0 +1,38 @@
+{
+  "summary": {
+    "totalEquity": 21479.6664277,
+    "walletBalance": 19967.30593947,
+    "unrealizedPnl": 1512.36048823,
+    "realizedPnl": 0,
+    "feePaid": 21.31067746,
+    "fundingPnl": -11.38338307,
+    "marginHealth": 0.98497201,
+    "performance": {
+      "totalPnL": 1479.9477677,
+      "winCount": 0,
+      "lossCount": 0,
+      "totalTrades": 0,
+      "winRate": 0,
+      "maxDrawdown": 478.65346427999793,
+      "sharpeRatio": -0.19097462778295954,
+      "pnlCurve": []
+    }
+  },
+  "config": {
+    "walletBalanceStartUsdt": 5000,
+    "initialMarginUsdt": 1000,
+    "leverage": 33,
+    "makerFeeRate": 0.0002,
+    "takerFeeRate": 0.0004,
+    "maintenanceMarginRate": 0.005,
+    "fundingIntervalMs": 28800000,
+    "heartbeatIntervalMs": 10000,
+    "debugAggressiveEntry": false
+  },
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "XRPUSDT"
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "symbol": "BTCUSDT",
+  "metrics": {
+    "markPrice": 63610.35,
+    "totalEquity": 5465.73593457,
+    "walletBalance": 4993.65090408,
+    "unrealizedPnl": 472.08503049,
+    "realizedPnl": 0,
+    "feePaid": 6.59551579,
+    "fundingPnl": 0.24641987,
+    "marginHealth": 0.98534808
+  },
+  "performance": {
+    "totalPnL": 462.9662005747032,
+    "winCount": 0,
+    "lossCount": 0,
+    "totalTrades": 0,
+    "winRate": 0,
+    "maxDrawdown": 312.24973939999927,
+    "sharpeRatio": -0.1450208051554062
+  },
+  "risk": {
+    "winStreak": 0,
+    "lossStreak": 0,
+    "dynamicLeverage": 33,
+    "stopLossPrice": 63044.245714,
+    "liquidationRisk": {
+      "score": "GREEN",
+      "timeToLiquidationMs": 703820,
+      "fundingRateImpact": 0.1209
+    }
+  },
+  "position": {
+    "side": "SHORT",
+    "qty": 0.251794,
+    "notionalUsdt": 16016.7044679,
+    "entryPrice": 65485.23594047,
+    "breakEvenPrice": 65433.84696399,
+    "markPrice": 63610.35,
+    "unrealizedPnl": 472.08503049,
+    "realizedPnl": 0,
+    "netPnl": 465.73593457,
+    "liqPrice": null
+  },
+  "openLimitOrders": [],
+  "lastEventTimestampMs": 1772272800839,
+  "eventCount": 227743
+}

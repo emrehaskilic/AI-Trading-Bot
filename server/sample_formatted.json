@@ -1,0 +1,41 @@
+{
+  "timestampMs": 1771539314220,
+  "symbol": "ETHUSDT",
+  "regime": "MR",
+  "gate": {
+    "passed": false,
+    "reason": "GATE_LOW_PRINTS",
+    "details": {
+      "tradeLagMs": 0,
+      "bookLagMs": 825,
+      "printsPerSecond": 0.016666666666666666,
+      "tradeCount": 1
+    }
+  },
+  "dfs": 0,
+  "dfsPercentile": 0,
+  "volLevel": 0,
+  "thresholds": {
+    "longEntry": 0.8,
+    "longBreak": 0.55,
+    "shortEntry": 0.2,
+    "shortBreak": 0.45
+  },
+  "reasons": [
+    "GATE_LOW_PRINTS"
+  ],
+  "actions": [
+    {
+      "type": "NOOP",
+      "reason": "GATE_PAUSED"
+    }
+  ],
+  "stats": {
+    "price": 1943.49,
+    "vwap": 1943.49,
+    "deltaZ": 0,
+    "cvdSlope": 0,
+    "obiDeep": -0.0010736857656752851,
+    "printsPerSecond": 0.016666666666666666
+  }
+}

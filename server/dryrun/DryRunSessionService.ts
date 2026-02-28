@@ -85,6 +85,12 @@ export interface DryRunSessionStatus {
   config: {
     walletBalanceStartUsdt: number;
     initialMarginUsdt: number;
+    sizing?: {
+      legacyNotionalCap?: boolean;
+      entrySplit?: number[];
+      addMode?: 'SPLIT_OF_ENTRY' | 'FIXED_MARGIN';
+      maxPositionNotional?: number | null;
+    };
     leverage: number;
     makerFeeRate: number;
     takerFeeRate: number;
@@ -844,12 +850,18 @@ export class DryRunSessionService {
         // AI policy path must never auto-close just to reverse.
         if (position && position.side !== actionSide) {
           if (aiPolicyAction) {
-            this.addConsoleLog(
-              'WARN',
-              normalized,
-              `AI reversal blocked without direction lock confirmation: ${position.side} -> ${actionSide}`,
-              session.lastEventTimestampMs
-            );
+            // Throttle: log at most once per 60 seconds per symbol
+            const nowMs = Date.now();
+            const lastWarnTs = (session as any)._lastReversalWarnTs || 0;
+            if (nowMs - lastWarnTs >= 60_000) {
+              (session as any)._lastReversalWarnTs = nowMs;
+              this.addConsoleLog(
+                'WARN',
+                normalized,
+                `AI reversal blocked without direction lock confirmation: ${position.side} -> ${actionSide}`,
+                session.lastEventTimestampMs
+              );
+            }
             continue;
           }
           const closeQty = roundTo(position.qty, 6);
@@ -2382,24 +2394,71 @@ export class DryRunSessionService {
     }
   ): { qty: number; leverage: number } {
     if (!this.config || !(price > 0)) return { qty: 0, leverage: session.dynamicLeverage || 1 };
+
     const leverage = session.dynamicLeverage || this.config.leverage || 1;
-    const maxNotional = Math.max(0, Number(this.config.initialMarginUsdt || 0) * Math.max(1, leverage));
-    if (!(maxNotional > 0)) return { qty: 0, leverage };
+    const initialMarginUsdt = Number(this.config.initialMarginUsdt || 0);
+    const targetNotionalEntry = Math.max(0, initialMarginUsdt * Math.max(1, leverage));
+
+    if (!(targetNotionalEntry > 0)) return { qty: 0, leverage };
+
+    const sizingParams = this.config.sizing || {};
+    const legacyCap = Boolean(sizingParams.legacyNotionalCap);
+    const maxPositionNotional = sizingParams.maxPositionNotional ?? Number.POSITIVE_INFINITY;
+    const entrySplit = sizingParams.entrySplit ?? [0.60, 0.40];
+    const addMode = sizingParams.addMode ?? 'SPLIT_OF_ENTRY';
 
     const currentNotional = session.lastState.position
       ? Math.max(0, Number(session.lastState.position.qty || 0) * price)
       : 0;
-    const maxExposureNotional = maxNotional * clampNumber(input.maxExposureMultiplier, 1.5, 1, 3);
-    const remainingExposure = Math.max(0, maxExposureNotional - currentNotional);
-    if (!(remainingExposure > 0)) return { qty: 0, leverage };
 
     let openNotional = 0;
-    if (input.mode === 'ENTRY') {
-      openNotional = Math.max(0, Math.min(maxNotional - currentNotional, remainingExposure));
+
+    if (legacyCap) {
+      const maxExposureNotional = targetNotionalEntry * clampNumber(input.maxExposureMultiplier, 1.5, 1, 3);
+      const remainingExposure = Math.max(0, maxExposureNotional - currentNotional);
+      if (!(remainingExposure > 0)) return { qty: 0, leverage };
+
+      if (input.mode === 'ENTRY') {
+        openNotional = Math.max(0, Math.min(targetNotionalEntry - currentNotional, remainingExposure));
+      } else {
+        const addPct = clampNumber(input.addPct, 0.2, 0.01, 1);
+        const desired = currentNotional * addPct;
+        openNotional = Math.max(0, Math.min(desired, remainingExposure));
+      }
     } else {
-      const addPct = clampNumber(input.addPct, 0.2, 0.01, 1);
-      const desired = currentNotional * addPct;
-      openNotional = Math.max(0, Math.min(desired, remainingExposure));
+      if (input.mode === 'ADD') {
+        let addNotional = 0;
+        if (input.addPct != null && input.addPct > 0) {
+          addNotional = currentNotional * clampNumber(input.addPct, 0.2, 0.01, 1);
+        } else {
+          if (addMode === 'SPLIT_OF_ENTRY') {
+            const addsUsed = session.addOnState?.count ?? 0;
+            const splitIndex = addsUsed + 1;
+            if (splitIndex < entrySplit.length) {
+              addNotional = targetNotionalEntry * (entrySplit[splitIndex] ?? 0);
+            } else {
+              addNotional = 0;
+            }
+          } else {
+            addNotional = targetNotionalEntry; // FIXED_MARGIN (addMargin defaults to basis)
+          }
+        }
+
+        if (maxPositionNotional !== Number.POSITIVE_INFINITY && maxPositionNotional != null) {
+          const remaining = maxPositionNotional - currentNotional;
+          if (remaining <= 0) {
+            addNotional = 0;
+          } else {
+            addNotional = Math.min(addNotional, remaining);
+          }
+        }
+        openNotional = Math.max(0, addNotional);
+      } else {
+        // ENTRY
+        const exposureMult = clampNumber(input.maxExposureMultiplier, 1.5, 1, 3);
+        const requestedNotional = (targetNotionalEntry * (entrySplit[0] ?? 0.60)) * exposureMult;
+        openNotional = Math.max(0, Math.min(requestedNotional, targetNotionalEntry));
+      }
     }
 
     const qty = roundTo(Math.max(0, openNotional / price), 6);
@@ -2471,29 +2530,87 @@ export class DryRunSessionService {
     options?: { mode?: 'ENTRY' | 'ADD'; incrementalRiskCapPct?: number }
   ): { qty: number; leverage: number } {
     if (!this.config || !(price > 0)) return { qty: 0, leverage: session.dynamicLeverage || 1 };
+
     const leverage = session.dynamicLeverage || this.config.leverage || 1;
-    const maxNotional = Math.max(0, Number(this.config.initialMarginUsdt || 0) * Math.max(1, leverage));
-    if (!(maxNotional > 0)) return { qty: 0, leverage };
+    const initialMarginUsdt = Number(this.config.initialMarginUsdt || 0);
+    const targetNotionalEntry = Math.max(0, initialMarginUsdt * Math.max(1, leverage));
+
+    if (!(targetNotionalEntry > 0)) return { qty: 0, leverage };
+
+    const sizingParams = this.config.sizing || {};
+    const legacyCap = Boolean(sizingParams.legacyNotionalCap);
+    // MODEL A Default Split Array: [ENTRY, ADD1, ADD2] -> [0.50, 0.30, 0.20]
+    const entrySplit = sizingParams.entrySplit ?? [0.50, 0.30, 0.20];
+    const addMode = sizingParams.addMode ?? 'SPLIT_OF_ENTRY';
+    const maxPositionNotional = sizingParams.maxPositionNotional ?? Number.POSITIVE_INFINITY;
 
     const rawMultiplier = Number(sizeMultiplier || 1);
     const normalizedMultiplier = this.isAIAutonomousRun()
       ? clampNumber(rawMultiplier, 1, 0.05, 4)
       : Math.max(0.05, Math.min(2, rawMultiplier));
-    const baseEntryPct = clampNumber(process.env.AI_BASE_ENTRY_PCT, 0.35, 0.25, 0.55);
-    const baseNotional = maxNotional * baseEntryPct;
-    const requestedNotional = Math.max(0, baseNotional * normalizedMultiplier);
 
     const currentNotional = session.lastState.position
       ? Math.max(0, Number(session.lastState.position.qty || 0) * price)
       : 0;
-    const availableNotional = options?.mode === 'ADD'
-      ? Math.max(0, maxNotional - currentNotional)
-      : maxNotional;
-    const incrementalCapPct = Number.isFinite(options?.incrementalRiskCapPct as number)
-      ? clampNumber(options?.incrementalRiskCapPct, 1, 0.05, 1)
-      : 1;
-    const cappedByIncremental = maxNotional * incrementalCapPct;
-    const openingNotional = Math.max(0, Math.min(requestedNotional, availableNotional, cappedByIncremental));
+
+    let openingNotional = 0;
+
+    if (legacyCap) {
+      // Legacy behavior: targetNotionalEntry is a hard cap for the whole position
+      const baseEntryPct = clampNumber(process.env.AI_BASE_ENTRY_PCT, 0.35, 0.25, 0.55);
+      const baseNotional = targetNotionalEntry * baseEntryPct;
+      const requestedNotional = Math.max(0, baseNotional * normalizedMultiplier);
+
+      const availableNotional = options?.mode === 'ADD'
+        ? Math.max(0, targetNotionalEntry - currentNotional)
+        : targetNotionalEntry;
+
+      const incrementalCapPct = Number.isFinite(options?.incrementalRiskCapPct as number)
+        ? clampNumber(options?.incrementalRiskCapPct, 1, 0.05, 1)
+        : 1;
+      const cappedByIncremental = targetNotionalEntry * incrementalCapPct;
+
+      openingNotional = Math.max(0, Math.min(requestedNotional, availableNotional, cappedByIncremental));
+    } else {
+      // New behavior: ENTRY and ADD are sized independently
+      if (options?.mode === 'ADD') {
+        let addNotional = 0;
+
+        if (addMode === 'FIXED_MARGIN') {
+          addNotional = targetNotionalEntry * normalizedMultiplier;
+        } else {
+          // 'SPLIT_OF_ENTRY' (Model A) -> Index is bounded by addsUsed
+          const addsUsed = session.addOnState?.count ?? 0;
+          // Split index relies on maxAdds = 2. So length max is [0], [1], [2]. Since entry is [0], add1 is [1], add2 is [2]
+          const splitIndex = addsUsed + 1;
+
+          if (splitIndex < entrySplit.length) {
+            const addTarget = targetNotionalEntry * (entrySplit[splitIndex] ?? 0);
+            addNotional = addTarget * normalizedMultiplier;
+          } else {
+            // Reached out of bounds, veto the add.
+            addNotional = 0;
+          }
+        }
+
+        if (maxPositionNotional !== Number.POSITIVE_INFINITY && maxPositionNotional != null) {
+          const remaining = maxPositionNotional - currentNotional;
+          if (remaining <= 0) {
+            addNotional = 0; // Veto (skip)
+          } else {
+            addNotional = Math.min(addNotional, remaining);
+          }
+        }
+        openingNotional = Math.max(0, addNotional);
+      } else {
+        // ENTRY mode
+        const entryTarget = targetNotionalEntry * (entrySplit[0] ?? 0.50);
+        let requestedNotional = entryTarget * normalizedMultiplier;
+
+        // entryNotional = min(requestedNotional, targetNotionalEntry)
+        openingNotional = Math.max(0, Math.min(requestedNotional, targetNotionalEntry));
+      }
+    }
 
     const qty = roundTo(Math.max(0, openingNotional / price), 6);
     return { qty, leverage };

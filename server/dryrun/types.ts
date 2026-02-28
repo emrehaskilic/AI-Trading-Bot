@@ -82,6 +82,12 @@ export interface DryRunConfig {
   fundingBoundaryStartTsUTC?: number;
   proxy: DryRunProxyConfig;
   marketImpact?: DryRunMarketImpactConfig;
+  sizing?: {
+    legacyNotionalCap?: boolean;
+    entrySplit?: number[];
+    addMode?: 'SPLIT_OF_ENTRY' | 'FIXED_MARGIN';
+    maxPositionNotional?: number | null;
+  };
 }
 
 export interface DryRunPosition {
