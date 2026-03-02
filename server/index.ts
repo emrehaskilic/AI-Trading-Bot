@@ -79,6 +79,7 @@ import { SpotReferenceMonitor, SpotReferenceMetrics } from './metrics/SpotRefere
 import { HtfStructureMonitor } from './metrics/HtfStructureMonitor';
 import { OrchestratorV1 } from './orchestrator_v1/OrchestratorV1';
 import { OrchestratorV1Decision, OrchestratorV1Order, OrchestratorV1Side } from './orchestrator_v1/types';
+import { BiasConfidenceTracker } from './orchestrator_v1/BiasConfidenceTracker';
 
 // =============================================================================
 // Configuration
@@ -88,6 +89,7 @@ const PORT = parseInt(process.env.PORT || '8787', 10);
 const HOST = process.env.HOST || '0.0.0.0'; // Listen on all interfaces for Nginx proxy
 const BINANCE_REST_BASE = 'https://fapi.binance.com';
 const BINANCE_WS_BASE = 'wss://fstream.binance.com/stream';
+const BIAS_DEBUG_FIELDS = ['1', 'true', 'yes', 'on'].includes(String(process.env.BIAS_DEBUG_FIELDS || '').trim().toLowerCase());
 const DEFAULT_MAKER_FEE_RATE = Number(process.env.MAKER_FEE_BPS || '2') / 10000;
 const DEFAULT_TAKER_FEE_RATE = Number(process.env.TAKER_FEE_BPS || '4') / 10000;
 
@@ -164,6 +166,7 @@ const EXECUTION_ENABLED_DEFAULT = parseEnvFlag(process.env.EXECUTION_ENABLED);
 let EXECUTION_ENABLED = EXECUTION_ENABLED_DEFAULT;
 const EXECUTION_ENV = 'testnet';
 const DECISION_MODE = normalizeDecisionMode(process.env.DECISION_MODE || 'off');
+let SUPER_SCALP_ENABLED = parseEnvFlag(process.env.SUPER_SCALP_ENABLED);
 
 function normalizeWsUpdateSpeed(raw: string): '100ms' | '250ms' | '500ms' {
     const value = String(raw || '').trim().toLowerCase();
@@ -303,6 +306,7 @@ const dryRunSession = new DryRunSessionService(alertService);
 const aiDryRun = new AIDryRunController(dryRunSession, decisionLog, log);
 const decisionProvider: DecisionProvider = new NoopDecisionProvider();
 const orchestratorV1 = new OrchestratorV1();
+const biasConfidenceTracker = new BiasConfidenceTracker();
 const abTestManager = new ABTestManager(alertService);
 const marketArchive = new MarketDataArchive();
 const signalReplay = new SignalReplay(marketArchive);
@@ -327,6 +331,7 @@ log('EXECUTION_CONFIG', {
     env: EXECUTION_ENV,
     decisionMode: DECISION_MODE,
     decisionEnabled: DECISION_MODE === 'orchestrator_v1',
+    superScalpEnabled: SUPER_SCALP_ENABLED,
     hasApiKey: hasEnvApiKey,
     hasApiSecret: hasEnvApiSecret,
     executionAllowed: initialGate.executionAllowed,
@@ -1670,10 +1675,17 @@ function defaultOrchestratorDecision(symbol: string, nowMs: number): Orchestrato
                 crossMarketVetoCount: 0,
                 crossMarketNeutralCount: 0,
                 crossMarketAllowedCount: 0,
+                active: false,
+                mode: 'DISABLED_NO_BTC' as const,
+                disableReason: null,
                 anchorSide: 'NONE' as const,
                 anchorMode: 'NONE' as const,
                 btcHasPosition: false,
+                mismatchActive: false,
+                mismatchSinceMs: null,
+                exitTriggeredCount: 0,
             },
+            lastExitReasonCode: null,
             reversal: {
                 reversalAttempted: 0,
                 reversalBlocked: 0,
@@ -1696,12 +1708,59 @@ function defaultOrchestratorDecision(symbol: string, nowMs: number): Orchestrato
                 softBiasApplied: false,
                 reason: null,
             },
+            superScalp: {
+                active: false,
+                m15SwingLow: null,
+                m15SwingHigh: null,
+                sweepDetected: false,
+                reclaimDetected: false,
+                sideCandidate: null,
+            },
         },
     };
 }
 
+function clamp01(value: number): number {
+    if (!Number.isFinite(value)) return 0;
+    return Math.max(0, Math.min(1, value));
+}
+
+function deriveRawBiasConfidence(decision: OrchestratorV1Decision): number {
+    const smoothed = decision.telemetry?.smoothed || { deltaZ: 0, cvdSlope: 0, obiWeighted: 0 };
+    const deltaZ = Number.isFinite(Number(smoothed.deltaZ)) ? Number(smoothed.deltaZ) : 0;
+    const cvdSlope = Number.isFinite(Number(smoothed.cvdSlope)) ? Number(smoothed.cvdSlope) : 0;
+    const obiWeighted = Number.isFinite(Number(smoothed.obiWeighted)) ? Number(smoothed.obiWeighted) : 0;
+
+    const deltaStrength = Math.min(1, Math.abs(deltaZ) / 2.5);
+    const cvdStrength = Math.min(1, Math.abs(cvdSlope) / 0.08);
+    const obiStrength = Math.min(1, Math.abs(obiWeighted) / 0.35);
+    const flowStrength = (deltaStrength + cvdStrength + obiStrength) / 3;
+
+    const gatePassRatio = (
+        Number(Boolean(decision.gateA?.passed))
+        + Number(Boolean(decision.gateB?.passed))
+        + Number(Boolean(decision.gateC?.passed))
+    ) / 3;
+    const readinessPenalty = decision.readiness.ready ? 1 : 0.85;
+    const base = decision.position.isOpen ? 0.82 : 0.45;
+    const confidence = (base + 0.28 * gatePassRatio + 0.22 * flowStrength) * readinessPenalty;
+    return Number(clamp01(confidence).toFixed(4));
+}
+
 function buildDecisionViewFromOrchestrator(decision: OrchestratorV1Decision, nowMs: number) {
     const side = decision.side === 'BUY' ? 'LONG' : (decision.side === 'SELL' ? 'SHORT' : 'NONE');
+    const readinessReady = Boolean(decision.readiness.ready);
+    const rawConfidence = deriveRawBiasConfidence(decision);
+    const biasResolution = biasConfidenceTracker.resolveWithDebug({
+        symbol: decision.symbol,
+        side,
+        hasOpenPosition: Boolean(decision.position.isOpen),
+        allGatesPassed: Boolean(decision.allGatesPassed),
+        readinessReady,
+        rawConfidence,
+    });
+    const hasRaw = Number.isFinite(rawConfidence);
+    const biasConfidence = biasResolution.confidence;
     const signal = decision.intent === 'ENTRY'
         ? (side === 'LONG' ? 'ENTRY_LONG' : (side === 'SHORT' ? 'ENTRY_SHORT' : 'NONE'))
         : decision.intent === 'ADD'
@@ -1729,6 +1788,25 @@ function buildDecisionViewFromOrchestrator(decision: OrchestratorV1Decision, now
                     ? 'ORCHESTRATOR_V1_EXIT_FLIP'
                     : (decision.readiness.reasons[0] || 'ORCHESTRATOR_V1_HOLD');
 
+    const aiBias: any = {
+        side,
+        confidence: biasConfidence,
+        source: 'STATE' as const,
+        lockedByPosition: decision.position.isOpen,
+        breakConfirm: decision.chase.repricesUsed + decision.position.addsUsed,
+        reason: vetoReason,
+        timestampMs: nowMs,
+    };
+    if (BIAS_DEBUG_FIELDS) {
+        aiBias.rawBias = biasResolution.rawBias;
+        aiBias.normalizedBias = biasResolution.normalizedBias;
+        aiBias.clampedBias = biasResolution.clampedBias;
+        aiBias.branchUsed = biasResolution.branchUsed;
+        aiBias.rawConfidence = rawConfidence;
+        aiBias.hasRaw = hasRaw;
+        aiBias.readinessReady = readinessReady;
+    }
+
     return {
         aiTrend: {
             side,
@@ -1738,15 +1816,7 @@ function buildDecisionViewFromOrchestrator(decision: OrchestratorV1Decision, now
             breakConfirm: decision.chase.repricesUsed + decision.position.addsUsed,
             source: 'runtime' as const,
         },
-        aiBias: {
-            side,
-            confidence: Number((decision.position.isOpen ? 1 : (decision.allGatesPassed ? 0.8 : 0)).toFixed(4)),
-            source: 'STATE' as const,
-            lockedByPosition: decision.position.isOpen,
-            breakConfirm: decision.chase.repricesUsed + decision.position.addsUsed,
-            reason: vetoReason,
-            timestampMs: nowMs,
-        },
+        aiBias,
         signalDisplay: {
             signal,
             score,
@@ -1991,8 +2061,9 @@ function broadcastMetrics(
             : 'NEUTRAL';
     let orchestratorV1Decision: OrchestratorV1Decision | null = null;
     if (DECISION_MODE === 'orchestrator_v1') {
+        const crossMarketRuntimeActive = ENABLE_CROSS_MARKET_CONFIRMATION && activeSymbols.has('BTCUSDT');
         let btcContext: any = null;
-        if (s !== 'BTCUSDT' && ENABLE_CROSS_MARKET_CONFIRMATION) {
+        if (s !== 'BTCUSDT' && crossMarketRuntimeActive) {
             try {
                 const btcHtf = getHtfMonitor('BTCUSDT').getSnapshot();
                 const btcAdvanced = advancedMicroMap.get('BTCUSDT')?.getMetrics(now);
@@ -2031,7 +2102,7 @@ function broadcastMetrics(
         };
 
         const dryRunPosition = dryRunSession.isTrackingSymbol(s) ? buildDrpSnapshot(s) : null;
-        const btcDryRunPosition = (s !== 'BTCUSDT' && dryRunSession.isTrackingSymbol('BTCUSDT'))
+        const btcDryRunPosition = (s !== 'BTCUSDT' && crossMarketRuntimeActive && dryRunSession.isTrackingSymbol('BTCUSDT'))
             ? buildDrpSnapshot('BTCUSDT')
             : null;
 
@@ -2063,9 +2134,13 @@ function broadcastMetrics(
             htfH1StructureBreakUp: Boolean(htfSnapshot?.h1?.structureBreakUp),
             htfH1StructureBreakDn: Boolean(htfSnapshot?.h1?.structureBreakDn),
             htfH4BarStartMs: Number.isFinite(Number(htfSnapshot?.h4?.barStartMs)) ? Number(htfSnapshot?.h4?.barStartMs) : null,
+            m15SwingLow: Number.isFinite(Number(htfSnapshot?.m15?.lastSwingLow)) ? Number(htfSnapshot?.m15?.lastSwingLow) : null,
+            m15SwingHigh: Number.isFinite(Number(htfSnapshot?.m15?.lastSwingHigh)) ? Number(htfSnapshot?.m15?.lastSwingHigh) : null,
+            superScalpEnabled: SUPER_SCALP_ENABLED,
             backfillDone: bootstrapSnapshot.backfillDone,
             barsLoaded1m: bootstrapSnapshot.barsLoaded1m,
             btcContext,
+            crossMarketActive: crossMarketRuntimeActive,
             dryRunPosition,
             btcDryRunPosition,
         });
@@ -2132,6 +2207,7 @@ function broadcastMetrics(
         legacyMetrics: legacyM,
         sessionVwap,
         htf: {
+            m15: htfSnapshot.m15,
             h1: htfSnapshot.h1,
             h4: htfSnapshot.h4,
         },
@@ -2544,12 +2620,37 @@ app.get('/api/dry-run/symbols', async (req, res) => {
     }
 });
 
+function withRuntimeStrategyConfig(status: any): any {
+    if (!status || typeof status !== 'object') return status;
+    const cfg = status.config && typeof status.config === 'object' ? status.config : null;
+    return {
+        ...status,
+        config: cfg ? { ...cfg, superScalpEnabled: SUPER_SCALP_ENABLED } : cfg,
+    };
+}
+
 app.get('/api/dry-run/status', (req, res) => {
-    res.json({ ok: true, status: dryRunSession.getStatus() });
+    res.json({ ok: true, status: withRuntimeStrategyConfig(dryRunSession.getStatus()) });
 });
 
 app.get('/api/ai-dry-run/status', (req, res) => {
-    res.json({ ok: true, status: dryRunSession.getStatus(), ai: aiDryRun.getStatus() });
+    res.json({
+        ok: true,
+        status: withRuntimeStrategyConfig(dryRunSession.getStatus()),
+        ai: aiDryRun.getStatus(),
+        runtime: { superScalpEnabled: SUPER_SCALP_ENABLED },
+    });
+});
+
+app.post('/api/ai-dry-run/super-scalp', (req, res) => {
+    const enabled = Boolean(req.body?.enabled);
+    SUPER_SCALP_ENABLED = enabled;
+    res.json({
+        ok: true,
+        superScalpEnabled: SUPER_SCALP_ENABLED,
+        status: withRuntimeStrategyConfig(dryRunSession.getStatus()),
+        ai: aiDryRun.getStatus(),
+    });
 });
 
 app.post('/api/ai-dry-run/start', async (req, res) => {
@@ -2565,6 +2666,10 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
         if (symbolsRequested.length === 0) {
             res.status(400).json({ ok: false, error: 'symbols_required' });
             return;
+        }
+
+        if (typeof req.body?.superScalpEnabled !== 'undefined') {
+            SUPER_SCALP_ENABLED = Boolean(req.body.superScalpEnabled);
         }
 
         const apiKey = String(req.body?.apiKey || '').trim();
@@ -2636,8 +2741,9 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
 
         res.json({
             ok: true,
-            status,
+            status: withRuntimeStrategyConfig(status),
             ai: aiDryRun.getStatus(),
+            runtime: { superScalpEnabled: SUPER_SCALP_ENABLED },
             bootstrapTrend: {
                 enabled: bootstrapTrendEnabled,
                 mode: 'DISABLED_FOR_DECISION',
@@ -2663,7 +2769,12 @@ app.post('/api/ai-dry-run/stop', (req, res) => {
         updateDryRunHealthFlag();
         dryRunForcedSymbols.clear();
         updateStreams();
-        res.json({ ok: true, status, ai: aiDryRun.getStatus() });
+        res.json({
+            ok: true,
+            status: withRuntimeStrategyConfig(status),
+            ai: aiDryRun.getStatus(),
+            runtime: { superScalpEnabled: SUPER_SCALP_ENABLED },
+        });
     } catch (e: any) {
         res.status(500).json({ ok: false, error: e?.message || 'ai_dry_run_stop_failed' });
     }
@@ -2676,7 +2787,12 @@ app.post('/api/ai-dry-run/reset', (req, res) => {
         updateDryRunHealthFlag();
         dryRunForcedSymbols.clear();
         updateStreams();
-        res.json({ ok: true, status, ai: aiDryRun.getStatus() });
+        res.json({
+            ok: true,
+            status: withRuntimeStrategyConfig(status),
+            ai: aiDryRun.getStatus(),
+            runtime: { superScalpEnabled: SUPER_SCALP_ENABLED },
+        });
     } catch (e: any) {
         res.status(500).json({ ok: false, error: e?.message || 'ai_dry_run_reset_failed' });
     }
@@ -2710,7 +2826,7 @@ app.post('/api/dry-run/load', async (req, res) => {
         }
         const status = await dryRunSession.loadSession(sessionId);
         updateDryRunHealthFlag();
-        res.json({ ok: true, status });
+        res.json({ ok: true, status: withRuntimeStrategyConfig(status) });
     } catch (e: any) {
         res.status(500).json({ ok: false, error: e?.message || 'dry_run_load_failed' });
     }
@@ -2718,6 +2834,9 @@ app.post('/api/dry-run/load', async (req, res) => {
 
 app.post('/api/dry-run/start', async (req, res) => {
     try {
+        if (typeof req.body?.superScalpEnabled !== 'undefined') {
+            SUPER_SCALP_ENABLED = Boolean(req.body.superScalpEnabled);
+        }
         const rawSymbols = Array.isArray(req.body?.symbols)
             ? req.body.symbols.map((s: any) => String(s || '').toUpperCase())
             : [];
@@ -2776,7 +2895,7 @@ app.post('/api/dry-run/start', async (req, res) => {
             }
         }
 
-        res.json({ ok: true, status });
+        res.json({ ok: true, status: withRuntimeStrategyConfig(status) });
     } catch (e: any) {
         res.status(500).json({ ok: false, error: e?.message || 'dry_run_start_failed' });
     }
@@ -2789,7 +2908,7 @@ app.post('/api/dry-run/stop', (req, res) => {
         updateDryRunHealthFlag();
         dryRunForcedSymbols.clear();
         updateStreams();
-        res.json({ ok: true, status });
+        res.json({ ok: true, status: withRuntimeStrategyConfig(status) });
     } catch (e: any) {
         res.status(500).json({ ok: false, error: e?.message || 'dry_run_stop_failed' });
     }
@@ -2802,7 +2921,7 @@ app.post('/api/dry-run/reset', (req, res) => {
         updateDryRunHealthFlag();
         dryRunForcedSymbols.clear();
         updateStreams();
-        res.json({ ok: true, status });
+        res.json({ ok: true, status: withRuntimeStrategyConfig(status) });
     } catch (e: any) {
         res.status(500).json({ ok: false, error: e?.message || 'dry_run_reset_failed' });
     }

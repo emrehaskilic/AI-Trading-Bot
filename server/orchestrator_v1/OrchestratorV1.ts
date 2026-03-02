@@ -44,6 +44,12 @@ function nextSide(deltaZ: number, cvdSlope: number, obiDeep: number): Orchestrat
   return null;
 }
 
+type SuperScalpEvaluation = {
+  sideCandidate: OrchestratorV1Side | null;
+  sweepDetected: boolean;
+  reclaimDetected: boolean;
+};
+
 function buildGate(passed: boolean, reason: string | null, checks: Record<string, boolean>): OrchestratorV1GateView {
   return { passed, reason, checks };
 }
@@ -87,6 +93,8 @@ function defaultRuntime(): OrchestratorV1RuntimeState {
     chaseLastRepriceTs: null,
     chaseAttempts: 0,
     chaseTimedOut: false,
+    m15LongSweepTs: null,
+    m15ShortSweepTs: null,
     // ── Aggregate telemetry counters ──────────────────────────────────────────
     chaseStartedCount: 0,
     chaseTimedOutCount: 0,
@@ -99,6 +107,9 @@ function defaultRuntime(): OrchestratorV1RuntimeState {
     crossMarketVetoCount: 0,
     crossMarketNeutralCount: 0,
     crossMarketAllowedCount: 0,
+    crossMarketMismatchSinceMs: null,
+    crossMarketMismatchExitTriggeredCount: 0,
+    lastExitReasonCode: null,
     // ── flip tracking for 2-step reversal ──
     flipDetectedSide: null,
     flipFirstDetectedMs: null,
@@ -155,8 +166,12 @@ export class OrchestratorV1 {
       htfH1StructureBreakUp: Boolean(inputRaw.htfH1StructureBreakUp),
       htfH1StructureBreakDn: Boolean(inputRaw.htfH1StructureBreakDn),
       htfH4BarStartMs: isFiniteNumber(inputRaw.htfH4BarStartMs) ? inputRaw.htfH4BarStartMs : null,
+      m15SwingLow: isFiniteNumber(inputRaw.m15SwingLow) ? inputRaw.m15SwingLow : null,
+      m15SwingHigh: isFiniteNumber(inputRaw.m15SwingHigh) ? inputRaw.m15SwingHigh : null,
+      superScalpEnabled: inputRaw.superScalpEnabled === true,
       backfillDone: Boolean(inputRaw.backfillDone),
       barsLoaded1m: Math.max(0, Math.trunc(toNumber(inputRaw.barsLoaded1m, 0))),
+      crossMarketActive: inputRaw.crossMarketActive !== false,
     };
 
     const symbol = input.symbol;
@@ -182,10 +197,16 @@ export class OrchestratorV1 {
 
     const smoothed = this.computeSmoothed(input, runtime);
     const isPositionOpen = runtime.positionQty > 0 && runtime.entryVwap != null && runtime.side != null;
-    const candidateSide = nextSide(smoothed.deltaZ, smoothed.cvdSlope, input.obiDeep);
+    const legacyCandidateSide = nextSide(smoothed.deltaZ, smoothed.cvdSlope, input.obiDeep);
+    const superScalpEval = this.evaluateSuperScalp(input, runtime, smoothed);
+    const candidateSideForEntry = input.superScalpEnabled
+      ? superScalpEval.sideCandidate
+      : legacyCandidateSide;
 
     // Pass false for freezeByPosition so we can detect flips in the 2-step state machine
-    const sideForEntry = this.resolveSideWithHysteresis(runtime, candidateSide, input.nowMs, false);
+    const sideForEntry = input.superScalpEnabled && candidateSideForEntry == null
+      ? null
+      : this.resolveSideWithHysteresis(runtime, candidateSideForEntry, input.nowMs, false);
 
     const readinessReasons: string[] = [];
     if (!input.backfillDone) readinessReasons.push('BACKFILL_NOT_DONE');
@@ -200,10 +221,10 @@ export class OrchestratorV1 {
 
     const htfLevelState = {
       price: input.price,
-      h1SwingLow: input.htfH1SwingLow,
-      h1SwingHigh: input.htfH1SwingHigh,
-      h1SBUp: input.htfH1StructureBreakUp,
-      h1SBDn: input.htfH1StructureBreakDn,
+      h1SwingLow: input.htfH1SwingLow ?? null,
+      h1SwingHigh: input.htfH1SwingHigh ?? null,
+      h1SBUp: Boolean(input.htfH1StructureBreakUp),
+      h1SBDn: Boolean(input.htfH1StructureBreakDn),
     };
     let htfVetoed = false;
     let htfSoftBiasApplied = false;
@@ -300,10 +321,23 @@ export class OrchestratorV1 {
 
     // ── BTC Cross Market Veto Derivation (P1: anchor-side aware) ──
     const btcContext = input.btcContext;
+    const crossMarketConfiguredForSymbol = Boolean(
+      this.params.crossMarket && this.params.crossMarket.enabled && this.params.crossMarket.applyTo.includes(symbol)
+    );
+    const crossMarketRuntimeActive = input.crossMarketActive !== false;
+    const crossMarketActive = crossMarketConfiguredForSymbol && crossMarketRuntimeActive;
+    const hasBtcContext = Boolean(btcContext);
+    const crossMarketCanEvaluate = crossMarketActive && hasBtcContext;
+    const crossMarketMode = this.params.crossMarket.mode;
+    const crossMarketTelemetryMode: 'hard_veto' | 'soft_bias' | 'DISABLED_NO_BTC' = crossMarketCanEvaluate
+      ? crossMarketMode
+      : (crossMarketConfiguredForSymbol ? 'DISABLED_NO_BTC' : crossMarketMode);
+    const crossMarketDisableReason: 'BTC_NOT_SELECTED' | 'CONFIG_DISABLED' | null = crossMarketConfiguredForSymbol
+      ? (crossMarketCanEvaluate ? null : (crossMarketRuntimeActive ? null : 'BTC_NOT_SELECTED'))
+      : 'CONFIG_DISABLED';
     let btcBias: 'LONG' | 'SHORT' | 'NEUTRAL' = 'NEUTRAL';
-    const checkCrossMarket = this.params.crossMarket && this.params.crossMarket.enabled && this.params.crossMarket.applyTo.includes(symbol);
 
-    if (checkCrossMarket && btcContext) {
+    if (crossMarketCanEvaluate && btcContext) {
       if (!btcContext.h1BarStartMs || !btcContext.h4BarStartMs) {
         btcBias = 'NEUTRAL';
       } else if (btcContext.chop > this.params.gateA.chopMax || btcContext.trendiness < this.params.gateA.trendinessMin) {
@@ -324,24 +358,26 @@ export class OrchestratorV1 {
     let anchorSide: 'BUY' | 'SELL' | 'NONE' = 'NONE';
     let anchorMode: 'BIAS' | 'ANCHOR_POSITION' | 'NONE' = 'NONE';
 
-    if (btcBias === 'LONG') {
-      anchorSide = 'BUY';
-      anchorMode = 'BIAS';
-    } else if (btcBias === 'SHORT') {
-      anchorSide = 'SELL';
-      anchorMode = 'BIAS';
-    } else if (btcBias === 'NEUTRAL' && btcHasPosition && btcDrp) {
-      // NEUTRAL bias but BTC has open position → use position as anchor
-      anchorSide = btcDrp.side === 'LONG' ? 'BUY' : btcDrp.side === 'SHORT' ? 'SELL' : 'NONE';
-      anchorMode = anchorSide !== 'NONE' ? 'ANCHOR_POSITION' : 'NONE';
+    if (crossMarketCanEvaluate) {
+      if (btcBias === 'LONG') {
+        anchorSide = 'BUY';
+        anchorMode = 'BIAS';
+      } else if (btcBias === 'SHORT') {
+        anchorSide = 'SELL';
+        anchorMode = 'BIAS';
+      } else if (btcBias === 'NEUTRAL' && btcHasPosition && btcDrp) {
+        // NEUTRAL bias but BTC has open position → use position as anchor
+        anchorSide = btcDrp.side === 'LONG' ? 'BUY' : btcDrp.side === 'SHORT' ? 'SELL' : 'NONE';
+        anchorMode = anchorSide !== 'NONE' ? 'ANCHOR_POSITION' : 'NONE';
+      }
     }
-    // else: btcBias=NEUTRAL, BTC flat → anchorSide=NONE, anchorMode=NONE (truly free)
+    // Otherwise cross-market is disabled or lacks BTC context; anchor stays NONE.
 
     let isCrossMarketVetoed = false;
     let crossMarketBlockReason: OrchestratorV1Decision['crossMarketBlockReason'] = null;
 
-    if (checkCrossMarket && sideForEntry) {
-      if (this.params.crossMarket.mode === 'hard_veto' && anchorSide !== 'NONE') {
+    if (crossMarketCanEvaluate && sideForEntry) {
+      if (crossMarketMode === 'hard_veto' && anchorSide !== 'NONE') {
         if (anchorSide === 'BUY' && sideForEntry === 'SELL') {
           isCrossMarketVetoed = true;
         } else if (anchorSide === 'SELL' && sideForEntry === 'BUY') {
@@ -386,12 +422,37 @@ export class OrchestratorV1 {
     // convert to EXIT_FLIP after persistence conditions, never direct ENTRY.
     let isFlipExitTriggered = false;
     const positionSideAsBuySell: OrchestratorV1Side | null = isPositionOpen && runtime.side ? runtime.side : null;
+    const crossMarketExitEnabled = this.params.crossMarketExit.enabled
+      && crossMarketCanEvaluate
+      && symbol !== 'BTCUSDT';
+    const isCrossMarketMismatch = Boolean(
+      crossMarketExitEnabled
+      && isPositionOpen
+      && anchorSide !== 'NONE'
+      && positionSideAsBuySell != null
+      && positionSideAsBuySell !== anchorSide
+    );
+    if (isCrossMarketMismatch) {
+      if (runtime.crossMarketMismatchSinceMs == null) {
+        runtime.crossMarketMismatchSinceMs = input.nowMs;
+      }
+    } else {
+      runtime.crossMarketMismatchSinceMs = null;
+    }
+    const crossMarketMismatchElapsedMs = runtime.crossMarketMismatchSinceMs == null
+      ? 0
+      : Math.max(0, input.nowMs - runtime.crossMarketMismatchSinceMs);
+    const crossMarketMismatchExitTriggered = Boolean(
+      isCrossMarketMismatch
+      && runtime.crossMarketMismatchSinceMs != null
+      && crossMarketMismatchElapsedMs >= this.params.crossMarketExit.persistMs
+    );
 
-    if (isPositionOpen && candidateSide && positionSideAsBuySell && candidateSide !== positionSideAsBuySell) {
+    if (isPositionOpen && legacyCandidateSide && positionSideAsBuySell && legacyCandidateSide !== positionSideAsBuySell) {
       // Opposite side detected while position open
-      if (runtime.flipDetectedSide !== candidateSide) {
+      if (runtime.flipDetectedSide !== legacyCandidateSide) {
         // New flip direction — reset tracking
-        runtime.flipDetectedSide = candidateSide;
+        runtime.flipDetectedSide = legacyCandidateSide;
         runtime.flipFirstDetectedMs = input.nowMs;
         runtime.flipPersistenceCount = 1;
       } else {
@@ -441,12 +502,13 @@ export class OrchestratorV1 {
       thresholdPrice: null,
     };
     let exitRiskTriggeredThisTick = false;
-    let exitRiskReason: 'REGIME' | 'FLOW_FLIP' | 'INTEGRITY' | null = null;
+    let exitRiskReason: 'REGIME' | 'FLOW_FLIP' | 'INTEGRITY' | 'CROSSMARKET_MISMATCH' | null = null;
     const exitRiskEval = this.evaluateExitRisk(input, runtime);
 
     // ── EXIT_FLIP takes priority over normal exit risk ──
     if (isFlipExitTriggered) {
       intent = 'EXIT_FLIP';
+      runtime.lastExitReasonCode = 'EXIT_FLIP';
       runtime.exitOnFlipCount += 1;
       // Use the exit risk machinery to close the position
       if (!runtime.exitRiskActive) {
@@ -464,10 +526,38 @@ export class OrchestratorV1 {
       }
       runtime.active = false;
     } else {
-
-      if (isPositionOpen && exitRiskEval.triggered) {
+      if (isPositionOpen && crossMarketMismatchExitTriggered) {
+        intent = 'EXIT_RISK';
+        exitRiskReason = 'CROSSMARKET_MISMATCH';
+        runtime.lastExitReasonCode = 'EXIT_CROSSMARKET_MISMATCH';
+        if (!runtime.exitRiskActive) {
+          runtime.exitRiskActive = true;
+          runtime.exitMakerAttempts = 0;
+          runtime.exitTakerUsed = false;
+          runtime.exitRiskTriggeredCount += 1;
+          runtime.crossMarketMismatchExitTriggeredCount += 1;
+          exitRiskTriggeredThisTick = true;
+        }
+        const riskEscalated = exitRiskEval.triggered;
+        if (riskEscalated && !runtime.exitTakerUsed) {
+          runtime.exitTakerUsed = true;
+          orders.push(this.buildExitTakerOrder(runtime));
+          this.closePosition(runtime, input.nowMs);
+        } else if (runtime.exitMakerAttempts < this.params.exitRisk.makerAttempts) {
+          runtime.exitMakerAttempts += 1;
+          orders.push(this.buildExitMakerOrder(input, runtime, runtime.exitMakerAttempts));
+        } else if (!runtime.exitTakerUsed) {
+          runtime.exitTakerUsed = true;
+          orders.push(this.buildExitTakerOrder(runtime));
+          this.closePosition(runtime, input.nowMs);
+        }
+        runtime.active = false;
+      } else if (isPositionOpen && exitRiskEval.triggered) {
         intent = 'EXIT_RISK';
         exitRiskReason = exitRiskEval.reason;
+        if (exitRiskEval.reason === 'REGIME') runtime.lastExitReasonCode = 'EXIT_RISK_REGIME';
+        else if (exitRiskEval.reason === 'FLOW_FLIP') runtime.lastExitReasonCode = 'EXIT_RISK_FLOW_FLIP';
+        else if (exitRiskEval.reason === 'INTEGRITY') runtime.lastExitReasonCode = 'EXIT_RISK_INTEGRITY';
         if (!runtime.exitRiskActive) {
           runtime.exitRiskActive = true;
           runtime.exitMakerAttempts = 0;
@@ -640,7 +730,7 @@ export class OrchestratorV1 {
           const canEnter = canEnterRaw && !isCrossMarketVetoed && !isSideMismatchBlocked;
 
           // Telemetry
-          if (canEnterRaw && checkCrossMarket && sideForEntry) {
+          if (canEnterRaw && crossMarketCanEvaluate && sideForEntry) {
             if (isCrossMarketVetoed) {
               runtime.crossMarketVetoCount += 1;
             } else if (btcBias === 'NEUTRAL') {
@@ -788,17 +878,24 @@ export class OrchestratorV1 {
           crossMarketVetoCount: runtime.crossMarketVetoCount,
           crossMarketNeutralCount: runtime.crossMarketNeutralCount,
           crossMarketAllowedCount: runtime.crossMarketAllowedCount,
+          active: crossMarketCanEvaluate,
+          mode: crossMarketTelemetryMode,
+          disableReason: crossMarketDisableReason,
           anchorSide,
           anchorMode,
           btcHasPosition,
+          mismatchActive: isCrossMarketMismatch,
+          mismatchSinceMs: runtime.crossMarketMismatchSinceMs,
+          exitTriggeredCount: runtime.crossMarketMismatchExitTriggeredCount,
         },
+        lastExitReasonCode: runtime.lastExitReasonCode,
         reversal: {
           reversalAttempted: runtime.reversalAttempted,
           reversalBlocked: runtime.reversalBlocked,
           reversalConvertedToExit: runtime.reversalConvertedToExit,
           exitOnFlipCount: runtime.exitOnFlipCount,
           currentPositionSide: positionSideAsBuySell,
-          sideCandidate: sideForEntry,
+          sideCandidate: legacyCandidateSide,
           flipPersistenceCount: runtime.flipPersistenceCount,
           flipFirstDetectedMs: runtime.flipFirstDetectedMs,
           minFlipIntervalMs: this.params.hysteresis.minFlipIntervalMs,
@@ -809,6 +906,14 @@ export class OrchestratorV1 {
           vetoed: htfVetoed,
           softBiasApplied: htfSoftBiasApplied,
           reason: htfReason,
+        },
+        superScalp: {
+          active: input.superScalpEnabled === true,
+          m15SwingLow: input.m15SwingLow ?? null,
+          m15SwingHigh: input.m15SwingHigh ?? null,
+          sweepDetected: superScalpEval.sweepDetected,
+          reclaimDetected: superScalpEval.reclaimDetected,
+          sideCandidate: input.superScalpEnabled ? candidateSideForEntry : null,
         },
       },
     };
@@ -845,6 +950,10 @@ export class OrchestratorV1 {
     runtime.chaseLastRepriceTs = null;
     runtime.chaseAttempts = 0;
     runtime.chaseTimedOut = false;
+    runtime.m15LongSweepTs = null;
+    runtime.m15ShortSweepTs = null;
+    runtime.crossMarketMismatchSinceMs = null;
+    runtime.lastExitReasonCode = null;
     this.runtime.set(symbol, runtime);
   }
 
@@ -901,6 +1010,60 @@ export class OrchestratorV1 {
       deltaZ: runtime.smoothedDeltaZ,
       cvdSlope: runtime.smoothedCvdSlope,
       obiWeighted: runtime.smoothedObiWeighted,
+    };
+  }
+
+  private evaluateSuperScalp(
+    input: OrchestratorV1Input,
+    runtime: OrchestratorV1RuntimeState,
+    smoothed: { deltaZ: number; cvdSlope: number }
+  ): SuperScalpEvaluation {
+    const swingLow = input.m15SwingLow;
+    const swingHigh = input.m15SwingHigh;
+    if (!input.superScalpEnabled) {
+      return { sideCandidate: null, sweepDetected: false, reclaimDetected: false };
+    }
+    if (!isFiniteNumber(swingLow) || !isFiniteNumber(swingHigh)) {
+      runtime.m15LongSweepTs = null;
+      runtime.m15ShortSweepTs = null;
+      return { sideCandidate: null, sweepDetected: false, reclaimDetected: false };
+    }
+
+    const sweepWindowMs = clamp(this.params.superScalp.sweepWindowMs, 60_000, 120_000);
+
+    if (input.price <= swingLow) {
+      runtime.m15LongSweepTs = input.nowMs;
+    }
+    if (input.price >= swingHigh) {
+      runtime.m15ShortSweepTs = input.nowMs;
+    }
+
+    const longSweepRecent = runtime.m15LongSweepTs != null && (input.nowMs - runtime.m15LongSweepTs) <= sweepWindowMs;
+    const shortSweepRecent = runtime.m15ShortSweepTs != null && (input.nowMs - runtime.m15ShortSweepTs) <= sweepWindowMs;
+    const longReclaim = longSweepRecent && input.price > swingLow;
+    const shortReclaim = shortSweepRecent && input.price < swingHigh;
+
+    const longFlow = smoothed.deltaZ > 0 && smoothed.cvdSlope > 0 && input.obiDeep >= 0;
+    const shortFlow = smoothed.deltaZ < 0 && smoothed.cvdSlope < 0 && input.obiDeep <= 0;
+    const longReady = longReclaim && longFlow;
+    const shortReady = shortReclaim && shortFlow;
+
+    let sideCandidate: OrchestratorV1Side | null = null;
+    if (longReady && !shortReady) {
+      sideCandidate = 'BUY';
+    } else if (shortReady && !longReady) {
+      sideCandidate = 'SELL';
+    } else if (longReady && shortReady) {
+      const longTs = runtime.m15LongSweepTs ?? 0;
+      const shortTs = runtime.m15ShortSweepTs ?? 0;
+      if (longTs > shortTs) sideCandidate = 'BUY';
+      else if (shortTs > longTs) sideCandidate = 'SELL';
+    }
+
+    return {
+      sideCandidate,
+      sweepDetected: longSweepRecent || shortSweepRecent,
+      reclaimDetected: longReclaim || shortReclaim,
     };
   }
 
@@ -1038,7 +1201,7 @@ export class OrchestratorV1 {
   private evaluateExitRisk(
     input: OrchestratorV1Input,
     runtime: OrchestratorV1RuntimeState
-  ): { triggered: boolean; reason: 'REGIME' | 'FLOW_FLIP' | 'INTEGRITY' | null } {
+  ): { triggered: boolean; reason: 'REGIME' | 'FLOW_FLIP' | 'INTEGRITY' | 'CROSSMARKET_MISMATCH' | null } {
     const integrityFail = input.orderbookIntegrityLevel > this.params.exitRisk.integrityFailLevel;
     if (integrityFail) return { triggered: true, reason: 'INTEGRITY' };
 
@@ -1093,6 +1256,9 @@ export class OrchestratorV1 {
     runtime.chaseLastRepriceTs = null;
     runtime.chaseAttempts = 0;
     runtime.chaseTimedOut = false;
+    runtime.m15LongSweepTs = null;
+    runtime.m15ShortSweepTs = null;
+    runtime.crossMarketMismatchSinceMs = null;
   }
 
   private buildMakerOrders(input: OrchestratorV1Input, side: OrchestratorV1Side, repriceAttempt: number, baseQty: number): OrchestratorV1Order[] {

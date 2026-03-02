@@ -1,4 +1,4 @@
-type Timeframe = '1h' | '4h';
+type Timeframe = '15m' | '1h' | '4h';
 
 interface KlinePoint {
   openTimeMs: number;
@@ -18,6 +18,7 @@ export interface HtfFrameMetrics {
 }
 
 export interface HtfSnapshot {
+  m15: HtfFrameMetrics;
   h1: HtfFrameMetrics;
   h4: HtfFrameMetrics;
 }
@@ -143,7 +144,7 @@ export class HtfStructureMonitor {
   private readonly config: MonitorConfig;
   private timer: ReturnType<typeof setInterval> | null = null;
   private inFlight = false;
-  private metrics: HtfSnapshot = { h1: { ...EMPTY_FRAME }, h4: { ...EMPTY_FRAME } };
+  private metrics: HtfSnapshot = { m15: { ...EMPTY_FRAME }, h1: { ...EMPTY_FRAME }, h4: { ...EMPTY_FRAME } };
 
   constructor(
     private readonly symbol: string,
@@ -173,6 +174,7 @@ export class HtfStructureMonitor {
 
   public getSnapshot(): HtfSnapshot {
     return {
+      m15: { ...this.metrics.m15 },
       h1: { ...this.metrics.h1 },
       h4: { ...this.metrics.h4 },
     };
@@ -182,11 +184,13 @@ export class HtfStructureMonitor {
     if (this.inFlight) return;
     this.inFlight = true;
     try {
-      const [h1, h4] = await Promise.all([
+      const [m15, h1, h4] = await Promise.all([
+        this.fetchFrame('15m'),
         this.fetchFrame('1h'),
         this.fetchFrame('4h'),
       ]);
       this.metrics = {
+        m15: m15 || this.metrics.m15,
         h1: h1 || this.metrics.h1,
         h4: h4 || this.metrics.h4,
       };

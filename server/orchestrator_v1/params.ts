@@ -89,6 +89,15 @@ export interface OrchestratorV1CrossMarketParams {
   applyTo: string[];
 }
 
+export interface OrchestratorV1CrossMarketExitParams {
+  enabled: boolean;
+  persistMs: number;
+}
+
+export interface OrchestratorV1SuperScalpParams {
+  sweepWindowMs: number;
+}
+
 export interface OrchestratorV1Params {
   readiness: OrchestratorV1ReadinessParams;
   atr: OrchestratorV1AtrParams;
@@ -103,6 +112,8 @@ export interface OrchestratorV1Params {
   hysteresis: OrchestratorV1HysteresisParams;
   smoothing: OrchestratorV1SmoothingParams;
   crossMarket: OrchestratorV1CrossMarketParams;
+  crossMarketExit: OrchestratorV1CrossMarketExitParams;
+  superScalp: OrchestratorV1SuperScalpParams;
 }
 
 export const ORCHESTRATOR_V1_PARAMS: OrchestratorV1Params = {
@@ -183,5 +194,14 @@ export const ORCHESTRATOR_V1_PARAMS: OrchestratorV1Params = {
     enabled: true,
     mode: 'hard_veto',
     applyTo: ['ETHUSDT', 'SOLUSDT', 'XRPUSDT'],
+  },
+  crossMarketExit: {
+    enabled: process.env.CROSSMARKET_EXIT_ENABLED == null
+      ? true
+      : ['1', 'true', 'yes', 'on'].includes(String(process.env.CROSSMARKET_EXIT_ENABLED).trim().toLowerCase()),
+    persistMs: Math.max(1_000, Math.trunc(Number(process.env.CROSSMARKET_EXIT_PERSIST_MS || 30_000))),
+  },
+  superScalp: {
+    sweepWindowMs: Math.max(60_000, Math.min(120_000, Math.trunc(Number(process.env.SUPER_SCALP_SWEEP_WINDOW_MS || 90_000)))),
   },
 };

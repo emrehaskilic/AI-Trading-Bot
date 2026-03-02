@@ -149,4 +149,36 @@ describe('OrchestratorV1 - Cross Market Veto', () => {
         expect(dec.orders.length).toBeGreaterThan(0);
         expect(dec.crossMarketBlockReason).toBeNull();
     });
+
+    it('disables cross-market when BTC is not selected (crossMarketActive=false)', () => {
+        // This context would normally veto ETH SHORT when cross-market is active.
+        const context = createBtcContext(true, false, true, false);
+        const dec = advanceToEntryCandidate('ETHUSDT', 'SELL', context);
+
+        // Warm-up path uses default crossMarketActive=true; now explicitly disable and retry.
+        orc = new OrchestratorV1();
+        const decDisabled = (() => {
+            let lastDecision;
+            for (let i = 0; i < 6; i++) {
+                lastDecision = orc.evaluate(goodInput(T0 + 10_000 + i * 100, {
+                    symbol: 'ETHUSDT',
+                    deltaZ: -1.2,
+                    cvdSlope: -0.05,
+                    obiDeep: -0.3,
+                    btcContext: context,
+                    crossMarketActive: false,
+                }));
+                if (lastDecision.intent === 'ENTRY') break;
+            }
+            return lastDecision!;
+        })();
+
+        expect(dec.intent).toBe('HOLD'); // sanity: active path vetoes
+        expect(decDisabled.intent).toBe('ENTRY'); // disabled path allows
+        expect(decDisabled.crossMarketBlockReason).toBeNull();
+        expect(decDisabled.telemetry.crossMarket.active).toBe(false);
+        expect(decDisabled.telemetry.crossMarket.mode).toBe('DISABLED_NO_BTC');
+        expect(decDisabled.telemetry.crossMarket.disableReason).toBe('BTC_NOT_SELECTED');
+        expect(decDisabled.telemetry.crossMarket.anchorSide).toBe('NONE');
+    });
 });

@@ -48,14 +48,19 @@ export interface OrchestratorV1Input {
   oiChangePct: number | null;
   sessionVwapValue: number | null;
   htfH1BarStartMs: number | null;
-  htfH1SwingLow: number | null;
-  htfH1SwingHigh: number | null;
-  htfH1StructureBreakUp: boolean;
-  htfH1StructureBreakDn: boolean;
+  htfH1SwingLow?: number | null;
+  htfH1SwingHigh?: number | null;
+  htfH1StructureBreakUp?: boolean;
+  htfH1StructureBreakDn?: boolean;
   htfH4BarStartMs: number | null;
+  m15SwingLow?: number | null;
+  m15SwingHigh?: number | null;
+  superScalpEnabled?: boolean | null;
   backfillDone: boolean;
   barsLoaded1m: number;
   btcContext?: OrchestratorV1BtcContext | null;
+  /** Derived at runtime: true only when BTCUSDT is in activeSymbols and cross-market env is enabled. */
+  crossMarketActive?: boolean | null;
   /** P0: DryRun position snapshot for this symbol (single source of truth) */
   dryRunPosition?: OrchestratorV1DryRunPositionSnapshot | null;
   /** P1: BTC DryRun position for anchor-side derivation in NEUTRAL btcBias */
@@ -134,7 +139,7 @@ export interface OrchestratorV1AddView {
 export interface OrchestratorV1ExitRiskView {
   triggered: boolean;
   triggeredThisTick: boolean;
-  reason: 'REGIME' | 'FLOW_FLIP' | 'INTEGRITY' | null;
+  reason: 'REGIME' | 'FLOW_FLIP' | 'INTEGRITY' | 'CROSSMARKET_MISMATCH' | null;
   makerAttemptsUsed: number;
   takerUsed: boolean;
 }
@@ -209,10 +214,17 @@ export interface OrchestratorV1Decision {
       crossMarketVetoCount: number;
       crossMarketNeutralCount: number;
       crossMarketAllowedCount: number;
+      active: boolean;
+      mode: 'hard_veto' | 'soft_bias' | 'DISABLED_NO_BTC';
+      disableReason: 'BTC_NOT_SELECTED' | 'CONFIG_DISABLED' | null;
       anchorSide: 'BUY' | 'SELL' | 'NONE';
       anchorMode: 'BIAS' | 'ANCHOR_POSITION' | 'NONE';
       btcHasPosition: boolean;
+      mismatchActive: boolean;
+      mismatchSinceMs: number | null;
+      exitTriggeredCount: number;
     };
+    lastExitReasonCode: 'EXIT_CROSSMARKET_MISMATCH' | 'EXIT_RISK_REGIME' | 'EXIT_RISK_FLOW_FLIP' | 'EXIT_RISK_INTEGRITY' | 'EXIT_FLIP' | null;
     reversal: {
       reversalAttempted: number;
       reversalBlocked: number;
@@ -234,6 +246,14 @@ export interface OrchestratorV1Decision {
       vetoed: boolean;
       softBiasApplied: boolean;
       reason: 'H1_STRUCTURE_BREAK_DN' | 'H1_STRUCTURE_BREAK_UP' | 'H1_SWING_BELOW_SOFT' | 'H1_SWING_ABOVE_SOFT' | null;
+    };
+    superScalp: {
+      active: boolean;
+      m15SwingLow: number | null;
+      m15SwingHigh: number | null;
+      sweepDetected: boolean;
+      reclaimDetected: boolean;
+      sideCandidate: 'BUY' | 'SELL' | null;
     };
   };
 }
@@ -276,6 +296,8 @@ export interface OrchestratorV1RuntimeState {
   chaseLastRepriceTs: number | null;
   chaseAttempts: number;
   chaseTimedOut: boolean;
+  m15LongSweepTs: number | null;
+  m15ShortSweepTs: number | null;
   // ── NEW: aggregate telemetry counters ────────────────────────────────────────
   chaseStartedCount: number;
   chaseTimedOutCount: number;
@@ -289,6 +311,9 @@ export interface OrchestratorV1RuntimeState {
   crossMarketVetoCount: number;
   crossMarketNeutralCount: number;
   crossMarketAllowedCount: number;
+  crossMarketMismatchSinceMs: number | null;
+  crossMarketMismatchExitTriggeredCount: number;
+  lastExitReasonCode: 'EXIT_CROSSMARKET_MISMATCH' | 'EXIT_RISK_REGIME' | 'EXIT_RISK_FLOW_FLIP' | 'EXIT_RISK_INTEGRITY' | 'EXIT_FLIP' | null;
   // ── flip tracking for 2-step reversal ──
   flipDetectedSide: OrchestratorV1Side | null;
   flipFirstDetectedMs: number | null;

@@ -27,6 +27,7 @@ interface DryRunStatus {
     fundingIntervalMs: number;
     heartbeatIntervalMs: number;
     debugAggressiveEntry: boolean;
+    superScalpEnabled?: boolean;
   } | null;
   summary: {
     totalEquity: number;
@@ -200,6 +201,7 @@ const AIDryRunDashboard: React.FC = () => {
   const [model, setModel] = useState('gemini-2.5-flash');
   const [customModel, setCustomModel] = useState('');
   const [localMode, setLocalMode] = useState(false);
+  const [superScalpEnabled, setSuperScalpEnabled] = useState(false);
   const localModeManualOverrideRef = useRef(false);
   const hasAppliedInitialConfigRef = useRef(false);
   const prevRunningRef = useRef(false);
@@ -292,6 +294,12 @@ const AIDryRunDashboard: React.FC = () => {
           const nextAi = (data?.ai || null) as AIDryRunStatus | null;
           setStatus(next);
           setAiStatus(nextAi);
+          const runtimeSuperScalp = Boolean((data as any)?.runtime?.superScalpEnabled);
+          if (next.config && typeof next.config.superScalpEnabled === 'boolean') {
+            setSuperScalpEnabled(Boolean(next.config.superScalpEnabled));
+          } else {
+            setSuperScalpEnabled(runtimeSuperScalp);
+          }
           if (nextAi && typeof nextAi.localOnly === 'boolean') {
             const shouldApplyServerLocalOnly = next.running || !localModeManualOverrideRef.current;
             if (shouldApplyServerLocalOnly) {
@@ -363,6 +371,7 @@ const AIDryRunDashboard: React.FC = () => {
           apiKey: localMode ? '' : apiKey.trim(),
           model: localMode ? '' : resolvedModel,
           localOnly: localMode,
+          superScalpEnabled,
         }),
       });
       const data = await res.json();
@@ -370,6 +379,10 @@ const AIDryRunDashboard: React.FC = () => {
         throw new Error(data?.error || 'ai_dry_run_start_failed');
       }
       setStatus((data?.status || DEFAULT_STATUS) as DryRunStatus);
+      const returnedStatus = (data?.status || DEFAULT_STATUS) as DryRunStatus;
+      if (returnedStatus.config && typeof returnedStatus.config.superScalpEnabled === 'boolean') {
+        setSuperScalpEnabled(Boolean(returnedStatus.config.superScalpEnabled));
+      }
       const nextAi = (data?.ai || null) as AIDryRunStatus | null;
       setAiStatus(nextAi);
       if (nextAi && typeof nextAi.localOnly === 'boolean') {
@@ -388,6 +401,10 @@ const AIDryRunDashboard: React.FC = () => {
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || 'ai_dry_run_stop_failed');
       setStatus((data?.status || DEFAULT_STATUS) as DryRunStatus);
+      const stopStatus = (data?.status || DEFAULT_STATUS) as DryRunStatus;
+      if (stopStatus.config && typeof stopStatus.config.superScalpEnabled === 'boolean') {
+        setSuperScalpEnabled(Boolean(stopStatus.config.superScalpEnabled));
+      }
       const nextAi = (data?.ai || null) as AIDryRunStatus | null;
       setAiStatus(nextAi);
       if (nextAi && typeof nextAi.localOnly === 'boolean') {
@@ -405,6 +422,10 @@ const AIDryRunDashboard: React.FC = () => {
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || 'ai_dry_run_reset_failed');
       setStatus((data?.status || DEFAULT_STATUS) as DryRunStatus);
+      const resetStatus = (data?.status || DEFAULT_STATUS) as DryRunStatus;
+      if (resetStatus.config && typeof resetStatus.config.superScalpEnabled === 'boolean') {
+        setSuperScalpEnabled(Boolean(resetStatus.config.superScalpEnabled));
+      }
       const nextAi = (data?.ai || null) as AIDryRunStatus | null;
       setAiStatus(nextAi);
       if (nextAi && typeof nextAi.localOnly === 'boolean') {
@@ -428,10 +449,38 @@ const AIDryRunDashboard: React.FC = () => {
       const nextAi = (data?.ai || null) as AIDryRunStatus | null;
       setStatus(next);
       setAiStatus(nextAi);
+      if (next.config && typeof next.config.superScalpEnabled === 'boolean') {
+        setSuperScalpEnabled(Boolean(next.config.superScalpEnabled));
+      }
     } catch (e: any) {
       setActionError(e?.message || 'ai_dry_run_status_failed');
     } finally {
       setIsRefreshingPositions(false);
+    }
+  };
+
+  const applySuperScalpToggle = async (enabled: boolean) => {
+    setActionError(null);
+    const previous = superScalpEnabled;
+    setSuperScalpEnabled(enabled);
+    try {
+      const res = await fetchWithAuth(`${proxyUrl}/api/ai-dry-run/super-scalp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || 'super_scalp_toggle_failed');
+      const next = (data?.status || null) as DryRunStatus | null;
+      if (next) setStatus(next);
+      if (next?.config && typeof next.config.superScalpEnabled === 'boolean') {
+        setSuperScalpEnabled(Boolean(next.config.superScalpEnabled));
+      } else if (typeof data?.superScalpEnabled === 'boolean') {
+        setSuperScalpEnabled(Boolean(data.superScalpEnabled));
+      }
+    } catch (e: any) {
+      setSuperScalpEnabled(previous);
+      setActionError(e?.message || 'super_scalp_toggle_failed');
     }
   };
 
@@ -500,6 +549,9 @@ const AIDryRunDashboard: React.FC = () => {
             )}
             {effectiveLocalMode && (
               <span className="text-zinc-500 ml-2">MODE: LOCAL_POLICY</span>
+            )}
+            {superScalpEnabled && (
+              <span className="text-zinc-500 ml-2">SUPER_SCALP: ON</span>
             )}
             <span className={`ml-2 ${telemetryTone}`}>WS: {telemetryConnection}</span>
             <span className="text-zinc-500 ml-2">
@@ -596,6 +648,15 @@ const AIDryRunDashboard: React.FC = () => {
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <div className="text-xs text-zinc-500">
+              <label className="mb-2 flex items-center gap-2 text-[11px] text-zinc-400">
+                <input
+                  type="checkbox"
+                  checked={superScalpEnabled}
+                  onChange={(e) => { void applySuperScalpToggle(e.target.checked); }}
+                  className="accent-zinc-300"
+                />
+                SuperScalp mode (M15 sweep/reclaim)
+              </label>
               <label className="mb-2 flex items-center gap-2 text-[11px] text-zinc-400">
                 <input
                   type="checkbox"
