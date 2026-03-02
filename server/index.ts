@@ -52,9 +52,6 @@ import { SnapshotTracker } from './telemetry/Snapshot';
 import { apiKeyMiddleware, validateWebSocketApiKey } from './auth/apiKey';
 import { NewStrategyV11 } from './strategy/NewStrategyV11';
 import { DecisionLog } from './telemetry/DecisionLog';
-import { AIDryRunController } from './ai/AIDryRunController';
-import { DecisionProvider } from './ai/DecisionProvider';
-import { NoopDecisionProvider } from './ai/NoopDecisionProvider';
 import { DryRunConfig, DryRunEngine, DryRunEventInput, DryRunSessionService, isUpstreamGuardError } from './dryrun';
 import { logger, requestLogger, serializeError } from './utils/logger';
 import { WebSocketManager } from './ws/WebSocketManager';
@@ -79,7 +76,6 @@ import { SpotReferenceMonitor, SpotReferenceMetrics } from './metrics/SpotRefere
 import { HtfStructureMonitor } from './metrics/HtfStructureMonitor';
 import { OrchestratorV1 } from './orchestrator_v1/OrchestratorV1';
 import { OrchestratorV1Decision, OrchestratorV1Order, OrchestratorV1Side } from './orchestrator_v1/types';
-import { BiasConfidenceTracker } from './orchestrator_v1/BiasConfidenceTracker';
 
 // =============================================================================
 // Configuration
@@ -89,7 +85,6 @@ const PORT = parseInt(process.env.PORT || '8787', 10);
 const HOST = process.env.HOST || '0.0.0.0'; // Listen on all interfaces for Nginx proxy
 const BINANCE_REST_BASE = 'https://fapi.binance.com';
 const BINANCE_WS_BASE = 'wss://fstream.binance.com/stream';
-const BIAS_DEBUG_FIELDS = ['1', 'true', 'yes', 'on'].includes(String(process.env.BIAS_DEBUG_FIELDS || '').trim().toLowerCase());
 const DEFAULT_MAKER_FEE_RATE = Number(process.env.MAKER_FEE_BPS || '2') / 10000;
 const DEFAULT_TAKER_FEE_RATE = Number(process.env.TAKER_FEE_BPS || '4') / 10000;
 
@@ -151,21 +146,9 @@ function parseEnvFlag(value: string | undefined): boolean {
     return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on';
 }
 
-function normalizeDecisionMode(raw: string | undefined): 'off' | 'orchestrator_v1' {
-    const normalized = String(raw || '').trim().toLowerCase();
-    if (normalized === 'off') return 'off';
-    if (normalized === 'orchestrator_v1') return 'orchestrator_v1';
-    logger.error('INVALID_DECISION_MODE', {
-        provided: String(raw || ''),
-        allowed: ['off', 'orchestrator_v1'],
-    });
-    process.exit(1);
-}
-
 const EXECUTION_ENABLED_DEFAULT = parseEnvFlag(process.env.EXECUTION_ENABLED);
 let EXECUTION_ENABLED = EXECUTION_ENABLED_DEFAULT;
 const EXECUTION_ENV = 'testnet';
-const DECISION_MODE = normalizeDecisionMode(process.env.DECISION_MODE || 'off');
 let SUPER_SCALP_ENABLED = parseEnvFlag(process.env.SUPER_SCALP_ENABLED);
 
 function normalizeWsUpdateSpeed(raw: string): '100ms' | '250ms' | '500ms' {
@@ -303,10 +286,7 @@ const alertService = new AlertService(alertConfig);
 const notificationService = new NotificationService(alertConfig);
 const orchestrator = createOrchestratorFromEnv(alertService);
 const dryRunSession = new DryRunSessionService(alertService);
-const aiDryRun = new AIDryRunController(dryRunSession, decisionLog, log);
-const decisionProvider: DecisionProvider = new NoopDecisionProvider();
 const orchestratorV1 = new OrchestratorV1();
-const biasConfidenceTracker = new BiasConfidenceTracker();
 const abTestManager = new ABTestManager(alertService);
 const marketArchive = new MarketDataArchive();
 const signalReplay = new SignalReplay(marketArchive);
@@ -329,8 +309,8 @@ log('EXECUTION_CONFIG', {
     execEnabled: EXECUTION_ENABLED,
     killSwitch: KILL_SWITCH,
     env: EXECUTION_ENV,
-    decisionMode: DECISION_MODE,
-    decisionEnabled: DECISION_MODE === 'orchestrator_v1',
+    decisionMode: 'orchestrator_v1',
+    decisionEnabled: true,
     superScalpEnabled: SUPER_SCALP_ENABLED,
     hasApiKey: hasEnvApiKey,
     hasApiSecret: hasEnvApiSecret,
@@ -503,7 +483,6 @@ function updateOrchestratorDiagnostics(symbol: string, decision: OrchestratorV1D
         if (chaseActive && !timedOutNow) fallbackBlockedReason = 'NO_TIMEOUT';
         else if (timedOutNow && !impulse) fallbackBlockedReason = 'IMPULSE_FALSE';
         else if (timedOutNow && !entryCandidate) fallbackBlockedReason = 'GATES_FALSE';
-        else if (timedOutNow && DECISION_MODE !== 'orchestrator_v1') fallbackBlockedReason = 'CONFIG_BLOCK';
         else if (timedOutNow) fallbackBlockedReason = 'OTHER';
     }
     if (fallbackBlockedReason) {
@@ -1371,8 +1350,8 @@ async function processSymbolEvent(s: string, d: any) {
         const strategy = getStrategy(s);
         const backfill = getBackfill(s);
         const oiMetrics = leg.getOpenInterestMetrics();
-        const decisionFlowEnabled = decisionProvider.isDecisionEnabled();
-        let decision = decisionFlowEnabled ? meta.lastStrategyDecision : null;
+        const decisionFlowEnabled = true;
+        let decision = meta.lastStrategyDecision;
         let tasMetrics: any = null;
         let legMetrics: any = null;
         let spreadPct: number | null = null;
@@ -1482,65 +1461,8 @@ async function processSymbolEvent(s: string, d: any) {
 
         // [DRY RUN INTEGRATION]
         const isDryRunTracked = dryRunSession.isTrackingSymbol(s);
-        const aiActive = aiDryRun.isActive() && aiDryRun.isTrackingSymbol(s);
         if (shouldEvaluateStrategy && decision) {
-            if (aiActive) {
-                const snapshotTs = Number(t || now);
-                const rawPosition = dryRunSession.getStrategyPosition(s);
-                const riskState = dryRunSession.getAIDryRunRiskState(s, snapshotTs);
-                const executionState = dryRunSession.getAIDryRunExecutionState(s, snapshotTs);
-                const blockedReasons: string[] = [];
-
-                void aiDryRun.onMetrics({
-                    symbol: s,
-                    timestampMs: snapshotTs,
-                    decision: {
-                        regime: decision.regime,
-                        dfs: decision.dfs,
-                        dfsPercentile: decision.dfsPercentile,
-                        volLevel: decision.volLevel,
-                        gatePassed: decision.gatePassed,
-                        thresholds: decision.log.thresholds,
-                    },
-                    market: {
-                        price: p,
-                        vwap: legMetrics?.vwap || mid || p,
-                        spreadPct: spreadRatio,
-                        delta1s: legMetrics?.delta1s || 0,
-                        delta5s: legMetrics?.delta5s || 0,
-                        deltaZ: legMetrics?.deltaZ || 0,
-                        cvdSlope: legMetrics?.cvdSlope || 0,
-                        obiWeighted: legMetrics?.obiWeighted || 0,
-                        obiDeep: legMetrics?.obiDeep || 0,
-                        obiDivergence: legMetrics?.obiDivergence || 0,
-                    },
-                    trades: {
-                        printsPerSecond: tasMetrics?.printsPerSecond || 0,
-                        tradeCount: tasMetrics?.tradeCount || 0,
-                        aggressiveBuyVolume: tasMetrics?.aggressiveBuyVolume || 0,
-                        aggressiveSellVolume: tasMetrics?.aggressiveSellVolume || 0,
-                        burstCount: tasMetrics?.consecutiveBurst?.count || 0,
-                        burstSide: tasMetrics?.consecutiveBurst?.side || null,
-                    },
-                    liquidityMetrics: advancedBundle.liquidityMetrics,
-                    passiveFlowMetrics: advancedBundle.passiveFlowMetrics,
-                    derivativesMetrics: advancedBundle.derivativesMetrics,
-                    toxicityMetrics: advancedBundle.toxicityMetrics,
-                    regimeMetrics: advancedBundle.regimeMetrics,
-                    crossMarketMetrics: advancedBundle.crossMarketMetrics,
-                    enableCrossMarketConfirmation: advancedBundle.enableCrossMarketConfirmation,
-                    openInterest: { oiChangePct: oiMetrics ? oiMetrics.oiChangePct : null },
-                    absorption: { value: absVal, side: absVal ? side : null },
-                    volatility: backfill.getState().atr || 0,
-                    blockedReasons,
-                    riskState,
-                    executionState,
-                    position: rawPosition ? {
-                        ...rawPosition,
-                        timeInPositionMs: Math.max(0, Number(rawPosition.timeInPositionMs || 0)),
-                    } : null,
-                });
-            } else if (isDryRunTracked) {
+            if (isDryRunTracked) {
                 if (Math.random() < 0.05) {
                     log('DRY_RUN_STRATEGY_CHECK', {
                         symbol: s,
@@ -1720,47 +1642,8 @@ function defaultOrchestratorDecision(symbol: string, nowMs: number): Orchestrato
     };
 }
 
-function clamp01(value: number): number {
-    if (!Number.isFinite(value)) return 0;
-    return Math.max(0, Math.min(1, value));
-}
-
-function deriveRawBiasConfidence(decision: OrchestratorV1Decision): number {
-    const smoothed = decision.telemetry?.smoothed || { deltaZ: 0, cvdSlope: 0, obiWeighted: 0 };
-    const deltaZ = Number.isFinite(Number(smoothed.deltaZ)) ? Number(smoothed.deltaZ) : 0;
-    const cvdSlope = Number.isFinite(Number(smoothed.cvdSlope)) ? Number(smoothed.cvdSlope) : 0;
-    const obiWeighted = Number.isFinite(Number(smoothed.obiWeighted)) ? Number(smoothed.obiWeighted) : 0;
-
-    const deltaStrength = Math.min(1, Math.abs(deltaZ) / 2.5);
-    const cvdStrength = Math.min(1, Math.abs(cvdSlope) / 0.08);
-    const obiStrength = Math.min(1, Math.abs(obiWeighted) / 0.35);
-    const flowStrength = (deltaStrength + cvdStrength + obiStrength) / 3;
-
-    const gatePassRatio = (
-        Number(Boolean(decision.gateA?.passed))
-        + Number(Boolean(decision.gateB?.passed))
-        + Number(Boolean(decision.gateC?.passed))
-    ) / 3;
-    const readinessPenalty = decision.readiness.ready ? 1 : 0.85;
-    const base = decision.position.isOpen ? 0.82 : 0.45;
-    const confidence = (base + 0.28 * gatePassRatio + 0.22 * flowStrength) * readinessPenalty;
-    return Number(clamp01(confidence).toFixed(4));
-}
-
-function buildDecisionViewFromOrchestrator(decision: OrchestratorV1Decision, nowMs: number) {
+function buildDecisionViewFromOrchestrator(decision: OrchestratorV1Decision) {
     const side = decision.side === 'BUY' ? 'LONG' : (decision.side === 'SELL' ? 'SHORT' : 'NONE');
-    const readinessReady = Boolean(decision.readiness.ready);
-    const rawConfidence = deriveRawBiasConfidence(decision);
-    const biasResolution = biasConfidenceTracker.resolveWithDebug({
-        symbol: decision.symbol,
-        side,
-        hasOpenPosition: Boolean(decision.position.isOpen),
-        allGatesPassed: Boolean(decision.allGatesPassed),
-        readinessReady,
-        rawConfidence,
-    });
-    const hasRaw = Number.isFinite(rawConfidence);
-    const biasConfidence = biasResolution.confidence;
     const signal = decision.intent === 'ENTRY'
         ? (side === 'LONG' ? 'ENTRY_LONG' : (side === 'SHORT' ? 'ENTRY_SHORT' : 'NONE'))
         : decision.intent === 'ADD'
@@ -1788,35 +1671,7 @@ function buildDecisionViewFromOrchestrator(decision: OrchestratorV1Decision, now
                     ? 'ORCHESTRATOR_V1_EXIT_FLIP'
                     : (decision.readiness.reasons[0] || 'ORCHESTRATOR_V1_HOLD');
 
-    const aiBias: any = {
-        side,
-        confidence: biasConfidence,
-        source: 'STATE' as const,
-        lockedByPosition: decision.position.isOpen,
-        breakConfirm: decision.chase.repricesUsed + decision.position.addsUsed,
-        reason: vetoReason,
-        timestampMs: nowMs,
-    };
-    if (BIAS_DEBUG_FIELDS) {
-        aiBias.rawBias = biasResolution.rawBias;
-        aiBias.normalizedBias = biasResolution.normalizedBias;
-        aiBias.clampedBias = biasResolution.clampedBias;
-        aiBias.branchUsed = biasResolution.branchUsed;
-        aiBias.rawConfidence = rawConfidence;
-        aiBias.hasRaw = hasRaw;
-        aiBias.readinessReady = readinessReady;
-    }
-
     return {
-        aiTrend: {
-            side,
-            score: Number((decision.allGatesPassed ? 1 : (decision.position.isOpen ? 0.7 : 0)).toFixed(4)),
-            intact: decision.chase.active || decision.position.isOpen,
-            ageMs: decision.chase.startedAtMs ? Math.max(0, nowMs - decision.chase.startedAtMs) : 0,
-            breakConfirm: decision.chase.repricesUsed + decision.position.addsUsed,
-            source: 'runtime' as const,
-        },
-        aiBias,
         signalDisplay: {
             signal,
             score,
@@ -1998,8 +1853,6 @@ function broadcastMetrics(
         doneAtMs: Number.isFinite(Number(bootstrapState.doneAtMs)) ? Number(bootstrapState.doneAtMs) : null,
     };
     const integrity = getIntegrity(s).getStatus(now);
-    const aiTrendStatus = decisionProvider.isDecisionEnabled() ? aiDryRun.getTrendStatus(s, now) : null;
-    const aiBiasStatus = decisionProvider.isDecisionEnabled() ? aiDryRun.getBiasStatus(s, now) : null;
     const tf1m = cvdM.find((x: any) => x.timeframe === '1m') || null;
     const tf5m = cvdM.find((x: any) => x.timeframe === '5m') || null;
     const tf15m = cvdM.find((x: any) => x.timeframe === '15m') || null;
@@ -2059,10 +1912,8 @@ function broadcastMetrics(
         : Number(tf5m?.delta || 0) < 0
             ? 'SELL'
             : 'NEUTRAL';
-    let orchestratorV1Decision: OrchestratorV1Decision | null = null;
-    if (DECISION_MODE === 'orchestrator_v1') {
-        const crossMarketRuntimeActive = ENABLE_CROSS_MARKET_CONFIRMATION && activeSymbols.has('BTCUSDT');
-        let btcContext: any = null;
+    const crossMarketRuntimeActive = ENABLE_CROSS_MARKET_CONFIRMATION && activeSymbols.has('BTCUSDT');
+    let btcContext: any = null;
         if (s !== 'BTCUSDT' && crossMarketRuntimeActive) {
             try {
                 const btcHtf = getHtfMonitor('BTCUSDT').getSnapshot();
@@ -2101,12 +1952,12 @@ function broadcastMetrics(
             };
         };
 
-        const dryRunPosition = dryRunSession.isTrackingSymbol(s) ? buildDrpSnapshot(s) : null;
+        const dryRunPositionSnapshot = dryRunSession.isTrackingSymbol(s) ? buildDrpSnapshot(s) : null;
         const btcDryRunPosition = (s !== 'BTCUSDT' && crossMarketRuntimeActive && dryRunSession.isTrackingSymbol('BTCUSDT'))
             ? buildDrpSnapshot('BTCUSDT')
             : null;
 
-        orchestratorV1Decision = orchestratorV1.evaluate({
+    const orchestratorV1Decision = orchestratorV1.evaluate({
             symbol: s,
             nowMs: Number(eventTimeMs || now),
             price: Number(mid || legacyM?.price || 0),
@@ -2141,32 +1992,12 @@ function broadcastMetrics(
             barsLoaded1m: bootstrapSnapshot.barsLoaded1m,
             btcContext,
             crossMarketActive: crossMarketRuntimeActive,
-            dryRunPosition,
+            dryRunPosition: dryRunPositionSnapshot,
             btcDryRunPosition,
-        });
-    }
-    const resolvedOrchestratorDecision = orchestratorV1Decision || defaultOrchestratorDecision(s, now);
-    const orchestratorDebug = DECISION_MODE === 'orchestrator_v1'
-        ? updateOrchestratorDiagnostics(s, resolvedOrchestratorDecision, Number(eventTimeMs || now))
-        : {
-            blockReason: 'DISABLED',
-            gateA: false,
-            gateB: false,
-            gateC: false,
-            impulse: false,
-            chaseActive: false,
-        };
-    const decisionView = DECISION_MODE === 'orchestrator_v1'
-        ? buildDecisionViewFromOrchestrator(resolvedOrchestratorDecision, now)
-        : decisionProvider.evaluate({
-            symbol: s,
-            nowMs: now,
-            decision,
-            aiTrendStatus,
-            aiBiasStatus,
-            strategyPosition: rawStrategyPosition,
-            defaultVetoReason: bf.vetoReason || 'BIAS_NEUTRAL',
-        });
+    });
+    const resolvedOrchestratorDecision = orchestratorV1Decision;
+    const orchestratorDebug = updateOrchestratorDiagnostics(s, resolvedOrchestratorDecision, Number(eventTimeMs || now));
+    const decisionView = buildDecisionViewFromOrchestrator(resolvedOrchestratorDecision);
     const strategyPosition = decisionView.suppressDryRunPosition && rawPositionSource === 'dryrun'
         ? null
         : rawStrategyPosition;
@@ -2192,8 +2023,6 @@ function broadcastMetrics(
         absorption: absVal,
         openInterest: resolvedOpenInterest,
         funding: lastFunding.get(s) || null,
-        aiTrend: decisionView.aiTrend,
-        aiBias: decisionView.aiBias,
         strategyPosition: hasOpenStrategyPosition
             ? {
                 side: strategyPosition!.side,
@@ -2214,7 +2043,7 @@ function broadcastMetrics(
         bootstrap: bootstrapSnapshot,
         orderbookIntegrity: integrity,
         signalDisplay: decisionView.signalDisplay,
-        orchestratorV1: DECISION_MODE === 'orchestrator_v1' ? {
+        orchestratorV1: {
             intent: resolvedOrchestratorDecision.intent,
             side: resolvedOrchestratorDecision.side,
             readiness: resolvedOrchestratorDecision.readiness,
@@ -2231,7 +2060,7 @@ function broadcastMetrics(
             chaseDebug: resolvedOrchestratorDecision.chaseDebug,
             telemetry: resolvedOrchestratorDecision.telemetry,
             debug: orchestratorDebug,
-        } : null,
+        },
         advancedMetrics: {
             sweepFadeScore: decision?.dfsPercentile || 0,
             breakoutScore: decision?.dfsPercentile || 0,
@@ -2290,10 +2119,8 @@ function broadcastMetrics(
         });
     }
 
-    if (eventTimeMs > 0 && DECISION_MODE === 'orchestrator_v1') {
+    if (eventTimeMs > 0) {
         applyOrchestratorOrders(s, resolvedOrchestratorDecision);
-    } else if (eventTimeMs > 0) {
-        decisionRuntimeStats.executorEntrySkipped += 1;
     }
 }
 
@@ -2359,8 +2186,8 @@ app.get('/api/health', (req, res) => {
         ok: true,
         executionEnabled: EXECUTION_ENABLED,
         killSwitch: KILL_SWITCH,
-        decisionMode: DECISION_MODE,
-        decisionEnabled: DECISION_MODE === 'orchestrator_v1',
+        decisionMode: 'orchestrator_v1',
+        decisionEnabled: true,
         decisionRuntime: {
             legacyDecisionCalls: decisionRuntimeStats.legacyDecisionCalls,
             executorEntrySkipped: decisionRuntimeStats.executorEntrySkipped,
@@ -2393,7 +2220,7 @@ app.get('/api/health', (req, res) => {
             cancelCount: decisionRuntimeStats.cancelCount,
             replaceCount: decisionRuntimeStats.replaceCount,
             blockReasonCountsBySymbol: Object.fromEntries(orchestratorDiagState.blockReasonCountsBySymbol.entries()),
-            orchestratorRuntime: DECISION_MODE === 'orchestrator_v1' ? orchestratorV1.getRuntimeSnapshot() : null,
+            orchestratorRuntime: orchestratorV1.getRuntimeSnapshot(),
         },
         bootstrapRuntime: {
             limit1m: BOOTSTRAP_1M_LIMIT,
@@ -2633,171 +2460,6 @@ app.get('/api/dry-run/status', (req, res) => {
     res.json({ ok: true, status: withRuntimeStrategyConfig(dryRunSession.getStatus()) });
 });
 
-app.get('/api/ai-dry-run/status', (req, res) => {
-    res.json({
-        ok: true,
-        status: withRuntimeStrategyConfig(dryRunSession.getStatus()),
-        ai: aiDryRun.getStatus(),
-        runtime: { superScalpEnabled: SUPER_SCALP_ENABLED },
-    });
-});
-
-app.post('/api/ai-dry-run/super-scalp', (req, res) => {
-    const enabled = Boolean(req.body?.enabled);
-    SUPER_SCALP_ENABLED = enabled;
-    res.json({
-        ok: true,
-        superScalpEnabled: SUPER_SCALP_ENABLED,
-        status: withRuntimeStrategyConfig(dryRunSession.getStatus()),
-        ai: aiDryRun.getStatus(),
-    });
-});
-
-app.post('/api/ai-dry-run/start', async (req, res) => {
-    try {
-        const rawSymbols = Array.isArray(req.body?.symbols)
-            ? req.body.symbols.map((s: any) => String(s || '').toUpperCase())
-            : [];
-        const fallbackSymbol = String(req.body?.symbol || '').toUpperCase();
-        const symbolsRequested: string[] = rawSymbols.length > 0
-            ? rawSymbols.filter((s: string, idx: number, arr: string[]) => Boolean(s) && arr.indexOf(s) === idx)
-            : (fallbackSymbol ? [fallbackSymbol] : []);
-
-        if (symbolsRequested.length === 0) {
-            res.status(400).json({ ok: false, error: 'symbols_required' });
-            return;
-        }
-
-        if (typeof req.body?.superScalpEnabled !== 'undefined') {
-            SUPER_SCALP_ENABLED = Boolean(req.body.superScalpEnabled);
-        }
-
-        const apiKey = String(req.body?.apiKey || '').trim();
-        const model = String(req.body?.model || '').trim();
-        const localPolicyTestMode = ['1', 'true', 'yes', 'on']
-            .includes(String(process.env.AI_TEST_LOCAL_POLICY || 'false').trim().toLowerCase());
-        const localOnly = localPolicyTestMode && Boolean(req.body?.localOnly);
-
-        const info = await fetchExchangeInfo();
-        const symbols = Array.isArray(info?.symbols) ? info.symbols : [];
-        const unsupported = symbolsRequested.filter((s: string) => !symbols.includes(s));
-        if (unsupported.length > 0) {
-            res.status(400).json({ ok: false, error: 'symbol_not_supported', unsupported });
-            return;
-        }
-
-        const bootstrapTrendEnabled = req.body?.bootstrapTrendEnabled !== false;
-        if (bootstrapTrendEnabled) {
-            await Promise.allSettled(symbolsRequested.map((symbol: string) => backfillCoordinator.ensure(symbol)));
-        }
-
-        const fundingRates: Record<string, number> = {};
-        for (const symbol of symbolsRequested) {
-            fundingRates[symbol] = lastFunding.get(symbol)?.rate ?? Number(req.body?.fundingRate ?? 0);
-        }
-
-        const status = dryRunSession.start({
-            symbols: symbolsRequested,
-            runId: req.body?.runId ? String(req.body.runId) : `ai-${Date.now()}`,
-            walletBalanceStartUsdt: Number(req.body?.walletBalanceStartUsdt ?? 5000),
-            initialMarginUsdt: Number(req.body?.initialMarginUsdt ?? 200),
-            leverage: Number(req.body?.leverage ?? 10),
-            makerFeeRate: req.body?.makerFeeRate != null ? Number(req.body.makerFeeRate) : undefined,
-            takerFeeRate: req.body?.takerFeeRate != null ? Number(req.body.takerFeeRate) : undefined,
-            maintenanceMarginRate: Number(req.body?.maintenanceMarginRate ?? 0.005),
-            fundingRates,
-            fundingIntervalMs: Number(req.body?.fundingIntervalMs ?? (8 * 60 * 60 * 1000)),
-            heartbeatIntervalMs: Number(req.body?.heartbeatIntervalMs ?? 10_000),
-            debugAggressiveEntry: Boolean(req.body?.debugAggressiveEntry ?? false),
-        });
-
-        aiDryRun.start({
-            symbols: symbolsRequested,
-            apiKey,
-            model,
-            decisionIntervalMs: Number(req.body?.decisionIntervalMs ?? 250),
-            temperature: Number(req.body?.temperature ?? 0),
-            maxOutputTokens: Number(req.body?.maxOutputTokens ?? 256),
-            localOnly,
-            bootstrapTrendBySymbol: {},
-        });
-
-        updateDryRunHealthFlag();
-        dryRunForcedSymbols.clear();
-        for (const symbol of symbolsRequested) {
-            dryRunForcedSymbols.add(symbol);
-        }
-        updateStreams();
-
-        for (const symbol of symbolsRequested) {
-            const ob = getOrderbook(symbol);
-            if (ob.lastUpdateId === 0 || ob.uiState === 'INIT') {
-                transitionOrderbookState(symbol, 'SNAPSHOT_PENDING', 'ai_dry_run_start');
-                fetchSnapshot(symbol, 'ai_dry_run_start', true).catch((e) => {
-                    log('AI_DRY_RUN_SNAPSHOT_ERROR', { symbol, error: e?.message || 'ai_dry_run_snapshot_failed' });
-                });
-            }
-        }
-
-        res.json({
-            ok: true,
-            status: withRuntimeStrategyConfig(status),
-            ai: aiDryRun.getStatus(),
-            runtime: { superScalpEnabled: SUPER_SCALP_ENABLED },
-            bootstrapTrend: {
-                enabled: bootstrapTrendEnabled,
-                mode: 'DISABLED_FOR_DECISION',
-                seededSymbols: [],
-            },
-            bootstrapBackfill: {
-                limit1m: BOOTSTRAP_1M_LIMIT,
-                symbols: symbolsRequested.reduce((acc: Record<string, any>, symbol: string) => {
-                    acc[symbol] = backfillCoordinator.getState(symbol);
-                    return acc;
-                }, {}),
-            },
-        });
-    } catch (e: any) {
-        res.status(500).json({ ok: false, error: e?.message || 'ai_dry_run_start_failed' });
-    }
-});
-
-app.post('/api/ai-dry-run/stop', (req, res) => {
-    try {
-        aiDryRun.stop();
-        const status = dryRunSession.stop();
-        updateDryRunHealthFlag();
-        dryRunForcedSymbols.clear();
-        updateStreams();
-        res.json({
-            ok: true,
-            status: withRuntimeStrategyConfig(status),
-            ai: aiDryRun.getStatus(),
-            runtime: { superScalpEnabled: SUPER_SCALP_ENABLED },
-        });
-    } catch (e: any) {
-        res.status(500).json({ ok: false, error: e?.message || 'ai_dry_run_stop_failed' });
-    }
-});
-
-app.post('/api/ai-dry-run/reset', (req, res) => {
-    try {
-        aiDryRun.stop();
-        const status = dryRunSession.reset();
-        updateDryRunHealthFlag();
-        dryRunForcedSymbols.clear();
-        updateStreams();
-        res.json({
-            ok: true,
-            status: withRuntimeStrategyConfig(status),
-            ai: aiDryRun.getStatus(),
-            runtime: { superScalpEnabled: SUPER_SCALP_ENABLED },
-        });
-    } catch (e: any) {
-        res.status(500).json({ ok: false, error: e?.message || 'ai_dry_run_reset_failed' });
-    }
-});
-
 app.get('/api/dry-run/sessions', async (_req, res) => {
     try {
         const sessions = await dryRunSession.listSessions();
@@ -2903,7 +2565,6 @@ app.post('/api/dry-run/start', async (req, res) => {
 
 app.post('/api/dry-run/stop', (req, res) => {
     try {
-        aiDryRun.stop();
         const status = dryRunSession.stop();
         updateDryRunHealthFlag();
         dryRunForcedSymbols.clear();
@@ -2916,7 +2577,6 @@ app.post('/api/dry-run/stop', (req, res) => {
 
 app.post('/api/dry-run/reset', (req, res) => {
     try {
-        aiDryRun.stop();
         const status = dryRunSession.reset();
         updateDryRunHealthFlag();
         dryRunForcedSymbols.clear();
