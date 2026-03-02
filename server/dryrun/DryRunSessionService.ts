@@ -310,12 +310,12 @@ const DEFAULT_TRAIL_ACTIVATE_R = clampNumber(process.env.TRAIL_ACTIVATE_R, 3.0, 
 const DEFAULT_TRAIL_CONFIRM_TICKS = Math.max(1, Math.trunc(clampNumber(process.env.TRAIL_CONFIRM_TICKS, 4, 1, 20)));
 const DEFAULT_TRAIL_MIN_HOLD_MS = Math.max(0, Math.trunc(clampNumber(process.env.TRAIL_MIN_HOLD_MS, 180_000, 0, 1_800_000)));
 const DEFAULT_MAX_SPREAD_PCT = clampNumber(process.env.MAX_SPREAD_PCT, 0.0008, 0, 0.01);
-const DEFAULT_AI_MAX_MARGIN_USAGE_PCT = clampNumber(process.env.AI_MAX_MARGIN_USAGE_PCT, 0.85, 0.3, 0.98);
-const DEFAULT_AI_MAX_POSITION_NOTIONAL = clampNumber(process.env.AI_MAX_POSITION_NOTIONAL_USDT, DEFAULT_MAX_NOTIONAL, 10, 10_000_000);
-const DEFAULT_AI_DAILY_LOSS_LOCK_PCT = clampNumber(process.env.AI_DAILY_LOSS_LOCK_PCT, 0.05, 0.005, 0.5);
-const DEFAULT_AI_DUST_MIN_NOTIONAL_USDT = clampNumber(process.env.AI_DUST_MIN_NOTIONAL_USDT, 5, 0.1, 1_000);
-const DEFAULT_AI_DUST_MIN_QTY = clampNumber(process.env.AI_DUST_MIN_QTY, 0.000001, 0.0000001, 0.01);
-const DEFAULT_AI_MIN_REDUCE_NOTIONAL_USDT = clampNumber(process.env.AI_MIN_REDUCE_NOTIONAL_USDT, 15, 0.1, 1_000);
+const DEFAULT_MAX_MARGIN_USAGE_PCT = clampNumber(process.env.MAX_MARGIN_USAGE_PCT, 0.85, 0.3, 0.98);
+const DEFAULT_MAX_POSITION_NOTIONAL = clampNumber(process.env.MAX_POSITION_NOTIONAL_USDT, DEFAULT_MAX_NOTIONAL, 10, 10_000_000);
+const DEFAULT_DAILY_LOSS_LOCK_PCT = clampNumber(process.env.DAILY_LOSS_LOCK_PCT, 0.05, 0.005, 0.5);
+const DEFAULT_DUST_MIN_NOTIONAL_USDT = clampNumber(process.env.DUST_MIN_NOTIONAL_USDT, 5, 0.1, 1_000);
+const DEFAULT_DUST_MIN_QTY = clampNumber(process.env.DUST_MIN_QTY, 0.000001, 0.0000001, 0.01);
+const DEFAULT_MIN_REDUCE_NOTIONAL_USDT = clampNumber(process.env.MIN_REDUCE_NOTIONAL_USDT, 15, 0.1, 1_000);
 const DEFAULT_STRAT_ENTRY_CANCEL_STREAK_TRIGGER = Math.max(1, Math.trunc(clampNumber(process.env.STRAT_ENTRY_CANCEL_STREAK_TRIGGER, 2, 1, 10)));
 const DEFAULT_STRAT_ENTRY_CANCEL_BASE_COOLDOWN_MS = Math.max(1000, Math.trunc(clampNumber(process.env.STRAT_ENTRY_CANCEL_BASE_COOLDOWN_MS, 15_000, 1000, 300_000)));
 const DEFAULT_STRAT_ENTRY_CANCEL_MAX_COOLDOWN_MS = Math.max(
@@ -1028,9 +1028,9 @@ export class DryRunSessionService {
           forceFullClose =
             !(reduceQty > 0)
             || reduceQty >= fullQty
-            || residualQty <= DEFAULT_AI_DUST_MIN_QTY
-            || (residualNotional > 0 && residualNotional <= DEFAULT_AI_DUST_MIN_NOTIONAL_USDT)
-            || (reduceNotional > 0 && reduceNotional < DEFAULT_AI_MIN_REDUCE_NOTIONAL_USDT);
+            || residualQty <= DEFAULT_DUST_MIN_QTY
+            || (residualNotional > 0 && residualNotional <= DEFAULT_DUST_MIN_NOTIONAL_USDT)
+            || (reduceNotional > 0 && reduceNotional < DEFAULT_MIN_REDUCE_NOTIONAL_USDT);
           if (forceFullClose) {
             reduceQty = fullQty;
           }
@@ -2239,7 +2239,7 @@ export class DryRunSessionService {
     const microprice = (bidQty > 0 && askQty > 0)
       ? ((bestAsk * bidQty) + (bestBid * askQty)) / (bidQty + askQty)
       : ((bestBid + bestAsk) / 2);
-    const offsetBps = clampNumber(process.env.AI_MICROPRICE_OFFSET_BPS, 1.5, 0.1, 25);
+    const offsetBps = clampNumber(process.env.MICROPRICE_OFFSET_BPS, 1.5, 0.1, 25);
     const offset = offsetBps / 10_000;
 
     // Use touch maker price (best bid/ask) for quicker fills while staying post-only.
@@ -2253,7 +2253,7 @@ export class DryRunSessionService {
     const price = roundTo(rawPrice, 6);
     if (!(price > 0)) return null;
 
-    const ttlMs = Math.max(250, Math.trunc(clampNumber(process.env.AI_LIMIT_TTL_MS, 4000, 250, 10_000)));
+    const ttlMs = Math.max(250, Math.trunc(clampNumber(process.env.LIMIT_TTL_MS, 4000, 250, 10_000)));
     return {
       side,
       type: 'LIMIT',
@@ -2281,8 +2281,8 @@ export class DryRunSessionService {
     if (!(qty > 0)) return false;
     const priceRef = Math.max(0, Number(markPrice || 0), Number(position.entryPrice || 0));
     const notional = qty * priceRef;
-    if (qty <= DEFAULT_AI_DUST_MIN_QTY) return true;
-    if (notional > 0 && notional <= DEFAULT_AI_DUST_MIN_NOTIONAL_USDT) return true;
+    if (qty <= DEFAULT_DUST_MIN_QTY) return true;
+    if (notional > 0 && notional <= DEFAULT_DUST_MIN_NOTIONAL_USDT) return true;
     return false;
   }
 
@@ -2557,7 +2557,7 @@ export class DryRunSessionService {
 
     if (legacyCap) {
       // Legacy behavior: targetNotionalEntry is a hard cap for the whole position
-      const baseEntryPct = clampNumber(process.env.AI_BASE_ENTRY_PCT, 0.35, 0.25, 0.55);
+      const baseEntryPct = clampNumber(process.env.BASE_ENTRY_PCT, 0.35, 0.25, 0.55);
       const baseNotional = targetNotionalEntry * baseEntryPct;
       const requestedNotional = Math.max(0, baseNotional * normalizedMultiplier);
 
