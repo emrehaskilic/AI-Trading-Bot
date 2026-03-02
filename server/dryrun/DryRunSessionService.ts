@@ -316,13 +316,13 @@ const DEFAULT_AI_DAILY_LOSS_LOCK_PCT = clampNumber(process.env.AI_DAILY_LOSS_LOC
 const DEFAULT_AI_DUST_MIN_NOTIONAL_USDT = clampNumber(process.env.AI_DUST_MIN_NOTIONAL_USDT, 5, 0.1, 1_000);
 const DEFAULT_AI_DUST_MIN_QTY = clampNumber(process.env.AI_DUST_MIN_QTY, 0.000001, 0.0000001, 0.01);
 const DEFAULT_AI_MIN_REDUCE_NOTIONAL_USDT = clampNumber(process.env.AI_MIN_REDUCE_NOTIONAL_USDT, 15, 0.1, 1_000);
-const DEFAULT_AI_ENTRY_CANCEL_STREAK_TRIGGER = Math.max(1, Math.trunc(clampNumber(process.env.AI_ENTRY_CANCEL_STREAK_TRIGGER, 2, 1, 10)));
-const DEFAULT_AI_ENTRY_CANCEL_BASE_COOLDOWN_MS = Math.max(1000, Math.trunc(clampNumber(process.env.AI_ENTRY_CANCEL_BASE_COOLDOWN_MS, 15_000, 1000, 300_000)));
-const DEFAULT_AI_ENTRY_CANCEL_MAX_COOLDOWN_MS = Math.max(
-  DEFAULT_AI_ENTRY_CANCEL_BASE_COOLDOWN_MS,
-  Math.trunc(clampNumber(process.env.AI_ENTRY_CANCEL_MAX_COOLDOWN_MS, 120_000, DEFAULT_AI_ENTRY_CANCEL_BASE_COOLDOWN_MS, 900_000))
+const DEFAULT_STRAT_ENTRY_CANCEL_STREAK_TRIGGER = Math.max(1, Math.trunc(clampNumber(process.env.STRAT_ENTRY_CANCEL_STREAK_TRIGGER, 2, 1, 10)));
+const DEFAULT_STRAT_ENTRY_CANCEL_BASE_COOLDOWN_MS = Math.max(1000, Math.trunc(clampNumber(process.env.STRAT_ENTRY_CANCEL_BASE_COOLDOWN_MS, 15_000, 1000, 300_000)));
+const DEFAULT_STRAT_ENTRY_CANCEL_MAX_COOLDOWN_MS = Math.max(
+  DEFAULT_STRAT_ENTRY_CANCEL_BASE_COOLDOWN_MS,
+  Math.trunc(clampNumber(process.env.STRAT_ENTRY_CANCEL_MAX_COOLDOWN_MS, 120_000, DEFAULT_STRAT_ENTRY_CANCEL_BASE_COOLDOWN_MS, 900_000))
 );
-const DEFAULT_AI_ENTRY_CANCEL_BACKOFF_MULT = clampNumber(process.env.AI_ENTRY_CANCEL_BACKOFF_MULT, 1.75, 1, 4);
+const DEFAULT_STRAT_ENTRY_CANCEL_BACKOFF_MULT = clampNumber(process.env.STRAT_ENTRY_CANCEL_BACKOFF_MULT, 1.75, 1, 4);
 
 function parseLimitStrategy(input: string): LimitStrategyMode {
   switch (input) {
@@ -871,7 +871,7 @@ export class DryRunSessionService {
               position.side === 'LONG' ? 'SELL' : 'BUY',
               closeQty,
               true,
-              'AI_REVERSAL_EXIT'
+              'STRAT_REVERSAL_EXIT'
             );
             if (closeOrder) {
               queueOrder(closeOrder);
@@ -896,7 +896,7 @@ export class DryRunSessionService {
             if (aiPolicyAction) {
               if (!this.isAiExecutionHealthy(session)) continue;
               if (this.hasLiveWorkingOrderForSide(session, desiredOrderSide)) continue;
-              const addOrder = this.buildAiPostOnlyEntryOrder(session, desiredOrderSide, sizing.qty, 'AI_ADD', strictMeta.enabled);
+              const addOrder = this.buildAiPostOnlyEntryOrder(session, desiredOrderSide, sizing.qty, 'STRAT_ADD', strictMeta.enabled);
               if (!addOrder) continue;
               queueOrder(addOrder);
             } else {
@@ -912,7 +912,7 @@ export class DryRunSessionService {
                 ladderCount: laddersRequested,
               });
               for (const order of addOrders) {
-                queueOrder({ ...order, reasonCode: 'AI_ADD' });
+                queueOrder({ ...order, reasonCode: 'STRAT_ADD' });
               }
             }
             session.addOnState.count += 1;
@@ -938,7 +938,7 @@ export class DryRunSessionService {
           if (!this.isAiExecutionHealthy(session)) continue;
           if (this.shouldBlockAiEntryByCooldown(session, normalized, decisionTs)) continue;
           if (this.hasLiveWorkingOrderForSide(session, desiredOrderSide)) continue;
-          const entryOrder = this.buildAiPostOnlyEntryOrder(session, desiredOrderSide, sizing.qty, 'AI_ENTRY', strictMeta.enabled);
+          const entryOrder = this.buildAiPostOnlyEntryOrder(session, desiredOrderSide, sizing.qty, 'STRAT_ENTRY', strictMeta.enabled);
           if (!entryOrder) continue;
           queueOrder(entryOrder);
         } else {
@@ -954,7 +954,7 @@ export class DryRunSessionService {
             ladderCount: laddersRequested,
           });
           for (const order of entryOrders) {
-            queueOrder({ ...order, reasonCode: 'AI_ENTRY' });
+            queueOrder({ ...order, reasonCode: 'STRAT_ENTRY' });
           }
         }
         session.lastEntryEventTs = decisionTs;
@@ -981,7 +981,7 @@ export class DryRunSessionService {
         if (aiPolicyAction) {
           if (!this.isAiExecutionHealthy(session)) continue;
           if (this.hasLiveWorkingOrderForSide(session, currentSide)) continue;
-          const addOrder = this.buildAiPostOnlyEntryOrder(session, currentSide, sizing.qty, 'AI_ADD', strictMeta.enabled);
+          const addOrder = this.buildAiPostOnlyEntryOrder(session, currentSide, sizing.qty, 'STRAT_ADD', strictMeta.enabled);
           if (!addOrder) continue;
           queueOrder(addOrder);
         } else {
@@ -997,7 +997,7 @@ export class DryRunSessionService {
             ladderCount: laddersRequested,
           });
           for (const order of addOrders) {
-            queueOrder({ ...order, reasonCode: 'AI_ADD' });
+            queueOrder({ ...order, reasonCode: 'STRAT_ADD' });
           }
         }
         session.addOnState.count += 1;
@@ -1041,12 +1041,12 @@ export class DryRunSessionService {
           position.side === 'LONG' ? 'SELL' : 'BUY',
           reduceQty,
           true,
-          forceFullClose ? 'AI_EXIT' : 'AI_REDUCE'
+          forceFullClose ? 'STRAT_EXIT' : 'STRAT_REDUCE'
         );
         if (reduceOrder) {
           queueOrder(reduceOrder);
           if (forceFullClose) {
-            session.pendingExitReason = action.reason || session.pendingExitReason || 'AI_DUST_FLATTEN';
+            session.pendingExitReason = action.reason || session.pendingExitReason || 'STRAT_DUST_FLATTEN';
             this.addConsoleLog('INFO', normalized, `AI reduce escalated to full exit for ${position.side} (dust guard)`, session.lastEventTimestampMs);
           } else {
             this.addConsoleLog('INFO', normalized, `AI reduce ${position.side} -${reduceQty} (${(reducePct * 100).toFixed(0)}%)`, session.lastEventTimestampMs);
@@ -1063,7 +1063,7 @@ export class DryRunSessionService {
           position.side === 'LONG' ? 'SELL' : 'BUY',
           exitQty,
           true,
-          'AI_EXIT'
+          'STRAT_EXIT'
         );
         if (exitOrder) {
           queueOrder(exitOrder);
@@ -1603,11 +1603,11 @@ export class DryRunSessionService {
           position.side === 'LONG' ? 'SELL' : 'BUY',
           closeQty,
           true,
-          'AI_EXIT'
+          'STRAT_EXIT'
         );
         if (closeOrder) {
           orders.push(closeOrder);
-          session.pendingExitReason = 'AI_DUST_FLATTEN';
+          session.pendingExitReason = 'STRAT_DUST_FLATTEN';
           this.addConsoleLog('INFO', session.symbol, `Dust cleanup queued (${position.side} ${closeQty})`, eventTimestampMs);
           return orders;
         }
@@ -2219,7 +2219,7 @@ export class DryRunSessionService {
     if (!(bestBid > 0) || !(bestAsk > 0)) return null;
 
     const forcePostOnlyEnv = ['1', 'true', 'yes', 'on'].includes(
-      String(process.env.AI_ENTRY_POST_ONLY || 'false').trim().toLowerCase()
+      String(process.env.STRAT_ENTRY_POST_ONLY || 'false').trim().toLowerCase()
     );
     const forcePostOnly = forcePostOnlyFromPolicy || forcePostOnlyEnv;
     if (!forcePostOnly) {
@@ -2321,7 +2321,7 @@ export class DryRunSessionService {
   }
 
   private registerAiEntryOrderOutcome(session: SymbolSession, symbol: string, order: DryRunEventLog['orderResults'][number], eventTimestampMs: number): void {
-    if (order.reasonCode !== 'AI_ENTRY') return;
+    if (order.reasonCode !== 'STRAT_ENTRY') return;
 
     const filledQty = Math.max(0, Number(order.filledQty || 0));
     if ((order.status === 'FILLED' || order.status === 'PARTIALLY_FILLED') && filledQty > 0) {
@@ -2333,12 +2333,12 @@ export class DryRunSessionService {
     if (!isEntryCancelWithoutFill) return;
 
     session.aiEntryCancelStreak += 1;
-    if (session.aiEntryCancelStreak < DEFAULT_AI_ENTRY_CANCEL_STREAK_TRIGGER) return;
+    if (session.aiEntryCancelStreak < DEFAULT_STRAT_ENTRY_CANCEL_STREAK_TRIGGER) return;
 
-    const backoffExponent = session.aiEntryCancelStreak - DEFAULT_AI_ENTRY_CANCEL_STREAK_TRIGGER;
+    const backoffExponent = session.aiEntryCancelStreak - DEFAULT_STRAT_ENTRY_CANCEL_STREAK_TRIGGER;
     const cooldownMs = Math.min(
-      DEFAULT_AI_ENTRY_CANCEL_MAX_COOLDOWN_MS,
-      Math.round(DEFAULT_AI_ENTRY_CANCEL_BASE_COOLDOWN_MS * Math.pow(DEFAULT_AI_ENTRY_CANCEL_BACKOFF_MULT, Math.max(0, backoffExponent)))
+      DEFAULT_STRAT_ENTRY_CANCEL_MAX_COOLDOWN_MS,
+      Math.round(DEFAULT_STRAT_ENTRY_CANCEL_BASE_COOLDOWN_MS * Math.pow(DEFAULT_STRAT_ENTRY_CANCEL_BACKOFF_MULT, Math.max(0, backoffExponent)))
     );
     const nextAllowedTs = eventTimestampMs + cooldownMs;
     if (nextAllowedTs > session.aiEntryCooldownUntilMs) {
