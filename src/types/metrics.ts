@@ -38,16 +38,6 @@ export interface StrategyPositionSnapshot {
   timeInPositionMs: number;
 }
 
-export interface AIBiasSnapshot {
-  side: 'LONG' | 'SHORT' | 'NEUTRAL' | 'NONE';
-  confidence: number;
-  source: 'POSITION_LOCK' | 'TREND_LOCK' | 'STATE' | 'EXIT_SIGNAL' | 'DISABLED';
-  lockedByPosition: boolean;
-  breakConfirm: number;
-  reason: string | null;
-  timestampMs: number;
-}
-
 export interface SnapshotMetadata {
   eventId: number;
   stateHash: string;
@@ -359,15 +349,6 @@ export interface MetricsMessage {
   absorption: number | null;
   openInterest: OpenInterestMetrics | null;
   funding: FundingContext | null;
-  aiTrend?: {
-    side: 'LONG' | 'SHORT' | 'NONE' | null;
-    score: number;
-    intact: boolean;
-    ageMs: number | null;
-    breakConfirm: number;
-    source?: 'runtime' | 'bootstrap' | 'disabled';
-  } | null;
-  aiBias?: AIBiasSnapshot | null;
   legacyMetrics: LegacyMetrics;
   orderbookIntegrity?: {
     symbol: string;

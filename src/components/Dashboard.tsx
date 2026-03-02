@@ -1,14 +1,12 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import LiveTelemetryDashboard from './LiveTelemetryDashboard';
 import DryRunDashboard from './DryRunDashboard';
-import AIDryRunDashboard from './AIDryRunDashboard';
 import { isViewerModeEnabled } from '../services/proxyAuth';
 
-type AppTab = 'telemetry' | 'dry-run' | 'ai-dry-run';
+type AppTab = 'telemetry' | 'dry-run';
 
 function tabFromHash(hash: string): AppTab {
   if (hash === '#dry-run') return 'dry-run';
-  if (hash === '#ai-dry-run') return 'ai-dry-run';
   return 'telemetry';
 }
 
@@ -34,7 +32,6 @@ const Dashboard: React.FC = () => {
       : [
           { id: 'telemetry', label: 'Live Telemetry' },
           { id: 'dry-run', label: 'Dry Run' },
-          { id: 'ai-dry-run', label: 'AI Dry Run' },
         ]
   ), [readonlyViewer]);
 
@@ -45,9 +42,7 @@ const Dashboard: React.FC = () => {
     setActiveTab(tab);
     const hash = tab === 'dry-run'
       ? '#dry-run'
-      : tab === 'ai-dry-run'
-        ? '#ai-dry-run'
-        : '#telemetry';
+      : '#telemetry';
     if (window.location.hash !== hash) {
       window.history.replaceState(null, '', hash);
     }
@@ -86,14 +81,9 @@ const Dashboard: React.FC = () => {
       </div>
 
       {!readonlyViewer && (
-        <>
-          <div className={activeTab === 'dry-run' ? 'block' : 'hidden'}>
-            <DryRunDashboard />
-          </div>
-          <div className={activeTab === 'ai-dry-run' ? 'block' : 'hidden'}>
-            <AIDryRunDashboard />
-          </div>
-        </>
+        <div className={activeTab === 'dry-run' ? 'block' : 'hidden'}>
+          <DryRunDashboard />
+        </div>
       )}
     </div>
   );

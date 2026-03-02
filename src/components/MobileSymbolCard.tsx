@@ -28,29 +28,16 @@ const MobileSymbolCard: React.FC<MobileSymbolCardProps> = ({ symbol, metrics, sh
   const lm = metrics.legacyMetrics;
   const sessionVwap = metrics.sessionVwap || null;
   const htf = metrics.htf || null;
-  const trend = metrics.aiTrend || null;
-  const aiBias = metrics.aiBias || null;
   const positionSide = metrics.strategyPosition?.side || null;
-  const biasSide = aiBias?.side === 'LONG' || aiBias?.side === 'SHORT' ? aiBias.side : null;
-  const trendSide = positionSide || biasSide || 'NEUTRAL';
+  const trendSide = positionSide || 'NEUTRAL';
   const trendScorePct = positionSide
     ? 100
-    : (aiBias
-      ? Math.round(Math.max(0, Math.min(1, Number(aiBias.confidence || 0))) * 100)
-      : 0);
+    : 0;
   const trendClass = positionSide
     ? (positionSide === 'LONG'
       ? 'bg-emerald-900/35 text-emerald-200 border-emerald-700/50'
       : 'bg-rose-900/35 text-rose-200 border-rose-700/50')
-    : !trendSide || trendSide === 'NEUTRAL'
-      ? 'bg-zinc-800 text-zinc-500 border-zinc-700'
-      : (!aiBias && trend && !trend.intact)
-        ? 'bg-amber-900/30 text-amber-300 border-amber-700/40'
-        : trendSide === 'LONG'
-          ? 'bg-emerald-900/25 text-emerald-300 border-emerald-700/40'
-          : trendSide === 'SHORT'
-            ? 'bg-rose-900/25 text-rose-300 border-rose-700/40'
-            : 'bg-zinc-800 text-zinc-300 border-zinc-700';
+    : 'bg-zinc-800 text-zinc-500 border-zinc-700';
 
   const posNegClass = (n: number) => (n > 0 ? 'text-emerald-300' : n < 0 ? 'text-rose-300' : 'text-zinc-300');
   const inferTickSize = (): number => {
@@ -118,10 +105,10 @@ const MobileSymbolCard: React.FC<MobileSymbolCardProps> = ({ symbol, metrics, sh
             <div className="text-[10px] text-zinc-500 font-mono">
               Session {sessionVwap?.name || '—'} | sVWAP {fmtPrice(sessionVwap?.value)} | Δbps {fmtSigned(sessionVwap?.priceDistanceBps, 1)} | Rng {fmtPct(sessionVwap?.sessionRangePct, 2)}
             </div>
-            {(trend || aiBias || positionSide) && (
+            {positionSide && (
               <div className="mt-1">
                 <span className={`text-[10px] px-1.5 py-0.5 rounded border uppercase tracking-tight ${trendClass}`}>
-                  {positionSide ? 'Position' : (aiBias ? 'Bias' : 'Trend')} {trendSide} {trendScorePct ?? 0}
+                  Position {trendSide} {trendScorePct}
                 </span>
               </div>
             )}
