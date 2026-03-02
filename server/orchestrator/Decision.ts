@@ -1,7 +1,7 @@
 import { DecisionAction, GateResult, OrchestratorMetricsInput, SymbolState } from './types';
 import { OrderType } from '../connectors/executionTypes';
 import { NewStrategyV11 } from '../strategy/NewStrategyV11';
-import { RiskGovernorV11 } from '../risk/RiskGovernorV11';
+import { ExecutionRiskModelV11 } from '../risk/ExecutionRiskModelV11';
 import { StrategyInput, StrategySide } from '../types/strategy';
 
 export interface DecisionDependencies {
@@ -27,7 +27,7 @@ export interface DecisionDependencies {
 
 export class DecisionEngine {
   private readonly strategy = new NewStrategyV11();
-  private readonly risk = new RiskGovernorV11();
+  private readonly risk = new ExecutionRiskModelV11();
 
   constructor(private readonly deps: DecisionDependencies) {}
 

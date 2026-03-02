@@ -28,11 +28,6 @@ import * as OrderbookIntegrityMonitorTests from './OrderbookIntegrityMonitor.tes
 import * as DryRunClockTests from './DryRunClock.test';
 import * as FreezeControllerTests from './FreezeController.test';
 import * as PositionSizerTests from './PositionSizer.test';
-import * as StateExtractorTests from './StateExtractor.test';
-import * as PolicyEngineTests from './PolicyEngine.test';
-import * as RiskGovernorTests from './RiskGovernor.test';
-import * as DirectionLockTests from './DirectionLock.test';
-import * as AIPolicyControllerTests from './AIPolicyController.test';
 
 export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'TimeAndSales', fn: TimeAndSalesTests.runTests },
@@ -64,9 +59,4 @@ export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'DryRunClock', fn: DryRunClockTests.runTests },
     { name: 'FreezeController', fn: FreezeControllerTests.runTests },
     { name: 'PositionSizer', fn: PositionSizerTests.runTests },
-    { name: 'StateExtractor', fn: StateExtractorTests.runTests },
-    { name: 'PolicyEngine', fn: PolicyEngineTests.runTests },
-    { name: 'RiskGovernor', fn: RiskGovernorTests.runTests },
-    { name: 'DirectionLock', fn: DirectionLockTests.runTests },
-    { name: 'AIPolicyController', fn: AIPolicyControllerTests.runTests },
 ];

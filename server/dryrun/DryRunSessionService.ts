@@ -1101,7 +1101,7 @@ export class DryRunSessionService {
     return Number.isFinite(value) ? value : null;
   }
 
-  getAIDryRunRiskState(symbol: string, timestampMs?: number): {
+  getStrategyRiskState(symbol: string, timestampMs?: number): {
     equity: number;
     leverage: number;
     startingMarginUser: number;
@@ -1160,7 +1160,7 @@ export class DryRunSessionService {
     };
   }
 
-  getAIDryRunExecutionState(symbol: string, timestampMs?: number): {
+  getStrategyExecutionState(symbol: string, timestampMs?: number): {
     lastAction: 'NONE' | 'HOLD' | 'ENTER' | 'MANAGE' | 'EXIT';
     holdStreak: number;
     lastAddMsAgo: number | null;
