@@ -1597,7 +1597,7 @@ async function processSymbolEvent(s: string, d: any) {
             && (!decision || (now - meta.lastStrategyEvalTs) >= STRATEGY_EVAL_MIN_INTERVAL_MS);
         if (shouldEvaluateStrategy) {
             const calcStart = Date.now();
-            legMetrics = leg.computeMetrics(ob);
+            legMetrics = leg.computeMetrics(ob, Number(t || now));
             tasMetrics = tas.computeMetrics();
             const integrity = getIntegrity(s).getStatus(now);
             const bestBidPx = bestBid(ob);
@@ -1698,7 +1698,7 @@ async function processSymbolEvent(s: string, d: any) {
         const isDryRunTracked = dryRunSession.isTrackingSymbol(s);
         if (shouldEvaluateStrategy && decision) {
             if (isDryRunTracked) {
-                if (Math.random() < 0.05) {
+                if ((Number(t || now) % 20) === 0) {
                     log('DRY_RUN_STRATEGY_CHECK', {
                         symbol: s,
                         regime: decision.regime,
@@ -2039,14 +2039,14 @@ function broadcastMetrics(
         return;
     }
 
-    const cvdM = precomputed?.cvdMetrics ?? cvd.computeMetrics();
+    const cvdM = precomputed?.cvdMetrics ?? cvd.computeMetrics(Number(eventTimeMs || now));
     const tasMetrics = precomputed?.tasMetrics ?? tas.computeMetrics();
     // Calculate OBI/Legacy if Orderbook has data (bids and asks exist)
     // This allows metrics to continue displaying during brief resyncs
     const hasBookData = ob.bids.size > 0 && ob.asks.size > 0;
     const legacyM = precomputed && Object.prototype.hasOwnProperty.call(precomputed, 'legacyMetrics')
         ? precomputed.legacyMetrics
-        : (hasBookData ? leg.computeMetrics(ob) : null);
+        : (hasBookData ? leg.computeMetrics(ob, Number(eventTimeMs || now)) : null);
     if (legacyM) {
         meta.lastLegacyMetrics = legacyM;
     }

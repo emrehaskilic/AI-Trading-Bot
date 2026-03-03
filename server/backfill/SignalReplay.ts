@@ -63,7 +63,7 @@ export class SignalReplay {
         }
         tas.addTrade({ price, quantity: qty, side, timestamp: event.timestampMs });
         legacy.addTrade({ price, quantity: qty, side, timestamp: event.timestampMs });
-        const metrics = legacy.computeMetrics(orderbook);
+        const metrics = legacy.computeMetrics(orderbook, event.timestampMs);
         if (metrics) {
           const tasMetrics = tas.computeMetrics();
           const decision = strategy.evaluate({
