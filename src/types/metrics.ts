@@ -69,6 +69,14 @@ export interface LegacyMetrics {
   totalVolume: number;
   totalNotional: number;
   tradeCount: number;
+  sweepFadeScore?: number;
+  breakoutScore?: number;
+  regimeWeight?: number;
+  absorptionScore?: number;
+  exhaustion?: {
+    isExhausted?: boolean;
+    confidence?: number;
+  } | null;
 }
 
 /**
