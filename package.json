@@ -10,6 +10,7 @@
     "benchmark": "tsx scripts/benchmark.ts",
     "analytics:test": "tsx scripts/analytics_simulation_test.ts",
     "strategy:test": "tsx scripts/run_strategy_tests.ts",
+    "redteam:test": "tsx scripts/redteam_simulation_test.ts",
     "build": "vite build",
     "build:server": "cd server && npm run build",
     "build:all": "npm run build:server && npm run build",

@@ -89,6 +89,7 @@ import {
     StrategyRegistry,
 } from './strategies';
 import { ConsensusEngine } from './consensus/ConsensusEngine';
+import { ResiliencePatches } from './risk/ResiliencePatches';
 
 // =============================================================================
 // Configuration
@@ -226,6 +227,13 @@ const RISK_ENGINE_CONFIG = {
             : parseEnvFlag(process.env.RISK_AUTO_CLOSE_POSITIONS),
     },
 };
+const RESILIENCE_PATCHES_ENABLED = process.env.RESILIENCE_PATCHES_ENABLED == null
+    ? true
+    : parseEnvFlag(process.env.RESILIENCE_PATCHES_ENABLED);
+const RESILIENCE_SUPPRESS_MIN_MULTIPLIER = Math.max(
+    0,
+    Math.min(1, parseEnvNumber(process.env.RESILIENCE_SUPPRESS_MIN_MULTIPLIER, 0.75))
+);
 const ANALYTICS_PERSIST_TO_DISK = process.env.ANALYTICS_PERSIST_TO_DISK == null
     ? false
     : parseEnvFlag(process.env.ANALYTICS_PERSIST_TO_DISK);
@@ -430,12 +438,21 @@ const signalReplay = new SignalReplay(marketArchive);
 const portfolioMonitor = new PortfolioMonitor();
 const latencyTracker = new LatencyTracker();
 const institutionalRiskEngine = new InstitutionalRiskEngine(RISK_ENGINE_CONFIG);
+const resiliencePatches = new ResiliencePatches({
+    enableAll: RESILIENCE_PATCHES_ENABLED,
+    autoKillSwitch: true,
+    autoHalt: true,
+});
+const resilienceLastSideBySymbol = new Map<string, 'BUY' | 'SELL' | null>();
 let riskEngineLastKnownEquity = RISK_ENGINE_DEFAULT_EQUITY_USDT;
 const riskEngineLastRealizedPnlBySymbol = new Map<string, number>();
 let riskEngineLastState: RiskState | null = null;
 if (RISK_ENGINE_ENABLED) {
     institutionalRiskEngine.initialize(riskEngineLastKnownEquity);
     riskEngineLastState = institutionalRiskEngine.getRiskState();
+}
+if (RESILIENCE_PATCHES_ENABLED && RISK_ENGINE_ENABLED) {
+    resiliencePatches.initialize(institutionalRiskEngine);
 }
 const marketDataValidator = new MarketDataValidator(alertService);
 const marketDataMonitor = new MarketDataMonitor(alertService, {
@@ -806,8 +823,12 @@ function syncRiskEngineRuntime(symbol: string, eventTimeMs: number, midPrice: nu
 
     const now = Date.now();
     const ts = Number.isFinite(eventTimeMs) && eventTimeMs > 0 ? eventTimeMs : now;
+    const latencyMs = Math.max(0, now - ts);
     institutionalRiskEngine.recordHeartbeat(ts);
-    institutionalRiskEngine.recordLatency(Math.max(0, now - ts), ts);
+    institutionalRiskEngine.recordLatency(latencyMs, ts);
+    if (RESILIENCE_PATCHES_ENABLED) {
+        resiliencePatches.recordLatency(latencyMs, ts, 'network');
+    }
 
     if (Number(midPrice || 0) > 0) {
         institutionalRiskEngine.recordPrice(symbol, Number(midPrice), ts);
@@ -1646,6 +1667,43 @@ async function processDepthQueue(symbol: string) {
                 continue;
             }
 
+            if (RESILIENCE_PATCHES_ENABLED) {
+                const eventTs = Number(update.eventTimeMs || now);
+                for (const [priceStr, qtyStr] of update.b) {
+                    const price = Number(priceStr);
+                    const qty = Number(qtyStr);
+                    if (Number.isFinite(price) && price > 0) {
+                        resiliencePatches.recordOrderActivity(
+                            symbol,
+                            price,
+                            'bid',
+                            Number.isFinite(qty) ? Math.max(0, qty) : 0,
+                            qty === 0 ? 'cancel' : 'modify',
+                            eventTs
+                        );
+                    }
+                }
+                for (const [priceStr, qtyStr] of update.a) {
+                    const price = Number(priceStr);
+                    const qty = Number(qtyStr);
+                    if (Number.isFinite(price) && price > 0) {
+                        resiliencePatches.recordOrderActivity(
+                            symbol,
+                            price,
+                            'ask',
+                            Number.isFinite(qty) ? Math.max(0, qty) : 0,
+                            qty === 0 ? 'cancel' : 'modify',
+                            eventTs
+                        );
+                    }
+                }
+                const bb = Number(bestBid(ob) || 0);
+                const ba = Number(bestAsk(ob) || 0);
+                if (bb > 0 && ba > 0) {
+                    resiliencePatches.recordOrderbook(symbol, bb, ba, eventTs);
+                }
+            }
+
             if (applied.applied) {
                 meta.applyCount10s++;
                 meta.goodSequenceStreak++;
@@ -1897,6 +1955,23 @@ async function processSymbolEvent(s: string, d: any) {
                 });
             } catch (error) {
                 logAnalyticsError('price_tick', s, error);
+            }
+            if (RESILIENCE_PATCHES_ENABLED) {
+                const bestBidNow = Number(bestBid(ob) || 0);
+                const bestAskNow = Number(bestAsk(ob) || 0);
+                const fallbackBid = bestBidNow > 0 ? bestBidNow : p;
+                const fallbackAsk = bestAskNow > 0 ? bestAskNow : p;
+                resiliencePatches.recordPriceTick(
+                    s,
+                    p,
+                    Number(q || 0),
+                    fallbackBid,
+                    fallbackAsk,
+                    Number(t || now)
+                );
+                if (fallbackBid > 0 && fallbackAsk > 0) {
+                    resiliencePatches.recordOrderbook(s, fallbackBid, fallbackAsk, Number(t || now));
+                }
             }
         }
 
@@ -2613,6 +2688,22 @@ function broadcastMetrics(
             : null;
 
     const canonicalTimeMs = Number(eventTimeMs || now);
+    const deltaZForDecision = Number(legacyForUse?.deltaZ ?? tf1m?.delta ?? 0);
+    const cvdSlopeForDecision = Number(legacyForUse?.cvdSlope ?? tf5m?.delta ?? 0);
+    const chopScoreForDecision = Number(advancedBundle.regimeMetrics?.chopScore || 0);
+    const spoofAwareObi = RESILIENCE_PATCHES_ENABLED
+        ? resiliencePatches.getOBI(s, ob.bids, ob.asks, 20, canonicalTimeMs)
+        : null;
+    const obiDeepForDecision = Number(
+        spoofAwareObi?.spoofAdjusted
+            ? spoofAwareObi.obi
+            : (legacyForUse?.obiDeep || 0)
+    );
+    const obiWeightedForDecision = Number(
+        spoofAwareObi?.spoofAdjusted
+            ? spoofAwareObi.obiWeighted
+            : (legacyForUse?.obiWeighted || 0)
+    );
     let resolvedOrchestratorDecision = defaultOrchestratorDecision(s, canonicalTimeMs);
     try {
         resolvedOrchestratorDecision = orchestratorV1.evaluate({
@@ -2623,13 +2714,13 @@ function broadcastMetrics(
             bestAsk: bestAskPx,
             spreadPct: spreadRatio,
             printsPerSecond: Number(tasMetrics?.printsPerSecond || 0),
-            deltaZ: Number(legacyForUse?.deltaZ ?? tf1m?.delta ?? 0),
-            cvdSlope: Number(legacyForUse?.cvdSlope ?? tf5m?.delta ?? 0),
+            deltaZ: deltaZForDecision,
+            cvdSlope: cvdSlopeForDecision,
             cvdTf5mState,
-            obiDeep: Number(legacyForUse?.obiDeep || 0),
-            obiWeighted: Number(legacyForUse?.obiWeighted || 0),
+            obiDeep: obiDeepForDecision,
+            obiWeighted: obiWeightedForDecision,
             trendinessScore: Number(advancedBundle.regimeMetrics?.trendinessScore || 0),
-            chopScore: Number(advancedBundle.regimeMetrics?.chopScore || 0),
+            chopScore: chopScoreForDecision,
             volOfVol: Number(advancedBundle.regimeMetrics?.volOfVol || 0),
             realizedVol1m: Number(advancedBundle.regimeMetrics?.realizedVol1m || 0),
             atr3m: selectedAtr3m,
@@ -2668,13 +2759,32 @@ function broadcastMetrics(
     const resolvedRiskState = RISK_ENGINE_ENABLED
         ? (riskSummary?.state ?? institutionalRiskEngine.getRiskState())
         : RiskState.TRACKING;
+    let resilienceGuardResult: ReturnType<ResiliencePatches['evaluate']> | null = null;
+    let resilienceStatus: ReturnType<ResiliencePatches['getStatus']> | null = null;
+    if (RESILIENCE_PATCHES_ENABLED) {
+        const decisionPrice = Number(mid || legacyForUse?.price || 0);
+        resiliencePatches.recordDelta(s, deltaZForDecision, decisionPrice, canonicalTimeMs);
+        resiliencePatches.recordChopScore(s, chopScoreForDecision, canonicalTimeMs);
+        const previousSide = resilienceLastSideBySymbol.has(s)
+            ? (resilienceLastSideBySymbol.get(s) ?? null)
+            : null;
+        const currentSide = resolvedOrchestratorDecision.side;
+        if ((currentSide === 'BUY' || currentSide === 'SELL') && currentSide !== previousSide) {
+            resiliencePatches.recordSideFlip(s, currentSide, decisionPrice, canonicalTimeMs);
+            resilienceLastSideBySymbol.set(s, currentSide);
+        } else if (currentSide == null && !resilienceLastSideBySymbol.has(s)) {
+            resilienceLastSideBySymbol.set(s, null);
+        }
+        resilienceGuardResult = resiliencePatches.evaluate(s, canonicalTimeMs);
+        resilienceStatus = resiliencePatches.getStatus(canonicalTimeMs);
+    }
     let strategySignals: ReturnType<StrategyRegistry['evaluateAll']> = [];
     let consensusDecision: ReturnType<ConsensusEngine['evaluate']> | null = null;
 
     if (strategyFrameworkEnabled) {
         try {
-            const deltaZForStrategy = Number(legacyForUse?.deltaZ ?? tf1m?.delta ?? 0);
-            const cvdSlopeForStrategy = Number(legacyForUse?.cvdSlope ?? tf5m?.delta ?? 0);
+            const deltaZForStrategy = deltaZForDecision;
+            const cvdSlopeForStrategy = cvdSlopeForDecision;
             const trendinessScore = Math.max(0, Math.min(1, Number(advancedBundle.regimeMetrics?.trendinessScore || 0)));
             const trendDirection = cvdSlopeForStrategy > 0
                 ? 1
@@ -2693,7 +2803,7 @@ function broadcastMetrics(
                 price: Number(mid || legacyForUse?.price || 0),
                 m3TrendScore,
                 m5TrendScore,
-                obiDeep: Number(legacyForUse?.obiDeep || 0),
+                obiDeep: obiDeepForDecision,
                 deltaZ: deltaZForStrategy,
                 volatilityIndex: Number(advancedBundle.regimeMetrics?.realizedVol1m || advancedBundle.regimeMetrics?.volOfVol || 0),
                 spreadPct,
@@ -2814,6 +2924,57 @@ function broadcastMetrics(
         strategyConsensusBySymbol.delete(s);
     }
 
+    if (RESILIENCE_PATCHES_ENABLED && resilienceGuardResult) {
+        if (resilienceGuardResult.action === 'KILL_SWITCH' && RISK_ENGINE_ENABLED && institutionalRiskEngine.getRiskState() !== RiskState.KILL_SWITCH) {
+            institutionalRiskEngine.activateKillSwitch(`ResiliencePatches blocked ${s}: ${resilienceGuardResult.reasons.join(',')}`);
+        } else if (resilienceGuardResult.action === 'HALT' && RISK_ENGINE_ENABLED) {
+            institutionalRiskEngine.getStateManager().transition(
+                RiskStateTrigger.EXECUTION_TIMEOUT,
+                `ResiliencePatches halt on ${s}: ${resilienceGuardResult.reasons.join(',')}`,
+                { symbol: s, timestampMs: canonicalTimeMs }
+            );
+        }
+
+        const preTradeIntent = resolvedOrchestratorDecision.intent === 'ENTRY'
+            || resolvedOrchestratorDecision.intent === 'ADD';
+        const suppressesPreTrade = preTradeIntent
+            && (
+                !resilienceGuardResult.allow
+                || resilienceGuardResult.action === 'NO_TRADE'
+                || resilienceGuardResult.action === 'HALT'
+                || resilienceGuardResult.action === 'KILL_SWITCH'
+                || (
+                    resilienceGuardResult.action === 'SUPPRESS'
+                    && resilienceGuardResult.confidenceMultiplier < RESILIENCE_SUPPRESS_MIN_MULTIPLIER
+                )
+            );
+
+        if (suppressesPreTrade) {
+            log('RESILIENCE_GUARD_BLOCKED', {
+                symbol: s,
+                action: resilienceGuardResult.action,
+                confidenceMultiplier: resilienceGuardResult.confidenceMultiplier,
+                reasons: resilienceGuardResult.reasons,
+                previousIntent: resolvedOrchestratorDecision.intent,
+                previousSide: resolvedOrchestratorDecision.side,
+            });
+            resolvedOrchestratorDecision = {
+                ...resolvedOrchestratorDecision,
+                intent: 'HOLD',
+                side: null,
+                allGatesPassed: false,
+                orders: [],
+                readiness: {
+                    ready: false,
+                    reasons: [
+                        'RESILIENCE_SUPPRESS',
+                        ...resilienceGuardResult.reasons,
+                    ],
+                },
+            };
+        }
+    }
+
     const orchestratorDebug = updateOrchestratorDiagnostics(s, resolvedOrchestratorDecision, canonicalTimeMs);
     const decisionView = buildDecisionViewFromOrchestrator(resolvedOrchestratorDecision);
     const strategyPosition = decisionView.suppressDryRunPosition && rawPositionSource === 'dryrun'
@@ -2899,6 +3060,22 @@ function broadcastMetrics(
                     timestamp: signal.timestamp,
                     validityDurationMs: signal.validityDurationMs,
                 })),
+            }
+            : null,
+        resilience: RESILIENCE_PATCHES_ENABLED
+            ? {
+                action: resilienceGuardResult?.action ?? 'ALLOW',
+                allow: resilienceGuardResult?.allow ?? true,
+                confidenceMultiplier: Number(resilienceGuardResult?.confidenceMultiplier ?? 1),
+                reasons: resilienceGuardResult?.reasons ?? [],
+                status: resilienceStatus,
+                spoofAwareObi: spoofAwareObi
+                    ? {
+                        obi: spoofAwareObi.obi,
+                        obiWeighted: spoofAwareObi.obiWeighted,
+                        spoofAdjusted: spoofAwareObi.spoofAdjusted,
+                    }
+                    : null,
             }
             : null,
         advancedMetrics: {
@@ -3030,6 +3207,8 @@ app.get('/api/health', (req, res) => {
         decisionEnabled: true,
         riskEngineEnabled: RISK_ENGINE_ENABLED,
         riskEngine: RISK_ENGINE_ENABLED ? institutionalRiskEngine.getRiskSummary() : null,
+        resilienceEnabled: RESILIENCE_PATCHES_ENABLED,
+        resilience: RESILIENCE_PATCHES_ENABLED ? resiliencePatches.getStatus(Date.now()) : null,
         decisionRuntime: {
             legacyDecisionCalls: decisionRuntimeStats.legacyDecisionCalls,
             executorEntrySkipped: decisionRuntimeStats.executorEntrySkipped,
@@ -3893,6 +4072,9 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 function shutdown(): void {
     wsManager.shutdown();
     marketDataMonitor.stopMonitoring();
+    if (RESILIENCE_PATCHES_ENABLED) {
+        resiliencePatches.stop();
+    }
     for (const monitor of spotReferenceMonitors.values()) {
         monitor.stop();
     }

@@ -1,6 +1,8 @@
 import { RiskState } from './RiskStateManager';
 
 export { RiskState, RiskStateManager, type RiskStateConfig, type RiskStateTransition, RiskStateTrigger } from './RiskStateManager';
+export { FlashCrashGuard, FlashCrashGuardRegistry, type FlashCrashConfig, type FlashCrashDetection, type FlashCrashStatus } from './FlashCrashGuard';
+export { ResiliencePatches, type ResiliencePatchesConfig, type ResilienceGuardResult, type ResilienceStatus } from './ResiliencePatches';
 
 export interface RiskStateProfile {
   state: RiskState;

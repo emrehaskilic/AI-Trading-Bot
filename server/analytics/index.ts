@@ -12,6 +12,7 @@ export { PnLCalculator } from './PnLCalculator';
 export { ExecutionAnalytics } from './ExecutionAnalytics';
 export { TradeQuality } from './TradeQuality';
 export { AnalyticsEngine } from './AnalyticsEngine';
+export { ChurnDetector, ChurnDetectorRegistry } from './ChurnDetector';
 
 // Default export
 export { AnalyticsEngine as default } from './AnalyticsEngine';
