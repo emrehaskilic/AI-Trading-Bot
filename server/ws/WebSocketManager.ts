@@ -17,15 +17,20 @@ type ConnectionContext = {
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_STALE_CONNECTION_MS = 60_000;
 const DEFAULT_MAX_SUBSCRIPTIONS_PER_CLIENT = 200;
+const LOG_THROTTLE_MS = 5_000;
 
 export class WebSocketManager {
   private readonly clients = new Set<WebSocket>();
   private readonly clientSubs = new Map<WebSocket, Set<string>>();
   private readonly lastPongAt = new Map<WebSocket, number>();
+  // Inverted index: symbol -> Set of clients subscribed to that symbol
+  private readonly symbolClients = new Map<string, Set<WebSocket>>();
   private readonly heartbeatIntervalMs: number;
   private readonly staleConnectionMs: number;
   private readonly maxSubscriptionsPerClient: number;
   private readonly timer: NodeJS.Timeout;
+  // Log throttling: error type -> last logged timestamp
+  private readonly logThrottleMap = new Map<string, number>();
 
   constructor(private readonly deps: ManagerDeps) {
     this.heartbeatIntervalMs = Math.max(1_000, deps.heartbeatIntervalMs || DEFAULT_HEARTBEAT_INTERVAL_MS);
@@ -41,6 +46,16 @@ export class WebSocketManager {
     this.clients.add(client);
     this.clientSubs.set(client, subscriptions);
     this.lastPongAt.set(client, Date.now());
+
+    // Update inverted index for O(1) broadcast lookup
+    for (const symbol of subscriptions) {
+      let clientsForSymbol = this.symbolClients.get(symbol);
+      if (!clientsForSymbol) {
+        clientsForSymbol = new Set<WebSocket>();
+        this.symbolClients.set(symbol, clientsForSymbol);
+      }
+      clientsForSymbol.add(client);
+    }
 
     client.on('pong', () => {
       this.lastPongAt.set(client, Date.now());
@@ -89,18 +104,21 @@ export class WebSocketManager {
   broadcastToSymbol(symbol: string, payload: string): number {
     let sent = 0;
 
-    for (const client of this.clients) {
+    // Use inverted index for O(1) lookup instead of O(n) iteration
+    const clientsForSymbol = this.symbolClients.get(symbol);
+    if (!clientsForSymbol) {
+      return 0;
+    }
+
+    for (const client of clientsForSymbol) {
       if (client.readyState !== WebSocket.OPEN) {
-        continue;
-      }
-      if (!this.clientSubs.get(client)?.has(symbol)) {
         continue;
       }
       try {
         client.send(payload);
         sent++;
       } catch (error: any) {
-        this.deps.log('WS_CLIENT_SEND_ERROR', {
+        this.throttledLog('WS_CLIENT_SEND_ERROR', {
           symbol,
           error: error?.message || 'send_failed',
         });
@@ -113,7 +131,7 @@ export class WebSocketManager {
 
   shutdown(): void {
     clearInterval(this.timer);
-    for (const client of [...this.clients]) {
+    for (const client of this.clients) {
       try {
         if (client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING) {
           client.terminate();
@@ -129,7 +147,8 @@ export class WebSocketManager {
   private heartbeatSweep(): void {
     const now = Date.now();
 
-    for (const client of [...this.clients]) {
+    // Iterate Set directly instead of creating array copy with [...this.clients]
+    for (const client of this.clients) {
       if (client.readyState === WebSocket.CLOSED) {
         this.cleanupClient(client, 'close');
         continue;
@@ -141,7 +160,7 @@ export class WebSocketManager {
 
       const lastSeen = this.lastPongAt.get(client) || 0;
       if (now - lastSeen > this.staleConnectionMs) {
-        this.deps.log('WS_CLIENT_STALE_CLOSE', {
+        this.throttledLog('WS_CLIENT_STALE_CLOSE', {
           staleForMs: now - lastSeen,
         });
         try {
@@ -165,6 +184,21 @@ export class WebSocketManager {
       return;
     }
 
+    // Remove from inverted index before deleting from other maps
+    const subs = this.clientSubs.get(client);
+    if (subs) {
+      for (const symbol of subs) {
+        const clientsForSymbol = this.symbolClients.get(symbol);
+        if (clientsForSymbol) {
+          clientsForSymbol.delete(client);
+          // Clean up empty symbol entries to prevent memory leak
+          if (clientsForSymbol.size === 0) {
+            this.symbolClients.delete(symbol);
+          }
+        }
+      }
+    }
+
     this.clients.delete(client);
     this.clientSubs.delete(client);
     this.lastPongAt.delete(client);
@@ -186,5 +220,19 @@ export class WebSocketManager {
       }
     }
     return [...normalized].sort();
+  }
+
+  /**
+   * Throttled logging - max 1 log per LOG_THROTTLE_MS (5 seconds) per error type
+   * Prevents log spam during high-frequency error conditions
+   */
+  private throttledLog(event: string, data: Record<string, unknown>): void {
+    const now = Date.now();
+    const lastLogged = this.logThrottleMap.get(event);
+    
+    if (!lastLogged || now - lastLogged >= LOG_THROTTLE_MS) {
+      this.logThrottleMap.set(event, now);
+      this.deps.log(event, data);
+    }
   }
 }
