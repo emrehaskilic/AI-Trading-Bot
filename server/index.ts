@@ -79,6 +79,7 @@ import { SpotReferenceMonitor, SpotReferenceMetrics } from './metrics/SpotRefere
 import { HtfStructureMonitor } from './metrics/HtfStructureMonitor';
 import { OrchestratorV1 } from './orchestrator_v1/OrchestratorV1';
 import { OrchestratorV1Decision, OrchestratorV1Order, OrchestratorV1Side } from './orchestrator_v1/types';
+import { AnalyticsEngine } from './analytics';
 
 // =============================================================================
 // Configuration
@@ -216,6 +217,14 @@ const RISK_ENGINE_CONFIG = {
             : parseEnvFlag(process.env.RISK_AUTO_CLOSE_POSITIONS),
     },
 };
+const ANALYTICS_PERSIST_TO_DISK = process.env.ANALYTICS_PERSIST_TO_DISK == null
+    ? false
+    : parseEnvFlag(process.env.ANALYTICS_PERSIST_TO_DISK);
+const ANALYTICS_SNAPSHOT_INTERVAL_MS = Math.max(
+    1000,
+    parseEnvNumber(process.env.ANALYTICS_SNAPSHOT_INTERVAL_MS, 30_000)
+);
+const ANALYTICS_OUTPUT_DIR = String(process.env.ANALYTICS_OUTPUT_DIR || './logs/analytics');
 
 function normalizeWsUpdateSpeed(raw: string): '100ms' | '250ms' | '500ms' {
     const value = String(raw || '').trim().toLowerCase();
@@ -379,6 +388,12 @@ const backfillCoordinator = new BackfillCoordinator(
 const alertConfig = getAlertConfig();
 const alertService = new AlertService(alertConfig);
 const notificationService = new NotificationService(alertConfig);
+const analyticsEngine = new AnalyticsEngine({
+    persistToDisk: ANALYTICS_PERSIST_TO_DISK,
+    snapshotIntervalMs: ANALYTICS_SNAPSHOT_INTERVAL_MS,
+    outputDir: ANALYTICS_OUTPUT_DIR,
+});
+const analyticsLastErrorByKind = new Map<string, number>();
 const orchestrator = createOrchestratorFromEnv(alertService);
 const dryRunSession = new DryRunSessionService(alertService);
 const orchestratorV1 = new OrchestratorV1();
@@ -400,6 +415,59 @@ const marketDataMonitor = new MarketDataMonitor(alertService, {
     maxSilenceMs: Number(process.env.MARKET_DATA_MAX_SILENCE_MS || 10_000),
 });
 marketDataMonitor.startMonitoring();
+
+function logAnalyticsError(kind: string, symbol: string | null, error: unknown): void {
+    const now = Date.now();
+    const last = analyticsLastErrorByKind.get(kind) || 0;
+    if (now - last < 15_000) {
+        return;
+    }
+    analyticsLastErrorByKind.set(kind, now);
+    log('ANALYTICS_INGEST_ERROR', {
+        kind,
+        symbol,
+        error: serializeError(error),
+    });
+}
+
+const executionConnector = orchestrator.getConnector();
+executionConnector.onExecutionEvent((event) => {
+    try {
+        if (event.type === 'TRADE_UPDATE') {
+            analyticsEngine.ingestFill({
+                type: 'FILL',
+                symbol: String(event.symbol || '').toUpperCase(),
+                side: event.side,
+                qty: Math.max(0, Number(event.fillQty || 0)),
+                price: Math.max(0, Number(event.fillPrice || 0)),
+                fee: Math.max(0, Number(event.commission || 0)),
+                feeType: 'taker',
+                timestamp: Number(event.event_time_ms || Date.now()),
+                orderId: String(event.orderId || ''),
+                tradeId: String(event.tradeId || ''),
+                isReduceOnly: false,
+            });
+            return;
+        }
+
+        if (event.type === 'ACCOUNT_UPDATE') {
+            const positionAmt = Number(event.positionAmt || 0);
+            const side = positionAmt > 0 ? 'LONG' : positionAmt < 0 ? 'SHORT' : 'FLAT';
+            analyticsEngine.ingestPosition({
+                type: 'POSITION_UPDATE',
+                symbol: String(event.symbol || '').toUpperCase(),
+                side,
+                qty: Math.abs(positionAmt),
+                entryPrice: Math.max(0, Number(event.entryPrice || 0)),
+                markPrice: Math.max(0, Number(event.entryPrice || 0)),
+                unrealizedPnl: Number(event.unrealizedPnL || 0),
+                timestamp: Number(event.event_time_ms || Date.now()),
+            });
+        }
+    } catch (error) {
+        logAnalyticsError('execution_event', event?.symbol || null, error);
+    }
+});
 orchestrator.setKillSwitch(KILL_SWITCH);
 if (typeof process.env.EXECUTION_MODE !== 'undefined') {
     log('CONFIG_WARNING', { message: 'EXECUTION_MODE is deprecated and ignored' });
@@ -754,6 +822,40 @@ function syncRiskEngineRuntime(symbol: string, eventTimeMs: number, midPrice: nu
             } else {
                 institutionalRiskEngine.getGuards().position.removePosition(symbol);
                 institutionalRiskEngine.getGuards().multiSymbol.removeExposure(symbol);
+            }
+
+            const markPrice = Math.max(
+                0,
+                Number(midPrice || 0),
+                Number(symbolStatus.metrics?.markPrice || 0),
+                Number(symbolStatus.position?.entryPrice || 0)
+            );
+            try {
+                if (position && Number(position.qty) > 0) {
+                    analyticsEngine.ingestPosition({
+                        type: 'POSITION_UPDATE',
+                        symbol,
+                        side: position.side,
+                        qty: Math.abs(Number(position.qty || 0)),
+                        entryPrice: Math.max(0, Number(position.entryPrice || 0)),
+                        markPrice,
+                        unrealizedPnl: Number(position.unrealizedPnl || symbolStatus.metrics?.unrealizedPnl || 0),
+                        timestamp: ts,
+                    });
+                } else {
+                    analyticsEngine.ingestPosition({
+                        type: 'POSITION_UPDATE',
+                        symbol,
+                        side: 'FLAT',
+                        qty: 0,
+                        entryPrice: 0,
+                        markPrice,
+                        unrealizedPnl: 0,
+                        timestamp: ts,
+                    });
+                }
+            } catch (error) {
+                logAnalyticsError('position_sync', symbol, error);
             }
         }
     }
@@ -1759,6 +1861,16 @@ async function processSymbolEvent(s: string, d: any) {
         latencyTracker.record('trade_ingest_ms', Math.max(0, now - Number(t || now)));
         if (p > 0) {
             portfolioMonitor.ingestPrice(s, p);
+            try {
+                analyticsEngine.ingestPrice({
+                    type: 'PRICE_TICK',
+                    symbol: s,
+                    markPrice: p,
+                    timestamp: Number(t || now),
+                });
+            } catch (error) {
+                logAnalyticsError('price_tick', s, error);
+            }
         }
 
         if (dryRunSession.isTrackingSymbol(s)) {
@@ -3386,6 +3498,16 @@ app.post('/api/backtest/walk-forward', async (req, res) => {
     } catch (e: any) {
         res.status(500).json({ ok: false, error: e?.message || 'walk_forward_failed' });
     }
+});
+
+app.get('/api/analytics/snapshot', (_req, res) => {
+    const result = analyticsEngine.handleSnapshotRequest();
+    res.status(result.status).json(result.body);
+});
+
+app.get('/api/analytics/evidence-pack', (_req, res) => {
+    const result = analyticsEngine.handleEvidencePackRequest();
+    res.status(result.status).json(result.body);
 });
 
 app.post('/api/analytics/edge-validation', (req, res) => {
