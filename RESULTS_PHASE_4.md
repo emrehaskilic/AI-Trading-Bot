@@ -1,7 +1,7 @@
-# RESULTS_PHASE_4
+ï»¿# RESULTS_PHASE_4
 
 ## Patch durumu
-- PATCH komutu: `git apply --3way "C:\Users\emrehaskilic\Desktop\Kimi_Agent_FAZ 4 Ka^rlilik O¨lc¸u¨mu¨\faz4\PATCH.diff"`
+- PATCH komutu: `git apply --3way "C:\Users\emrehaskilic\Desktop\Kimi_Agent_FAZ 4 Ka^rlilik OÂ¨lcÂ¸uÂ¨muÂ¨\faz4\PATCH.diff"`
 - Sonuc: **Basarisiz** (`error: corrupt patch at line 327`)
 - Uygulama sekli: Paket dosyalari manuel olarak entegre edildi.
 - Conflict: Klasik merge conflict yok; patch bozuk oldugu icin manual integration yapildi.
@@ -53,9 +53,10 @@
 - Toplevel schema kontrolu: `EVIDENCE_SAMPLE_SCHEMA_TOPLEVEL_OK=True`
 
 ## Kalan riskler / TODO
-- `ExecutionAnalytics` icinde slippage icin expected price su an harici bir `recordExpectedPrice(...)` akisina bagli; bu akisa henüz merkezi bir call-site eklenmedi.
+- `ExecutionAnalytics` icinde slippage icin expected price su an harici bir `recordExpectedPrice(...)` akisina bagli; bu akisa henÃ¼z merkezi bir call-site eklenmedi.
 - `TradeQuality` drawdown/equity hesaplari su an temel seviyede; gercek portfolio equity ile daha dogrudan baglanabilir.
 - Analytics snapshot endpoint read-only aktif ancak frontend tarafinda ozel analytics panel entegrasyonu bu faz kapsaminda yapilmadi.
 
 ## Main merge hash
-- `PENDING`
+- `74880d3` (phase-4-analytics -> main merge commit)
+
