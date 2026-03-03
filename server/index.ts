@@ -26,7 +26,9 @@ import { FundingMonitor, FundingMetrics } from './metrics/FundingMonitor';
 import { OrderbookIntegrityMonitor } from './metrics/OrderbookIntegrityMonitor';
 import {
     OrderbookState,
-    createOrderbookState,
+    createOrderbookStateMap,
+    getOrCreateOrderbookState,
+    resetOrderbookState,
     applyDepthUpdate,
     applySnapshot,
     bestBid,
@@ -249,7 +251,7 @@ interface SymbolMeta {
 }
 
 const symbolMeta = new Map<string, SymbolMeta>();
-const orderbookMap = new Map<string, OrderbookState>();
+const orderbookMap = createOrderbookStateMap();
 
 // Metrics
 const timeAndSalesMap = new Map<string, TimeAndSales>();
@@ -574,12 +576,7 @@ function getMeta(symbol: string): SymbolMeta {
 }
 
 function getOrderbook(symbol: string): OrderbookState {
-    let state = orderbookMap.get(symbol);
-    if (!state) {
-        state = createOrderbookState();
-        orderbookMap.set(symbol, state);
-    }
-    return state;
+    return getOrCreateOrderbookState(orderbookMap, symbol);
 }
 
 function pruneWindow(values: number[], windowMs: number, now: number): void {
@@ -663,12 +660,41 @@ function transitionOrderbookState(symbol: string, to: OrderbookState['uiState'],
         return;
     }
     ob.uiState = to;
+    if (to === 'LIVE') {
+        ob.snapshotRequired = false;
+    } else if (to === 'SNAPSHOT_PENDING' || to === 'RESYNCING' || to === 'HALTED') {
+        ob.snapshotRequired = true;
+    }
     const meta = getMeta(symbol);
     meta.lastStateTransitionTs = Date.now();
     if (to === 'LIVE') {
         meta.lastLiveTs = meta.lastStateTransitionTs;
     }
     log('ORDERBOOK_STATE_TRANSITION', { symbol, from, to, trigger, ...detail });
+}
+
+function requestOrderbookResync(symbol: string, trigger: string, detail: any = {}): void {
+    const now = Date.now();
+    const meta = getMeta(symbol);
+    if (meta.isResyncing) {
+        return;
+    }
+
+    meta.isResyncing = true;
+    meta.lastResyncTs = now;
+    meta.depthQueue = [];
+    meta.goodSequenceStreak = 0;
+    meta.desyncCount += 1;
+    meta.desyncEvents.push(now);
+
+    const ob = getOrderbook(symbol);
+    resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true, desync: true });
+    getIntegrity(symbol).markResyncStart(now);
+
+    transitionOrderbookState(symbol, 'RESYNCING', trigger, detail);
+    fetchSnapshot(symbol, trigger, true).catch((e) => {
+        log('RESYNC_FETCH_ERROR', { symbol, trigger, error: e?.message || 'resync_fetch_failed' });
+    });
 }
 
 // Lazy Metric Getters
@@ -778,14 +804,23 @@ async function fetchSnapshot(symbol: string, trigger: string, force = false) {
 
     if (now < globalBackoffUntil) {
         log('SNAPSHOT_SKIP_GLOBAL', { symbol, wait: globalBackoffUntil - now });
+        meta.isResyncing = false;
         return;
     }
 
     const waitMs = Math.max(SNAPSHOT_MIN_INTERVAL_MS, meta.backoffMs);
-    if (now - meta.lastSnapshotAttempt < waitMs) {
+    if (!force && now - meta.lastSnapshotAttempt < waitMs) {
         meta.snapshotSkipEvents.push(now);
         log('SNAPSHOT_SKIP_LOCAL', { symbol, trigger, force, wait: waitMs - (now - meta.lastSnapshotAttempt) });
         return;
+    }
+
+    if (force) {
+        // Force mode always starts from a clean baseline to avoid stale merge.
+        resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true });
+        meta.depthQueue = [];
+        meta.goodSequenceStreak = 0;
+        getIntegrity(symbol).markResyncStart(now);
     }
 
     meta.lastSnapshotAttempt = now;
@@ -972,10 +1007,12 @@ function updateStreams() {
 
         activeSymbols.forEach((symbol) => {
             const ob = getOrderbook(symbol);
-            if (ob.uiState === 'INIT' || ob.lastUpdateId === 0) {
-                transitionOrderbookState(symbol, 'SNAPSHOT_PENDING', 'ws_open_seed');
-                fetchSnapshot(symbol, 'ws_open_seed', true).catch(() => { });
-            }
+            const meta = getMeta(symbol);
+            resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true });
+            meta.depthQueue = [];
+            meta.goodSequenceStreak = 0;
+            transitionOrderbookState(symbol, 'SNAPSHOT_PENDING', 'ws_open_seed');
+            fetchSnapshot(symbol, 'ws_open_seed', true).catch(() => { });
         });
     });
 
@@ -989,6 +1026,13 @@ function updateStreams() {
         wsState = 'disconnected';
         ws = null;
         log('WS_CLOSE', {});
+        const now = Date.now();
+        for (const symbol of activeSymbols) {
+            const ob = getOrderbook(symbol);
+            resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true });
+            getMeta(symbol).depthQueue = [];
+            getIntegrity(symbol).markReconnect(now);
+        }
         setTimeout(updateStreams, 5000);
     });
 
@@ -1005,12 +1049,7 @@ function enqueueDepthUpdate(symbol: string, update: { U: number; u: number; pu?:
     const meta = getMeta(symbol);
     meta.depthQueue.push(update);
     if (meta.depthQueue.length > DEPTH_QUEUE_MAX) {
-        meta.depthQueue = [];
-        meta.desyncCount++;
-        meta.desyncEvents.push(Date.now());
-        meta.goodSequenceStreak = 0;
-        transitionOrderbookState(symbol, 'RESYNCING', 'queue_overflow', { max: DEPTH_QUEUE_MAX });
-        fetchSnapshot(symbol, 'queue_overflow', true).catch(() => { });
+        requestOrderbookResync(symbol, 'queue_overflow', { max: DEPTH_QUEUE_MAX });
         return;
     }
     processDepthQueue(symbol).catch((e) => {
@@ -1031,12 +1070,7 @@ async function processDepthQueue(symbol: string) {
             const lagMs = now - update.receiptTimeMs;
             latencyTracker.record('depth_ingest_ms', Math.max(0, now - Number(update.eventTimeMs || now)));
             if (lagMs > DEPTH_LAG_MAX_MS) {
-                meta.desyncCount++;
-                meta.desyncEvents.push(now);
-                meta.goodSequenceStreak = 0;
-                meta.depthQueue = [];
-                transitionOrderbookState(symbol, 'RESYNCING', 'lag_too_high', { lagMs, max: DEPTH_LAG_MAX_MS });
-                await fetchSnapshot(symbol, 'lag_too_high', true);
+                requestOrderbookResync(symbol, 'lag_too_high', { lagMs, max: DEPTH_LAG_MAX_MS });
                 break;
             }
 
@@ -1046,15 +1080,14 @@ async function processDepthQueue(symbol: string) {
 
             const applied = applyDepthUpdate(ob, update);
             if (!applied.ok && applied.gapDetected) {
-                meta.desyncCount++;
-                meta.desyncEvents.push(now);
-                meta.goodSequenceStreak = 0;
-                // Drop queued updates from the broken sequence and resync from fresh snapshot.
-                meta.depthQueue = [];
                 log('DEPTH_DESYNC', { symbol, U: update.U, u: update.u, lastUpdateId: ob.lastUpdateId });
-                transitionOrderbookState(symbol, 'RESYNCING', 'sequence_gap', { U: update.U, u: update.u, lastUpdateId: ob.lastUpdateId });
-                await fetchSnapshot(symbol, 'sequence_gap', true);
+                requestOrderbookResync(symbol, 'sequence_gap', { U: update.U, u: update.u, lastUpdateId: ob.lastUpdateId });
                 break;
+            }
+
+            if (!applied.applied) {
+                // While waiting for a mandatory snapshot or reordering window, ignore this diff.
+                continue;
             }
 
             if (applied.applied) {
@@ -1082,14 +1115,11 @@ async function processDepthQueue(symbol: string) {
             if (integrity.reconnectRecommended && !meta.isResyncing) {
                 const timeSinceResync = now - meta.lastResyncTs;
                 if (timeSinceResync > MIN_RESYNC_INTERVAL_MS) {
-                    meta.lastResyncTs = now;
                     getIntegrity(symbol).markReconnect(now);
-                    meta.depthQueue = [];
-                    transitionOrderbookState(symbol, 'RESYNCING', 'integrity_reconnect', {
+                    requestOrderbookResync(symbol, 'integrity_reconnect', {
                         level: integrity.level,
                         message: integrity.message,
                     });
-                    await fetchSnapshot(symbol, 'integrity_reconnect', true);
                     break;
                 }
             }
@@ -1197,16 +1227,13 @@ function evaluateLiveReadiness(symbol: string) {
         const canResync = timeSinceResync > MIN_RESYNC_INTERVAL_MS;
 
         if (canResync && !meta.isResyncing) {
-            meta.lastResyncTs = now;
-            // Only transition if we are actually going to fetch
-            transitionOrderbookState(symbol, 'RESYNCING', 'live_criteria_failed_throttled', {
+            requestOrderbookResync(symbol, 'live_criteria_failed_throttled', {
                 fresh: snapshotFresh,
                 dataFlowing,
                 dataLag: now - meta.lastDepthMsgTs,
                 hasBook,
                 timeSinceResync
             });
-            fetchSnapshot(symbol, 'watchdog_resync', true).catch(() => { });
         }
     }
 }
@@ -3060,9 +3087,9 @@ wss.on('connection', (wc, req) => {
     syms.forEach(s => {
         // Trigger initial seed if needed
         const ob = getOrderbook(s);
-        if (ob.uiState === 'INIT') {
+        if (ob.uiState === 'INIT' || ob.lastUpdateId === 0 || ob.snapshotRequired) {
             transitionOrderbookState(s, 'SNAPSHOT_PENDING', 'client_subscribe_init');
-            fetchSnapshot(s, 'client_subscribe_init', true);
+            fetchSnapshot(s, 'client_subscribe_init', true).catch(() => { });
         }
     });
 });
@@ -3078,8 +3105,7 @@ setInterval(() => {
         meta.applyCount10s = 0;
         const desyncRate10s = countWindow(meta.desyncEvents, 10000, now);
         if (desyncRate10s > LIVE_DESYNC_RATE_10S_MAX) {
-            transitionOrderbookState(symbol, 'RESYNCING', 'desync_rate_high', { desyncRate10s });
-            fetchSnapshot(symbol, 'desync_rate_high', true).catch(() => { });
+            requestOrderbookResync(symbol, 'desync_rate_high', { desyncRate10s });
         }
     });
 }, 10000);

@@ -48,6 +48,7 @@ export class OrderbookIntegrityMonitor {
   private avgStalenessMs = 0;
   private reconnectCount = 0;
   private lastReconnectTimestamp = 0;
+  private lastResyncTimestamp = 0;
 
   constructor(symbol: string, config?: Partial<OrderbookIntegrityConfig>) {
     this.symbol = symbol;
@@ -103,21 +104,18 @@ export class OrderbookIntegrityMonitor {
   markReconnect(nowMs: number): void {
     this.reconnectCount += 1;
     this.lastReconnectTimestamp = nowMs;
-    // A reconnect starts a fresh sequence baseline.
-    this.sequenceGapCount = 0;
-    this.lastSequenceEnd = 0;
-    this.crossedBookDetected = false;
-    this.avgStalenessMs = 0;
-    this.lastUpdateTimestamp = nowMs;
+    this.lastResyncTimestamp = nowMs;
+    this.resetBaseline(nowMs);
+  }
+
+  markResyncStart(nowMs: number): void {
+    this.lastResyncTimestamp = nowMs;
+    this.resetBaseline(nowMs);
   }
 
   resetAfterSnapshot(nowMs: number): void {
     // Snapshot establishes a new authoritative baseline.
-    this.sequenceGapCount = 0;
-    this.lastSequenceEnd = 0;
-    this.crossedBookDetected = false;
-    this.avgStalenessMs = 0;
-    this.lastUpdateTimestamp = nowMs;
+    this.resetBaseline(nowMs);
   }
 
   getStatus(nowMs: number): OrderbookIntegrityStatus {
@@ -173,5 +171,13 @@ export class OrderbookIntegrityMonitor {
       return 'sequence_gaps_critical';
     }
     return 'sequence_gap_detected';
+  }
+
+  private resetBaseline(nowMs: number): void {
+    this.sequenceGapCount = 0;
+    this.lastSequenceEnd = 0;
+    this.crossedBookDetected = false;
+    this.avgStalenessMs = 0;
+    this.lastUpdateTimestamp = nowMs;
   }
 }
