@@ -59,6 +59,7 @@ import { logger, requestLogger, serializeError } from './utils/logger';
 import { WebSocketManager } from './ws/WebSocketManager';
 import { AlertService } from './notifications/AlertService';
 import { getAlertConfig } from './config/alertConfig';
+import { bootValidation } from './config/ConfigValidator';
 import { NotificationService } from './notifications/NotificationService';
 import { HealthController } from './health/HealthController';
 import { MarketDataArchive } from './backfill/MarketDataArchive';
@@ -90,10 +91,17 @@ import {
 } from './strategies';
 import { ConsensusEngine } from './consensus/ConsensusEngine';
 import { ResiliencePatches } from './risk/ResiliencePatches';
+import {
+    metrics as observabilityMetrics,
+    RiskState as TelemetryRiskState,
+} from './telemetry';
+import { initializeProductionReadiness } from './integration';
 
 // =============================================================================
 // Configuration
 // =============================================================================
+
+const productionRuntimeConfig = bootValidation(process.env);
 
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const HOST = process.env.HOST || '0.0.0.0'; // Listen on all interfaces for Nginx proxy
@@ -450,6 +458,9 @@ let riskEngineLastState: RiskState | null = null;
 if (RISK_ENGINE_ENABLED) {
     institutionalRiskEngine.initialize(riskEngineLastKnownEquity);
     riskEngineLastState = institutionalRiskEngine.getRiskState();
+    observabilityMetrics.setRiskState(toTelemetryRiskState(riskEngineLastState));
+} else {
+    observabilityMetrics.setRiskState(TelemetryRiskState.NORMAL);
 }
 if (RESILIENCE_PATCHES_ENABLED && RISK_ENGINE_ENABLED) {
     resiliencePatches.initialize(institutionalRiskEngine);
@@ -459,6 +470,45 @@ const marketDataMonitor = new MarketDataMonitor(alertService, {
     maxSilenceMs: Number(process.env.MARKET_DATA_MAX_SILENCE_MS || 10_000),
 });
 marketDataMonitor.startMonitoring();
+
+const OBSERVABILITY_PNL_SYNC_INTERVAL_MS = 1_000;
+let lastObservabilityPnlSyncMs = 0;
+
+function toTelemetryRiskState(state: RiskState | string): TelemetryRiskState {
+    if (state === RiskState.HALTED || state === RiskState.KILL_SWITCH) {
+        return TelemetryRiskState.HALTED;
+    }
+    if (state === RiskState.REDUCED_RISK) {
+        return TelemetryRiskState.WARNING;
+    }
+    return TelemetryRiskState.NORMAL;
+}
+
+function syncObservabilityMetrics(nowMs: number): void {
+    if (RISK_ENGINE_ENABLED) {
+        observabilityMetrics.setRiskState(toTelemetryRiskState(institutionalRiskEngine.getRiskState()));
+    } else {
+        observabilityMetrics.setRiskState(TelemetryRiskState.NORMAL);
+    }
+
+    if (nowMs - lastObservabilityPnlSyncMs < OBSERVABILITY_PNL_SYNC_INTERVAL_MS) {
+        return;
+    }
+    lastObservabilityPnlSyncMs = nowMs;
+
+    try {
+        const snapshot = analyticsEngine.getSnapshot();
+        observabilityMetrics.setPnL(Number(snapshot?.summary?.netPnl || 0));
+        const status = dryRunSession.getStatus();
+        const openPositions = Object.values(status.perSymbol || {}).reduce((count, symbolStatus: any) => {
+            const qty = Math.abs(Number(symbolStatus?.position?.qty || 0));
+            return count + (qty > 0 ? 1 : 0);
+        }, 0);
+        observabilityMetrics.setPositionCount(openPositions);
+    } catch (error) {
+        logAnalyticsError('telemetry_pnl_sync', null, error);
+    }
+}
 
 function logAnalyticsError(kind: string, symbol: string | null, error: unknown): void {
     const now = Date.now();
@@ -824,6 +874,7 @@ function syncRiskEngineRuntime(symbol: string, eventTimeMs: number, midPrice: nu
     const now = Date.now();
     const ts = Number.isFinite(eventTimeMs) && eventTimeMs > 0 ? eventTimeMs : now;
     const latencyMs = Math.max(0, now - ts);
+    observabilityMetrics.recordWsLatency(latencyMs);
     institutionalRiskEngine.recordHeartbeat(ts);
     institutionalRiskEngine.recordLatency(latencyMs, ts);
     if (RESILIENCE_PATCHES_ENABLED) {
@@ -910,6 +961,7 @@ function syncRiskEngineRuntime(symbol: string, eventTimeMs: number, midPrice: nu
 
     const currentState = institutionalRiskEngine.getRiskState();
     if (riskEngineLastState !== currentState) {
+        observabilityMetrics.setRiskState(toTelemetryRiskState(currentState));
         log('RISK_ENGINE_STATE_CHANGED', {
             from: riskEngineLastState,
             to: currentState,
@@ -919,6 +971,7 @@ function syncRiskEngineRuntime(symbol: string, eventTimeMs: number, midPrice: nu
     }
 
     if (currentState === RiskState.KILL_SWITCH && !KILL_SWITCH) {
+        observabilityMetrics.recordKillSwitchTriggered();
         KILL_SWITCH = true;
         orchestrator.setKillSwitch(true);
         log('RISK_ENGINE_FORCED_KILL_SWITCH', {
@@ -926,6 +979,8 @@ function syncRiskEngineRuntime(symbol: string, eventTimeMs: number, midPrice: nu
             state: currentState,
         });
     }
+
+    syncObservabilityMetrics(now);
 
     return institutionalRiskEngine.getRiskSummary();
 }
@@ -1404,7 +1459,35 @@ const wsManager = new WebSocketManager({
 let autoScaleForcedSingle = false;
 const healthController = new HealthController(wsManager, {
     getLatencySnapshot: () => latencyTracker.snapshot(),
+    getReadinessState: () => ({
+        wsConnected: wsState === 'connected',
+        riskState: RISK_ENGINE_ENABLED ? institutionalRiskEngine.getRiskState() : 'TRACKING',
+        killSwitchActive: Boolean(
+            KILL_SWITCH
+            || (RISK_ENGINE_ENABLED && institutionalRiskEngine.getRiskState() === RiskState.KILL_SWITCH)
+        ),
+        memoryThresholdPercent: Number(productionRuntimeConfig.system.memoryThreshold || 85),
+    }),
 });
+const productionReadinessSystem = initializeProductionReadiness(
+    {
+        version: 'phase-7',
+        environment: process.env.NODE_ENV || 'development',
+        enableGracefulShutdown: true,
+    },
+    {
+        getClientCount: () => wsManager.getClientCount(),
+        getReadinessState: () => ({
+            wsConnected: wsState === 'connected',
+            riskState: RISK_ENGINE_ENABLED ? institutionalRiskEngine.getRiskState() : 'TRACKING',
+            killSwitchActive: Boolean(
+                KILL_SWITCH
+                || (RISK_ENGINE_ENABLED && institutionalRiskEngine.getRiskState() === RiskState.KILL_SWITCH)
+            ),
+            memoryThresholdPercent: Number(productionRuntimeConfig.system.memoryThreshold || 85),
+        }),
+    }
+);
 
 function updateDryRunHealthFlag(): void {
     const dryRunActive = dryRunSession.getStatus().running;
@@ -2379,6 +2462,7 @@ function applyOrchestratorOrders(symbol: string, decision: OrchestratorV1Decisio
     const isPreTradeIntent = decision.intent === 'ENTRY' || decision.intent === 'ADD';
     const riskMultiplier = RISK_ENGINE_ENABLED ? institutionalRiskEngine.getPositionMultiplier() : 1;
     if (RISK_ENGINE_ENABLED && isPreTradeIntent && decision.side) {
+        observabilityMetrics.recordTradeAttempt();
         const currentPos = dryRunSession.getStrategyPosition(symbol);
         const fallbackPrice = Number(currentPos?.entryPrice || decision.position?.entryVwap || 0) > 0
             ? Number(currentPos?.entryPrice || decision.position?.entryVwap || 0)
@@ -2389,6 +2473,7 @@ function applyOrchestratorOrders(symbol: string, decision: OrchestratorV1Decisio
         const direction = decision.side === 'BUY' ? 'long' as const : 'short' as const;
         const riskCheck = institutionalRiskEngine.canTrade(symbol, checkQty, checkNotional, direction);
         if (!riskCheck.allowed) {
+            observabilityMetrics.recordTradeRejected();
             log('RISK_ENGINE_TRADE_REJECTED', {
                 symbol,
                 intent: decision.intent,
@@ -2410,6 +2495,7 @@ function applyOrchestratorOrders(symbol: string, decision: OrchestratorV1Decisio
         const currentPos = dryRunSession.getStrategyPosition(symbol);
         if ((decision.intent === 'ENTRY' || decision.intent === 'ADD') && decision.side) {
             if (RISK_ENGINE_ENABLED && riskMultiplier <= 0) {
+                observabilityMetrics.recordTradeRejected();
                 log('RISK_ENGINE_TRADE_REJECTED', {
                     symbol,
                     intent: decision.intent,
@@ -2452,6 +2538,7 @@ function applyOrchestratorOrders(symbol: string, decision: OrchestratorV1Decisio
         } else {
             decisionRuntimeStats.takerOrdersPlaced += 1;
         }
+        observabilityMetrics.recordTradeExecuted();
         if (order.kind === 'TAKER_ENTRY_FALLBACK') {
             decisionRuntimeStats.entryTakerNotionalPct = Math.max(
                 decisionRuntimeStats.entryTakerNotionalPct,
@@ -2828,6 +2915,9 @@ function broadcastMetrics(
 
             strategySignals = strategyRegistry.evaluateAll(strategyContext);
             consensusDecision = consensusEngine.evaluate(strategySignals, resolvedRiskState, canonicalTimeMs);
+            observabilityMetrics.recordDecisionConfidence(
+                Math.max(0, Math.min(1, Number(consensusDecision.confidence || 0)))
+            );
             strategyConsensusBySymbol.set(s, {
                 timestampMs: canonicalTimeMs,
                 side: consensusDecision.side,
@@ -3194,6 +3284,24 @@ app.get(
     }
 );
 
+app.get('/health', (_req, res) => {
+    const result = healthController.getHealth();
+    res.status(result.status).json(result.body);
+});
+app.get('/ready', (_req, res) => {
+    const result = healthController.getReady();
+    res.status(result.status).json(result.body);
+});
+app.get('/metrics', (req, res) => {
+    syncObservabilityMetrics(Date.now());
+    const acceptHeader = String(req.headers.accept || 'text/plain');
+    const result = observabilityMetrics.handleMetricsEndpoint(acceptHeader);
+    res.status(result.statusCode);
+    for (const [key, value] of Object.entries(result.headers)) {
+        res.setHeader(key, value);
+    }
+    res.send(result.body);
+});
 app.get('/health/liveness', healthController.liveness);
 app.get('/health/readiness', healthController.readiness);
 app.get('/health/metrics', healthController.metrics);
@@ -3256,6 +3364,9 @@ app.get('/api/health', (req, res) => {
 
 app.post('/api/kill-switch', (req, res) => {
     KILL_SWITCH = Boolean(req.body?.enabled);
+    if (KILL_SWITCH) {
+        observabilityMetrics.recordKillSwitchTriggered();
+    }
     orchestrator.setKillSwitch(KILL_SWITCH);
     if (RISK_ENGINE_ENABLED) {
         if (KILL_SWITCH) {

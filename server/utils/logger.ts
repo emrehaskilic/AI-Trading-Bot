@@ -1,7 +1,12 @@
+import { AsyncLocalStorage } from 'async_hooks';
 import { NextFunction, Request, Response } from 'express';
 
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 type LogContext = Record<string, unknown>;
+
+type RequestContext = {
+  correlationId: string;
+};
 
 const LOG_LEVEL_ORDER: Record<LogLevel, number> = {
   debug: 10,
@@ -9,6 +14,9 @@ const LOG_LEVEL_ORDER: Record<LogLevel, number> = {
   warn: 30,
   error: 40,
 };
+
+const requestContextStore = new AsyncLocalStorage<RequestContext>();
+let correlationCounter = 0;
 
 function parseLogLevel(value: string | undefined): LogLevel {
   const normalized = String(value || '').trim().toLowerCase();
@@ -46,15 +54,22 @@ function jsonReplacer(_key: string, value: unknown): unknown {
   return value;
 }
 
+function getCorrelationIdFromContext(): string | null {
+  const context = requestContextStore.getStore();
+  return context?.correlationId || null;
+}
+
 function write(level: LogLevel, event: string, context: LogContext = {}): void {
   if (LOG_LEVEL_ORDER[level] < LOG_LEVEL_ORDER[CURRENT_LOG_LEVEL]) {
     return;
   }
 
+  const correlationId = getCorrelationIdFromContext();
   const payload = {
     ts: new Date().toISOString(),
     level,
     event,
+    ...(correlationId ? { correlationId } : {}),
     ...context,
   };
 
@@ -64,6 +79,17 @@ function write(level: LogLevel, event: string, context: LogContext = {}): void {
     return;
   }
   process.stdout.write(`${line}\n`);
+}
+
+function generateCorrelationId(prefix: string = 'req'): string {
+  const nowPart = Date.now().toString(36);
+  correlationCounter = (correlationCounter + 1) % 1_000_000;
+  const seqPart = correlationCounter.toString(36).padStart(4, '0');
+  return `${prefix}-${nowPart}-${seqPart}`;
+}
+
+export function getCorrelationId(): string | null {
+  return getCorrelationIdFromContext();
 }
 
 export const logger = {
@@ -82,16 +108,25 @@ export const logger = {
 };
 
 export function requestLogger(req: Request, res: Response, next: NextFunction): void {
-  const start = Date.now();
-  res.on('finish', () => {
-    logger.info('HTTP_REQUEST', {
-      method: req.method,
-      path: req.originalUrl || req.url,
-      status: res.statusCode,
-      durationMs: Date.now() - start,
-      ip: req.ip || req.socket.remoteAddress || null,
-      userAgent: req.headers['user-agent'] || null,
+  const incomingHeader = req.header('x-correlation-id') || req.header('X-Correlation-Id');
+  const correlationId = incomingHeader && incomingHeader.trim().length > 0
+    ? incomingHeader.trim()
+    : generateCorrelationId('req');
+
+  res.setHeader('x-correlation-id', correlationId);
+
+  requestContextStore.run({ correlationId }, () => {
+    const start = Date.now();
+    res.on('finish', () => {
+      logger.info('HTTP_REQUEST', {
+        method: req.method,
+        path: req.originalUrl || req.url,
+        status: res.statusCode,
+        durationMs: Date.now() - start,
+        ip: req.ip || req.socket.remoteAddress || null,
+        userAgent: req.headers['user-agent'] || null,
+      });
     });
+    next();
   });
-  next();
 }
