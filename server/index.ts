@@ -204,6 +204,7 @@ interface SymbolMeta {
     consecutiveErrors: number;
     isResyncing: boolean;
     lastResyncTs: number; // New throttle
+    lastResyncTrigger: string;
     // Counters
     depthMsgCount: number;
     depthMsgCount10s: number;
@@ -248,6 +249,7 @@ interface SymbolMeta {
     // Strategy throttling cache
     lastStrategyEvalTs: number;
     lastStrategyDecision: any | null;
+    lastLegacyMetrics: any | null;
 }
 
 const symbolMeta = new Map<string, SymbolMeta>();
@@ -536,6 +538,7 @@ function getMeta(symbol: string): SymbolMeta {
             consecutiveErrors: 0,
             isResyncing: false,
             lastResyncTs: 0,
+            lastResyncTrigger: 'none',
             depthMsgCount: 0,
             depthMsgCount10s: 0,
             lastDepthMsgTs: Date.now(), // Avoid immediate stale check
@@ -570,6 +573,7 @@ function getMeta(symbol: string): SymbolMeta {
             snapshotTracker: new SnapshotTracker(),
             lastStrategyEvalTs: 0,
             lastStrategyDecision: null,
+            lastLegacyMetrics: null,
         };
         symbolMeta.set(symbol, meta);
     }
@@ -683,6 +687,7 @@ function requestOrderbookResync(symbol: string, trigger: string, detail: any = {
 
     meta.isResyncing = true;
     meta.lastResyncTs = now;
+    meta.lastResyncTrigger = trigger;
     meta.depthQueue = [];
     meta.goodSequenceStreak = 0;
     meta.desyncCount += 1;
@@ -1840,6 +1845,10 @@ function broadcastMetrics(
     const legacyM = precomputed && Object.prototype.hasOwnProperty.call(precomputed, 'legacyMetrics')
         ? precomputed.legacyMetrics
         : (hasBookData ? leg.computeMetrics(ob) : null);
+    if (legacyM) {
+        meta.lastLegacyMetrics = legacyM;
+    }
+    const legacyForUse = legacyM || meta.lastLegacyMetrics || null;
 
     // Top of book
     const { bids, asks } = getTopLevels(ob, 20);
@@ -1990,16 +1999,16 @@ function broadcastMetrics(
         resolvedOrchestratorDecision = orchestratorV1.evaluate({
             symbol: s,
             nowMs: Number(eventTimeMs || now),
-            price: Number(mid || legacyM?.price || 0),
+            price: Number(mid || legacyForUse?.price || 0),
             bestBid: bestBidPx,
             bestAsk: bestAskPx,
             spreadPct: spreadRatio,
             printsPerSecond: Number(tasMetrics?.printsPerSecond || 0),
-            deltaZ: Number(legacyM?.deltaZ ?? tf1m?.delta ?? 0),
-            cvdSlope: Number(legacyM?.cvdSlope ?? tf5m?.delta ?? 0),
+            deltaZ: Number(legacyForUse?.deltaZ ?? tf1m?.delta ?? 0),
+            cvdSlope: Number(legacyForUse?.cvdSlope ?? tf5m?.delta ?? 0),
             cvdTf5mState,
-            obiDeep: Number(legacyM?.obiDeep || 0),
-            obiWeighted: Number(legacyM?.obiWeighted || 0),
+            obiDeep: Number(legacyForUse?.obiDeep || 0),
+            obiWeighted: Number(legacyForUse?.obiWeighted || 0),
             trendinessScore: Number(advancedBundle.regimeMetrics?.trendinessScore || 0),
             chopScore: Number(advancedBundle.regimeMetrics?.chopScore || 0),
             volOfVol: Number(advancedBundle.regimeMetrics?.volOfVol || 0),
@@ -2073,7 +2082,7 @@ function broadcastMetrics(
                 timeInPositionMs: Number((strategyPosition as any).timeInPositionMs || 0),
             }
             : null,
-        legacyMetrics: legacyM,
+        legacyMetrics: legacyForUse,
         sessionVwap,
         htf: {
             m15: htfSnapshot.m15,
@@ -2142,9 +2151,9 @@ function broadcastMetrics(
             throttled: false,
             intervalMs,
             sentTo: sentCount,
-            obiWeighted: legacyM?.obiWeighted ?? null,
-            obiDeep: legacyM?.obiDeep ?? null,
-            obiDivergence: legacyM?.obiDivergence ?? null,
+            obiWeighted: legacyForUse?.obiWeighted ?? null,
+            obiDeep: legacyForUse?.obiDeep ?? null,
+            obiDivergence: legacyForUse?.obiDivergence ?? null,
             integrityLevel: integrity.level
         });
 
@@ -2153,8 +2162,8 @@ function broadcastMetrics(
             symbol: s,
             bestBid: bestBid(ob),
             bestAsk: bestAsk(ob),
-            obiWeighted: legacyM?.obiWeighted ?? null,
-            obiDeep: legacyM?.obiDeep ?? null,
+            obiWeighted: legacyForUse?.obiWeighted ?? null,
+            obiDeep: legacyForUse?.obiDeep ?? null,
             bookLevels: { bids: ob.bids.size, asks: ob.asks.size }
         });
     }
@@ -2343,7 +2352,8 @@ app.get('/api/status', (req, res) => {
             lastMetricsBroadcastTs: meta.lastBroadcastTs,
             lastMetricsBroadcastReason: meta.lastMetricsBroadcastReason,
             backoff: meta.backoffMs,
-            trades: meta.tradeMsgCount
+            trades: meta.tradeMsgCount,
+            lastResyncTrigger: meta.lastResyncTrigger,
         };
         result.summary.desync_count_10s += desync10s;
         result.summary.desync_count_60s += desync60s;

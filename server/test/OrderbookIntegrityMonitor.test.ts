@@ -34,6 +34,23 @@ export function runTests() {
   assert(gap.sequenceGapCount >= 1, 'gap counter should increment');
   assert(gap.level !== 'OK', 'sequence gap should degrade integrity');
 
+  monitor.resetAfterSnapshot(now + 150);
+  const contiguousWithPrevMismatch = monitor.observe({
+    symbol: 'BTCUSDT',
+    sequenceStart: 30,
+    sequenceEnd: 31,
+    prevSequenceEnd: 10, // mismatched pu-like pointer
+    eventTimeMs: now + 160,
+    bestBid: 100.1,
+    bestAsk: 100.2,
+    nowMs: now + 170,
+  });
+  assert.equal(
+    contiguousWithPrevMismatch.sequenceGapCount,
+    0,
+    'prev mismatch should not count as gap when sequence range is contiguous',
+  );
+
   const crossed = monitor.observe({
     symbol: 'BTCUSDT',
     sequenceStart: 22,

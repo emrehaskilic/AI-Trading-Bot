@@ -47,7 +47,7 @@ export function runTests() {
     eventTimeMs: 200,
     receiptTimeMs: 200,
   });
-  assert.equal(ignored.dropped, true, 'diff must be ignored until fresh snapshot arrives');
+  assert.equal(ignored.buffered, true, 'diff must be buffered until fresh snapshot arrives');
   assert.equal(btc.lastUpdateId, 0, 'state must stay reset before snapshot');
 
   applySnapshot(btc, {
@@ -87,5 +87,23 @@ export function runTests() {
     receiptTimeMs: 1100,
   });
   assert.equal(stale.dropped, true, 'u <= lastUpdateId must be dropped');
-}
 
+  // Snapshot bridge: pu can lag snapshot id, but U/u continuity must still apply.
+  const bridge = getOrCreateOrderbookState(store, 'solusdt');
+  applySnapshot(bridge, {
+    lastUpdateId: 500,
+    bids: [['150', '1']],
+    asks: [['151', '1']],
+  });
+  const bridged = applyDepthUpdate(bridge, {
+    U: 500,
+    u: 501,
+    pu: 499,
+    b: [['150', '2']],
+    a: [],
+    eventTimeMs: 500,
+    receiptTimeMs: 1200,
+  });
+  assert.equal(bridged.applied, true, 'snapshot bridge diff must apply even when pu < snapshot id');
+  assert.equal(bridge.lastUpdateId, 501, 'bridge update must advance sequence');
+}

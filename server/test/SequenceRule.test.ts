@@ -39,8 +39,8 @@ export function runTests() {
     u: 26,
     b: [],
     a: [],
-    eventTimeMs: 2000,
-    receiptTimeMs: 2000,
+    eventTimeMs: 7001,
+    receiptTimeMs: 7001,
   });
   assert(badGap.ok === false && badGap.gapDetected === true, 'expired future update should trigger gap');
   // DROP case: u <= lastUpdateId

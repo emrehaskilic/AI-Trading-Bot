@@ -62,12 +62,14 @@ export class OrderbookIntegrityMonitor {
     this.lastUpdateTimestamp = input.nowMs;
 
     if (this.lastSequenceEnd > 0) {
+      const expectedNext = this.lastSequenceEnd + 1;
+      const rangeContiguous = input.sequenceStart <= expectedNext && input.sequenceEnd >= expectedNext;
       const hasPrevPointer = Number.isFinite(input.prevSequenceEnd) && Number(input.prevSequenceEnd) > 0;
       if (hasPrevPointer) {
-        if (Number(input.prevSequenceEnd) !== this.lastSequenceEnd) {
+        if (Number(input.prevSequenceEnd) !== this.lastSequenceEnd && !rangeContiguous) {
           this.sequenceGapCount += 1;
         }
-      } else if (input.sequenceStart > this.lastSequenceEnd + 1) {
+      } else if (!rangeContiguous) {
         this.sequenceGapCount += 1;
       }
     }

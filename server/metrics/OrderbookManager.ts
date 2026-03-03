@@ -75,8 +75,10 @@ export interface ResetOrderbookOptions {
 }
 
 const MAX_LEVELS_PER_SIDE = Math.max(200, Number(process.env.ORDERBOOK_MAX_LEVELS_PER_SIDE || 2000));
-const REORDER_BUFFER_MAX = Math.max(4, Number(process.env.ORDERBOOK_REORDER_BUFFER_MAX || 24));
-const REORDER_BUFFER_TTL_MS = Math.max(20, Number(process.env.ORDERBOOK_REORDER_BUFFER_TTL_MS || 150));
+const SNAPSHOT_BRIDGE_BUFFER_MAX = Math.max(200, Number(process.env.ORDERBOOK_SNAPSHOT_BUFFER_MAX || 4000));
+// Keep reorder buffer bounded but tolerant to short network jitter on 100ms streams.
+const REORDER_BUFFER_MAX = Math.max(8, Number(process.env.ORDERBOOK_REORDER_BUFFER_MAX || 64));
+const REORDER_BUFFER_TTL_MS = Math.max(250, Number(process.env.ORDERBOOK_REORDER_BUFFER_TTL_MS || 5000));
 
 type SequenceDecision = 'apply' | 'future' | 'stale' | 'gap';
 
@@ -206,16 +208,31 @@ export function applyDepthUpdate(state: OrderbookState, update: BufferedDepthUpd
     return { ok: true, applied: false, dropped: true, buffered: false, gapDetected: false };
   }
 
-  // During mandatory snapshot phases, ignore live diffs to avoid stale merge.
-  if (state.snapshotRequired || state.lastUpdateId <= 0 || !canApplyDeltaInState(state.uiState)) {
+  // During snapshot-required phases we must buffer diffs for snapshot->diff bridging.
+  if (state.snapshotRequired || state.lastUpdateId <= 0) {
+    bufferSnapshotBridgeUpdate(state, update);
+    return { ok: true, applied: false, dropped: false, buffered: true, gapDetected: false };
+  }
+
+  if (!canApplyDeltaInState(state.uiState)) {
     state.stats.dropped++;
     return { ok: true, applied: false, dropped: true, buffered: false, gapDetected: false };
   }
 
   if (update.u <= state.lastUpdateId) {
     state.stats.dropped++;
-    return { ok: true, applied: false, dropped: true, buffered: false, gapDetected: false };
+  return { ok: true, applied: false, dropped: true, buffered: false, gapDetected: false };
+}
+
+function bufferSnapshotBridgeUpdate(state: OrderbookState, update: BufferedDepthUpdate): void {
+  if (state.buffer.length >= SNAPSHOT_BRIDGE_BUFFER_MAX) {
+    // Keep most recent updates during prolonged snapshot waits.
+    state.buffer.shift();
+    state.stats.dropped++;
   }
+  state.buffer.push(update);
+  state.stats.buffered++;
+}
 
   const expected = state.lastUpdateId + 1;
   if (evictExpiredReorderEntries(state, now, expected)) {
@@ -272,6 +289,12 @@ function classifyUpdate(state: OrderbookState, update: BufferedDepthUpdate, expe
   }
 
   const spansExpected = update.U <= expected && update.u >= expected;
+  // Binance snapshot->diff bridge must prioritize U/u continuity.
+  // `pu` can legitimately lag snapshot id on the first live diff after snapshot.
+  if (spansExpected) {
+    return 'apply';
+  }
+
   const hasPrevUpdatePointer = Number.isFinite(update.pu) && Number(update.pu) > 0;
   if (hasPrevUpdatePointer) {
     const pu = Number(update.pu);
@@ -281,14 +304,7 @@ function classifyUpdate(state: OrderbookState, update: BufferedDepthUpdate, expe
     if (pu > state.lastUpdateId) {
       return 'future';
     }
-    if (spansExpected) {
-      return 'apply';
-    }
     return update.U > expected ? 'future' : 'gap';
-  }
-
-  if (spansExpected) {
-    return 'apply';
   }
   if (update.U > expected) {
     return 'future';
