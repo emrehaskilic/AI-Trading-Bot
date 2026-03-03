@@ -1,20 +1,42 @@
-# RESULTS
+# RESULTS - FAZ 1A Deterministic Orderbook
 
-## AI tamamen kaldirildi mi?
-Evet.
+## Cozulen P0 maddeleri
+- P0-1 (Symbol-state isolation): Cozuldu. `OrderbookState` artik symbol bazli map uzerinden yonetiliyor.
+- P0-2 (Reconnect reset + snapshot): Cozuldu. Reconnect/resync akisinda hard reset ve zorunlu snapshot var.
+- P0-3 (Gap -> auto resync): Cozuldu. Gap algisinda otomatik resync tetikleniyor, snapshot gelene kadar diff uygulanmiyor.
+- P0-4 (Monotonic sequence): Cozuldu. `u <= lastUpdateId` stale update drop, sequence bozulmasinda resync tetigi var.
+- P0-5 (Minimal reorder buffer): Cozuldu. Kucuk ve TTL bazli reorder buffer eklendi.
 
-## Kalan referans var mi?
-Kod tarafinda (server/src/scripts ve teknik dosya uzantilari icinde) `ai-dry-run`, `AIDryRun`, `GoogleAIClient`, `DecisionProvider`, `PolicyEngine`, `RiskGovernor`, `DECISION_MODE`, `AI_` referansi kalmadi.
-Not: Tarihsel dokuman/artifact dosyalarinda (envanter raporlari gibi) AI gecisleri korunmustur.
+## Degisen dosyalar
+- `server/metrics/OrderbookManager.ts`
+- `server/metrics/OrderbookIntegrityMonitor.ts`
+- `server/ws/WebSocketManager.ts`
+- `server/index.ts`
+- `server/test/OrderbookDeterminismP0.test.ts`
+- `server/test/OrderbookManager.test.ts`
+- `server/test/ReconnectContinuity.test.ts`
+- `server/test/SequenceRule.test.ts`
+- `server/test/suites.ts`
 
-## Build/test sonucu
-- Root install: `npm install` basarili
-- Backend install: `server/npm install` basarili
-- Backend build: `server/npm run build` basarili
-- Backend run kontrolu: `/api/health` -> 200
-- AI endpoint kontrolu: `/api/ai-dry-run/status` -> 404
-- Frontend build: `npm run build` basarili
+## Dogrulama (komut ve log)
+- Backend build:
+  - Komut: `cd server && npm run build`
+  - Sonuc: Basarili
+- Frontend build:
+  - Komut: `npm run build`
+  - Sonuc: Basarili
+- P0 odakli testler:
+  - Komut: `node --require ts-node/register` ile `OrderbookManager`, `SequenceRule`, `ReconnectContinuity`, `OrderbookDeterminismP0` suite'leri calistirildi
+  - Sonuc logu: `ORDERBOOK_P0_TESTS_OK`
+- Multi-symbol + gap/reorder/reset simulasyonu:
+  - Sonuc loglari:
+    - `MULTI_SYMBOL_ISOLATION 3 4`
+    - `REORDER_FUTURE_BUFFERED true GAP_AFTER_TTL true`
+    - `RESET_REQUIRES_SNAPSHOT true LAST_ID 0`
+- Backend run smoke:
+  - Komut: `cd server && node dist/index.js` (AI key env'leri bos)
+  - Sonuc logu: `SERVER_RUNNING_OK`
 
-## Riskli alan var mi?
-- Orta: AI'ya ozel testler ve arac scriptleri kaldirildigi icin o yuzeyde regresyon testi artik yok.
-- Dusuk: Tarihsel dokumanlar AI terimlerini icermeye devam ediyor; calisan kodu etkilemiyor.
+## Kalan risk / TODO
+- Tam `npm test` suresi bu repoda uzun ve timeout'a dusuyor; tum suite'ler icin CI timeout/parallel test iyilestirmesi onerilir.
+- Reorder buffer parametreleri (TTL ve max boyut) canli trafik profiline gore tune edilmelidir.
