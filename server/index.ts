@@ -65,6 +65,7 @@ import { MarketDataArchive } from './backfill/MarketDataArchive';
 import { SignalReplay } from './backfill/SignalReplay';
 import { ABTestManager } from './abtesting';
 import { PortfolioMonitor } from './risk/PortfolioMonitor';
+import { InstitutionalRiskEngine, RiskState, RiskStateTrigger } from './risk/InstitutionalRiskEngine';
 import { LatencyTracker } from './metrics/LatencyTracker';
 import { MonteCarloSimulator, calculateRiskOfRuin, generateRandomTrades } from './backtesting/MonteCarloSimulator';
 import { WalkForwardAnalyzer } from './backtesting/WalkForwardAnalyzer';
@@ -147,11 +148,74 @@ function parseEnvFlag(value: string | undefined): boolean {
     const normalized = value.trim().replace(/^['"]|['"]$/g, '').toLowerCase();
     return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on';
 }
+function parseEnvNumber(value: string | undefined, fallback: number): number {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+}
 
 const EXECUTION_ENABLED_DEFAULT = parseEnvFlag(process.env.EXECUTION_ENABLED);
 let EXECUTION_ENABLED = EXECUTION_ENABLED_DEFAULT;
 const EXECUTION_ENV = 'testnet';
 let SUPER_SCALP_ENABLED = parseEnvFlag(process.env.SUPER_SCALP_ENABLED);
+const RISK_ENGINE_ENABLED = process.env.RISK_ENGINE_ENABLED == null
+    ? true
+    : parseEnvFlag(process.env.RISK_ENGINE_ENABLED);
+const RISK_ENGINE_DEFAULT_EQUITY_USDT = Math.max(
+    1,
+    parseEnvNumber(process.env.RISK_ENGINE_DEFAULT_EQUITY_USDT || process.env.STARTING_MARGIN_USDT, 5000)
+);
+const MAX_POSITION_NOTIONAL_BASE = Math.max(
+    100,
+    parseEnvNumber(process.env.MAX_POSITION_NOTIONAL_USDT, 10000)
+);
+const RISK_ENGINE_CONFIG = {
+    state: {
+        reducedRiskPositionMultiplier: Math.max(
+            0.05,
+            Math.min(1, parseEnvNumber(process.env.RISK_REDUCED_POSITION_MULTIPLIER, 0.5))
+        ),
+    },
+    position: {
+        maxPositionNotional: Math.max(100, parseEnvNumber(process.env.RISK_MAX_POSITION_NOTIONAL_USDT, MAX_POSITION_NOTIONAL_BASE)),
+        maxLeverage: Math.max(1, parseEnvNumber(process.env.RISK_MAX_LEVERAGE, parseEnvNumber(process.env.MAX_LEVERAGE, 20))),
+        maxPositionQty: Math.max(0.000001, parseEnvNumber(process.env.RISK_MAX_POSITION_QTY, 10)),
+        maxTotalNotional: Math.max(100, parseEnvNumber(process.env.RISK_MAX_TOTAL_NOTIONAL_USDT, Math.max(MAX_POSITION_NOTIONAL_BASE * 2, 20000))),
+        warningThreshold: Math.max(0.5, Math.min(0.99, parseEnvNumber(process.env.RISK_POSITION_WARNING_THRESHOLD, 0.8))),
+    },
+    drawdown: {
+        dailyLossLimitRatio: Math.max(0.01, Math.min(1, parseEnvNumber(process.env.RISK_DAILY_LOSS_LIMIT_RATIO, 0.1))),
+        dailyLossWarningRatio: Math.max(0.005, Math.min(1, parseEnvNumber(process.env.RISK_DAILY_LOSS_WARNING_RATIO, 0.07))),
+        maxDrawdownRatio: Math.max(0.01, Math.min(1, parseEnvNumber(process.env.RISK_MAX_DRAWDOWN_RATIO, 0.15))),
+        checkIntervalMs: Math.max(500, parseEnvNumber(process.env.RISK_DRAWDOWN_CHECK_INTERVAL_MS, 5000)),
+        autoHaltOnLimit: process.env.RISK_DRAWDOWN_AUTO_HALT == null
+            ? true
+            : parseEnvFlag(process.env.RISK_DRAWDOWN_AUTO_HALT),
+    },
+    consecutiveLoss: {
+        maxConsecutiveLosses: Math.max(1, Math.trunc(parseEnvNumber(process.env.RISK_MAX_CONSECUTIVE_LOSSES, 5))),
+        lossWindowMs: Math.max(1000, parseEnvNumber(process.env.RISK_CONSECUTIVE_LOSS_WINDOW_MS, 3600000)),
+        reducedRiskThreshold: Math.max(1, Math.trunc(parseEnvNumber(process.env.RISK_REDUCED_AFTER_CONSECUTIVE_LOSSES, 3))),
+        reducedRiskMultiplier: Math.max(0.05, Math.min(1, parseEnvNumber(process.env.RISK_CONSECUTIVE_LOSS_MULTIPLIER, 0.5))),
+    },
+    execution: {
+        maxPartialFillRate: Math.max(0.01, Math.min(1, parseEnvNumber(process.env.RISK_MAX_PARTIAL_FILL_RATE, 0.3))),
+        maxRejectRate: Math.max(0.01, Math.min(1, parseEnvNumber(process.env.RISK_MAX_REJECT_RATE, 0.2))),
+        executionTimeoutMs: Math.max(500, parseEnvNumber(process.env.RISK_EXECUTION_TIMEOUT_MS, 10000)),
+        rateWindowMs: Math.max(1000, parseEnvNumber(process.env.RISK_EXECUTION_WINDOW_MS, 300000)),
+        autoHaltOnFailure: process.env.RISK_EXECUTION_AUTO_HALT == null
+            ? true
+            : parseEnvFlag(process.env.RISK_EXECUTION_AUTO_HALT),
+    },
+    killSwitch: {
+        latencySpikeThresholdMs: Math.max(10, parseEnvNumber(process.env.RISK_LATENCY_SPIKE_MS, 5000)),
+        volatilitySpikeThreshold: Math.max(0.001, Math.min(1, parseEnvNumber(process.env.RISK_VOLATILITY_SPIKE_RATIO, 0.05))),
+        disconnectTimeoutMs: Math.max(1000, parseEnvNumber(process.env.RISK_DISCONNECT_TIMEOUT_MS, 30000)),
+        priceWindowMs: Math.max(1000, parseEnvNumber(process.env.RISK_PRICE_WINDOW_MS, 60000)),
+        autoClosePositions: process.env.RISK_AUTO_CLOSE_POSITIONS == null
+            ? true
+            : parseEnvFlag(process.env.RISK_AUTO_CLOSE_POSITIONS),
+    },
+};
 
 function normalizeWsUpdateSpeed(raw: string): '100ms' | '250ms' | '500ms' {
     const value = String(raw || '').trim().toLowerCase();
@@ -323,6 +387,14 @@ const marketArchive = new MarketDataArchive();
 const signalReplay = new SignalReplay(marketArchive);
 const portfolioMonitor = new PortfolioMonitor();
 const latencyTracker = new LatencyTracker();
+const institutionalRiskEngine = new InstitutionalRiskEngine(RISK_ENGINE_CONFIG);
+let riskEngineLastKnownEquity = RISK_ENGINE_DEFAULT_EQUITY_USDT;
+const riskEngineLastRealizedPnlBySymbol = new Map<string, number>();
+let riskEngineLastState: RiskState | null = null;
+if (RISK_ENGINE_ENABLED) {
+    institutionalRiskEngine.initialize(riskEngineLastKnownEquity);
+    riskEngineLastState = institutionalRiskEngine.getRiskState();
+}
 const marketDataValidator = new MarketDataValidator(alertService);
 const marketDataMonitor = new MarketDataMonitor(alertService, {
     maxSilenceMs: Number(process.env.MARKET_DATA_MAX_SILENCE_MS || 10_000),
@@ -343,6 +415,8 @@ log('EXECUTION_CONFIG', {
     decisionMode: 'orchestrator_v1',
     decisionEnabled: true,
     superScalpEnabled: SUPER_SCALP_ENABLED,
+    riskEngineEnabled: RISK_ENGINE_ENABLED,
+    riskEngineDefaultEquityUsdt: RISK_ENGINE_DEFAULT_EQUITY_USDT,
     hasApiKey: hasEnvApiKey,
     hasApiSecret: hasEnvApiSecret,
     executionAllowed: initialGate.executionAllowed,
@@ -548,6 +622,162 @@ function updateOrchestratorDiagnostics(symbol: string, decision: OrchestratorV1D
         impulse,
         chaseActive,
     };
+}
+
+function computeRiskExposureFromOrders(orders: OrchestratorV1Order[], fallbackPrice: number | null): {
+    quantity: number;
+    notional: number;
+} {
+    const quantity = orders.reduce((sum, order) => sum + Math.max(0, Math.abs(Number(order.qty || 0))), 0);
+    const directNotional = orders.reduce((sum, order) => {
+        const qty = Math.max(0, Math.abs(Number(order.qty || 0)));
+        const price = Number(order.price || 0);
+        if (qty > 0 && price > 0) {
+            return sum + (qty * price);
+        }
+        return sum;
+    }, 0);
+    const notionalFromPct = orders.reduce((sum, order) => {
+        const pct = Math.max(0, Math.abs(Number(order.notionalPct || 0)));
+        return sum + ((pct / 100) * riskEngineLastKnownEquity);
+    }, 0);
+    const notionalFromFallback = quantity > 0 && Number(fallbackPrice || 0) > 0
+        ? quantity * Number(fallbackPrice)
+        : 0;
+
+    return {
+        quantity,
+        notional: Math.max(0, directNotional, notionalFromPct, notionalFromFallback),
+    };
+}
+
+function submitRiskAwareStrategyDecision(
+    symbol: string,
+    side: 'BUY' | 'SELL',
+    intent: 'ENTRY' | 'ADD',
+    timestampMs: number,
+    riskMultiplier: number,
+    expectedPrice: number | null
+): void {
+    const score = intent === 'ENTRY' ? 100 : 80;
+    const strategySide = side === 'BUY' ? 'LONG' : 'SHORT';
+    const reason = intent === 'ENTRY' ? 'ENTRY_TR' : 'STRAT_ADD';
+    const actionType = intent === 'ENTRY' ? 'ENTRY' : 'ADD';
+    const boundedMultiplier = Math.max(0, Math.min(1, Number(riskMultiplier || 1)));
+    const percentile = Math.max(0, Math.min(1, score / 100));
+
+    dryRunSession.submitStrategyDecision(symbol, {
+        symbol,
+        timestampMs,
+        regime: 'TR',
+        dfs: score,
+        dfsPercentile: percentile,
+        volLevel: 0.5,
+        gatePassed: true,
+        reasons: [reason],
+        actions: [{
+            type: actionType as any,
+            side: strategySide as any,
+            reason: reason as any,
+            expectedPrice,
+            sizeMultiplier: boundedMultiplier,
+        }],
+        log: {
+            timestampMs,
+            symbol,
+            regime: 'TR',
+            gate: { passed: true, reason: null, details: {} },
+            dfs: score,
+            dfsPercentile: percentile,
+            volLevel: 0.5,
+            thresholds: { longEntry: 0.85, longBreak: 0.55, shortEntry: 0.15, shortBreak: 0.45 },
+            reasons: [reason],
+            actions: [{
+                type: actionType as any,
+                side: strategySide as any,
+                reason: reason as any,
+                expectedPrice,
+                sizeMultiplier: boundedMultiplier,
+            }],
+            stats: {},
+        },
+    } as any, timestampMs);
+}
+
+function syncRiskEngineRuntime(symbol: string, eventTimeMs: number, midPrice: number | null): ReturnType<InstitutionalRiskEngine['getRiskSummary']> | null {
+    if (!RISK_ENGINE_ENABLED) {
+        return null;
+    }
+
+    const now = Date.now();
+    const ts = Number.isFinite(eventTimeMs) && eventTimeMs > 0 ? eventTimeMs : now;
+    institutionalRiskEngine.recordHeartbeat(ts);
+    institutionalRiskEngine.recordLatency(Math.max(0, now - ts), ts);
+
+    if (Number(midPrice || 0) > 0) {
+        institutionalRiskEngine.recordPrice(symbol, Number(midPrice), ts);
+    }
+
+    if (dryRunSession.isTrackingSymbol(symbol)) {
+        const status = dryRunSession.getStatus();
+        const totalEquity = Number(status.summary.totalEquity || 0);
+        if (Number.isFinite(totalEquity) && totalEquity > 0) {
+            riskEngineLastKnownEquity = totalEquity;
+            institutionalRiskEngine.updateEquity(totalEquity, ts);
+        }
+
+        const symbolStatus = status.perSymbol[symbol];
+        if (symbolStatus) {
+            const realizedPnl = Number(symbolStatus.metrics?.realizedPnl || 0);
+            const prevRealized = riskEngineLastRealizedPnlBySymbol.has(symbol)
+                ? Number(riskEngineLastRealizedPnlBySymbol.get(symbol))
+                : realizedPnl;
+            const pnlDelta = realizedPnl - prevRealized;
+            if (Number.isFinite(pnlDelta) && Math.abs(pnlDelta) > 0) {
+                const qtyForRecord = Math.max(1e-6, Number(symbolStatus.position?.qty || 1));
+                institutionalRiskEngine.recordTradeResult(symbol, pnlDelta, qtyForRecord, ts);
+            }
+            riskEngineLastRealizedPnlBySymbol.set(symbol, realizedPnl);
+
+            const position = symbolStatus.position;
+            if (position && Number(position.qty) > 0 && Number(position.entryPrice) > 0) {
+                const notional = Math.max(
+                    0,
+                    Math.abs(Number(position.notionalUsdt || 0)),
+                    Math.abs(Number(position.qty || 0) * Number(position.entryPrice || 0))
+                );
+                const signedQty = position.side === 'LONG'
+                    ? Math.abs(Number(position.qty || 0))
+                    : -Math.abs(Number(position.qty || 0));
+                const leverage = Math.max(1, Number(symbolStatus.risk?.dynamicLeverage || parseEnvNumber(process.env.MAX_LEVERAGE, 10)));
+                institutionalRiskEngine.updatePosition(symbol, signedQty, notional, leverage);
+            } else {
+                institutionalRiskEngine.getGuards().position.removePosition(symbol);
+                institutionalRiskEngine.getGuards().multiSymbol.removeExposure(symbol);
+            }
+        }
+    }
+
+    const currentState = institutionalRiskEngine.getRiskState();
+    if (riskEngineLastState !== currentState) {
+        log('RISK_ENGINE_STATE_CHANGED', {
+            from: riskEngineLastState,
+            to: currentState,
+            summary: institutionalRiskEngine.getRiskSummary(),
+        });
+        riskEngineLastState = currentState;
+    }
+
+    if (currentState === RiskState.KILL_SWITCH && !KILL_SWITCH) {
+        KILL_SWITCH = true;
+        orchestrator.setKillSwitch(true);
+        log('RISK_ENGINE_FORCED_KILL_SWITCH', {
+            reason: 'risk_engine_kill_switch_state',
+            state: currentState,
+        });
+    }
+
+    return institutionalRiskEngine.getRiskSummary();
 }
 
 // =============================================================================
@@ -1932,26 +2162,59 @@ function applyOrchestratorOrders(symbol: string, decision: OrchestratorV1Decisio
         decisionRuntimeStats.exitRiskTriggeredCount += 1;
     }
 
-    // ── Dry Run integration: forward OrchestratorV1 decisions to dryRunSession ──
+    const isPreTradeIntent = decision.intent === 'ENTRY' || decision.intent === 'ADD';
+    const riskMultiplier = RISK_ENGINE_ENABLED ? institutionalRiskEngine.getPositionMultiplier() : 1;
+    if (RISK_ENGINE_ENABLED && isPreTradeIntent && decision.side) {
+        const currentPos = dryRunSession.getStrategyPosition(symbol);
+        const fallbackPrice = Number(currentPos?.entryPrice || decision.position?.entryVwap || 0) > 0
+            ? Number(currentPos?.entryPrice || decision.position?.entryVwap || 0)
+            : null;
+        const exposure = computeRiskExposureFromOrders(Array.isArray(decision.orders) ? decision.orders : [], fallbackPrice);
+        const checkQty = exposure.quantity > 0 ? exposure.quantity : 1;
+        const checkNotional = exposure.notional > 0 ? exposure.notional : Math.max(1, riskEngineLastKnownEquity * 0.01);
+        const direction = decision.side === 'BUY' ? 'long' as const : 'short' as const;
+        const riskCheck = institutionalRiskEngine.canTrade(symbol, checkQty, checkNotional, direction);
+        if (!riskCheck.allowed) {
+            log('RISK_ENGINE_TRADE_REJECTED', {
+                symbol,
+                intent: decision.intent,
+                side: decision.side,
+                quantity: checkQty,
+                notional: checkNotional,
+                reason: riskCheck.reason || 'risk_rejected',
+                state: riskCheck.state,
+                guards: riskCheck.guards,
+                positionMultiplier: riskCheck.positionMultiplier,
+            });
+            return;
+        }
+    }
+
+    // Dry Run integration: forward OrchestratorV1 decisions to dryRunSession
     const isDryRunTracked = dryRunSession.isTrackingSymbol(symbol);
     if (isDryRunTracked && (decision.intent === 'ENTRY' || decision.intent === 'ADD' || decision.intent === 'EXIT_RISK' || decision.intent === 'EXIT_FLIP')) {
         const currentPos = dryRunSession.getStrategyPosition(symbol);
-        if (decision.intent === 'ENTRY' && decision.side) {
-            const signalType = decision.side === 'BUY' ? 'ENTRY_LONG' : 'ENTRY_SHORT';
-            dryRunSession.submitStrategySignal(symbol, {
-                signal: signalType,
-                score: 100,
-                vetoReason: null,
-                candidate: null,
-            }, decision.timestampMs);
-        } else if (decision.intent === 'ADD' && decision.side) {
-            const signalType = decision.side === 'BUY' ? 'ENTRY_LONG' : 'ENTRY_SHORT';
-            dryRunSession.submitStrategySignal(symbol, {
-                signal: signalType,
-                score: 80,
-                vetoReason: null,
-                candidate: null,
-            }, decision.timestampMs);
+        if ((decision.intent === 'ENTRY' || decision.intent === 'ADD') && decision.side) {
+            if (RISK_ENGINE_ENABLED && riskMultiplier <= 0) {
+                log('RISK_ENGINE_TRADE_REJECTED', {
+                    symbol,
+                    intent: decision.intent,
+                    reason: 'position_multiplier_zero',
+                    state: institutionalRiskEngine.getRiskState(),
+                });
+                return;
+            }
+            const expectedPrice = Array.isArray(decision.orders)
+                ? (decision.orders.find((order) => Number(order.price || 0) > 0)?.price ?? null)
+                : null;
+            submitRiskAwareStrategyDecision(
+                symbol,
+                decision.side,
+                decision.intent === 'ENTRY' ? 'ENTRY' : 'ADD',
+                Number(decision.timestampMs || Date.now()),
+                riskMultiplier,
+                expectedPrice
+            );
         } else if ((decision.intent === 'EXIT_RISK' || decision.intent === 'EXIT_FLIP') && currentPos) {
             if (currentPos.side === 'LONG' || currentPos.side === 'SHORT') {
                 const exitSignal = currentPos.side === 'LONG' ? 'ENTRY_SHORT' : 'ENTRY_LONG';
@@ -1982,11 +2245,25 @@ function applyOrchestratorOrders(symbol: string, decision: OrchestratorV1Decisio
             );
             decisionRuntimeStats.takerFillsCount += 1;
         }
+        if (RISK_ENGINE_ENABLED) {
+            const requestedQty = Math.max(0, Math.abs(Number(order.qty || 0)));
+            if (requestedQty > 0) {
+                institutionalRiskEngine.recordExecutionEvent(
+                    String(order.id || `${symbol}-${decision.timestampMs}-${decisionRuntimeStats.ordersAttempted}`),
+                    symbol,
+                    'fill',
+                    requestedQty,
+                    requestedQty
+                );
+            }
+        }
     }
     log('ORCHESTRATOR_V1_ORDERS', {
         symbol,
         intent: decision.intent,
         side: decision.side,
+        riskState: RISK_ENGINE_ENABLED ? institutionalRiskEngine.getRiskState() : 'DISABLED',
+        riskMultiplier,
         orders: decision.orders.map((order: OrchestratorV1Order) => ({
             id: order.id,
             kind: order.kind,
@@ -2249,6 +2526,7 @@ function broadcastMetrics(
     }
     const orchestratorDebug = updateOrchestratorDiagnostics(s, resolvedOrchestratorDecision, Number(eventTimeMs || now));
     const decisionView = buildDecisionViewFromOrchestrator(resolvedOrchestratorDecision);
+    const riskSummary = syncRiskEngineRuntime(s, Number(eventTimeMs || now), mid);
     const strategyPosition = decisionView.suppressDryRunPosition && rawPositionSource === 'dryrun'
         ? null
         : rawStrategyPosition;
@@ -2263,6 +2541,7 @@ function broadcastMetrics(
         symbol: s,
         state: ob.uiState,
         event_time_ms: eventTimeMs,
+        riskEngine: riskSummary,
         snapshot: meta.snapshotTracker.next({ s, mid }),
         timeAndSales: tasMetrics,
         cvd: {
@@ -2439,6 +2718,8 @@ app.get('/api/health', (req, res) => {
         killSwitch: KILL_SWITCH,
         decisionMode: 'orchestrator_v1',
         decisionEnabled: true,
+        riskEngineEnabled: RISK_ENGINE_ENABLED,
+        riskEngine: RISK_ENGINE_ENABLED ? institutionalRiskEngine.getRiskSummary() : null,
         decisionRuntime: {
             legacyDecisionCalls: decisionRuntimeStats.legacyDecisionCalls,
             executorEntrySkipped: decisionRuntimeStats.executorEntrySkipped,
@@ -2487,6 +2768,16 @@ app.get('/api/health', (req, res) => {
 app.post('/api/kill-switch', (req, res) => {
     KILL_SWITCH = Boolean(req.body?.enabled);
     orchestrator.setKillSwitch(KILL_SWITCH);
+    if (RISK_ENGINE_ENABLED) {
+        if (KILL_SWITCH) {
+            institutionalRiskEngine.activateKillSwitch('manual_http_kill_switch');
+        } else {
+            institutionalRiskEngine.getStateManager().transition(
+                RiskStateTrigger.MANUAL_RESET,
+                'manual_http_kill_switch_reset'
+            );
+        }
+    }
     log('KILL_SWITCH_TOGGLED', { enabled: KILL_SWITCH });
     res.json({ ok: true, killSwitch: KILL_SWITCH });
 });
@@ -2922,6 +3213,15 @@ app.get('/api/portfolio/status', (_req, res) => {
 
 app.get('/api/latency', (_req, res) => {
     res.json({ ok: true, latency: latencyTracker.snapshot() });
+});
+
+app.get('/api/risk/status', (_req, res) => {
+    res.json({
+        ok: true,
+        enabled: RISK_ENGINE_ENABLED,
+        defaultEquityUsdt: riskEngineLastKnownEquity,
+        summary: RISK_ENGINE_ENABLED ? institutionalRiskEngine.getRiskSummary() : null,
+    });
 });
 
 app.post('/api/abtest/start', (req, res) => {
