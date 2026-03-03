@@ -2,6 +2,7 @@ import * as TimeAndSalesTests from './TimeAndSales.test';
 import * as CvdTests from './CvdCalculator.test';
 import * as AbsorptionTests from './AbsorptionDetector.test';
 import * as OrderbookTests from './OrderbookManager.test';
+import * as OrderbookDeterminismP0Tests from './OrderbookDeterminismP0.test';
 import * as OIMonitorTests from './OpenInterestMonitor.test';
 import * as FundingTests from './FundingMonitor.test';
 import * as SessionVwapTrackerTests from './SessionVwapTracker.test';
@@ -34,6 +35,7 @@ export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'CvdCalculator', fn: CvdTests.runTests },
     { name: 'AbsorptionDetector', fn: AbsorptionTests.runTests },
     { name: 'OrderbookManager', fn: OrderbookTests.runTests },
+    { name: 'OrderbookDeterminismP0', fn: OrderbookDeterminismP0Tests.runTests },
     { name: 'OpenInterestMonitor', fn: OIMonitorTests.runTests },
     { name: 'FundingMonitor', fn: FundingTests.runTests },
     { name: 'SessionVwapTracker', fn: SessionVwapTrackerTests.runTests },

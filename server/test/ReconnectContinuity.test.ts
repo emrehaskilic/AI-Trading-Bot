@@ -30,10 +30,19 @@ export function runTests() {
     u: 20,
     b: [],
     a: [],
-    eventTimeMs: Date.now(),
-    receiptTimeMs: Date.now(),
+    eventTimeMs: 1000,
+    receiptTimeMs: 1000,
   });
-  assert(gap.ok === false, 'gap update should fail');
+  assert(gap.ok === true && gap.buffered === true, 'future update should be buffered first');
+  const gapFinal = applyDepthUpdate(ob, {
+    U: 16,
+    u: 21,
+    b: [],
+    a: [],
+    eventTimeMs: 2000,
+    receiptTimeMs: 2000,
+  });
+  assert(gapFinal.ok === false, 'expired reorder entry should fail with gap');
   // After reconnect (new snapshot)
   const snap2: DepthCache = { lastUpdateId: 30, bids: [], asks: [] };
   applySnapshot(ob, snap2);

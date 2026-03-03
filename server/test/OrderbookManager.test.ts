@@ -57,8 +57,17 @@ export function runTests() {
     u: 13,
     b: [['100.0', '5']],
     a: [],
-    eventTimeMs: Date.now(),
-    receiptTimeMs: Date.now(),
+    eventTimeMs: 1000,
+    receiptTimeMs: 1000,
   });
-  assert(bad.ok === false, 'gap update should return false');
+  assert(bad.ok === true && bad.buffered === true, 'future update should enter reorder buffer');
+  const gap = applyDepthUpdate(ob, {
+    U: 14,
+    u: 14,
+    b: [],
+    a: [],
+    eventTimeMs: 2000,
+    receiptTimeMs: 2000,
+  });
+  assert(gap.ok === false && gap.gapDetected === true, 'expired reorder entry should trigger gap');
 }

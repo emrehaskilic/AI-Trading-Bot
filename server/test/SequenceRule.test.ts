@@ -30,10 +30,19 @@ export function runTests() {
     u: 25,
     b: [],
     a: [],
-    eventTimeMs: Date.now(),
-    receiptTimeMs: Date.now(),
+    eventTimeMs: 1000,
+    receiptTimeMs: 1000,
   });
-  assert(bad1.ok === false && bad1.gapDetected === true, 'update with U > lastUpdateId+1 should fail');
+  assert(bad1.ok === true && bad1.buffered === true, 'future update should be buffered');
+  const badGap = applyDepthUpdate(ob, {
+    U: 23,
+    u: 26,
+    b: [],
+    a: [],
+    eventTimeMs: 2000,
+    receiptTimeMs: 2000,
+  });
+  assert(badGap.ok === false && badGap.gapDetected === true, 'expired future update should trigger gap');
   // DROP case: u <= lastUpdateId
   ob.lastUpdateId = 30;
   const bad2 = applyDepthUpdate(ob, {

@@ -1,5 +1,5 @@
 /**
- * Orderbook management utilities with canonical Binance snapshot+delta sync.
+ * Orderbook management utilities with deterministic Binance snapshot+diff sync.
  */
 
 export interface DepthCache {
@@ -26,6 +26,11 @@ export interface BufferedDepthUpdate {
   receiptTimeMs: number;
 }
 
+interface ReorderBufferEntry {
+  update: BufferedDepthUpdate;
+  insertedAtMs: number;
+}
+
 export interface OrderbookState {
   lastUpdateId: number;
   bids: Map<number, number>;
@@ -34,14 +39,19 @@ export interface OrderbookState {
   uiState: OrderbookUiState;
   resyncPromise: Promise<void> | null;
   buffer: BufferedDepthUpdate[];
+  reorderBuffer: Map<string, ReorderBufferEntry>;
+  snapshotRequired: boolean;
   lastSeenU_u: string;
   stats: {
     applied: number;
     dropped: number;
     buffered: number;
     desyncs: number;
+    reordered: number;
   };
 }
+
+export type OrderbookStateMap = Map<string, OrderbookState>;
 
 export interface SnapshotApplyResult {
   ok: boolean;
@@ -58,7 +68,31 @@ export interface DepthApplyResult {
   gapDetected: boolean;
 }
 
+export interface ResetOrderbookOptions {
+  uiState?: OrderbookUiState;
+  keepStats?: boolean;
+  desync?: boolean;
+}
+
 const MAX_LEVELS_PER_SIDE = Math.max(200, Number(process.env.ORDERBOOK_MAX_LEVELS_PER_SIDE || 2000));
+const REORDER_BUFFER_MAX = Math.max(4, Number(process.env.ORDERBOOK_REORDER_BUFFER_MAX || 24));
+const REORDER_BUFFER_TTL_MS = Math.max(20, Number(process.env.ORDERBOOK_REORDER_BUFFER_TTL_MS || 150));
+
+type SequenceDecision = 'apply' | 'future' | 'stale' | 'gap';
+
+export function createOrderbookStateMap(): OrderbookStateMap {
+  return new Map<string, OrderbookState>();
+}
+
+export function getOrCreateOrderbookState(stateMap: OrderbookStateMap, symbol: string): OrderbookState {
+  const normalized = String(symbol || '').trim().toUpperCase();
+  let state = stateMap.get(normalized);
+  if (!state) {
+    state = createOrderbookState();
+    stateMap.set(normalized, state);
+  }
+  return state;
+}
 
 export function createOrderbookState(): OrderbookState {
   return {
@@ -69,93 +103,113 @@ export function createOrderbookState(): OrderbookState {
     uiState: 'INIT',
     resyncPromise: null,
     buffer: [],
+    reorderBuffer: new Map(),
+    snapshotRequired: true,
     lastSeenU_u: '',
-    stats: { applied: 0, dropped: 0, buffered: 0, desyncs: 0 },
+    stats: { applied: 0, dropped: 0, buffered: 0, desyncs: 0, reordered: 0 },
+  };
+}
+
+export function resetOrderbookState(state: OrderbookState, options: ResetOrderbookOptions = {}): void {
+  state.lastUpdateId = 0;
+  state.bids.clear();
+  state.asks.clear();
+  state.lastDepthTime = 0;
+  state.resyncPromise = null;
+  state.buffer = [];
+  state.reorderBuffer.clear();
+  state.snapshotRequired = true;
+  state.lastSeenU_u = '';
+  state.uiState = options.uiState || 'SNAPSHOT_PENDING';
+  if (options.keepStats) {
+    if (options.desync) {
+      state.stats.desyncs += 1;
+    }
+    return;
+  }
+  state.stats = {
+    applied: 0,
+    dropped: 0,
+    buffered: 0,
+    desyncs: options.desync ? 1 : 0,
+    reordered: 0,
   };
 }
 
 export function applySnapshot(state: OrderbookState, snapshot: DepthCache): SnapshotApplyResult {
+  const snapshotId = Math.trunc(Number(snapshot?.lastUpdateId || 0));
+  const result: SnapshotApplyResult = {
+    ok: snapshotId > 0,
+    appliedCount: 0,
+    droppedCount: 0,
+    gapDetected: snapshotId <= 0,
+  };
+  if (snapshotId <= 0) {
+    return result;
+  }
+
   state.bids.clear();
   state.asks.clear();
 
-  for (const [priceStr, qtyStr] of snapshot.bids) {
-    const qty = parseFloat(qtyStr);
-    if (qty > 0) {
-      state.bids.set(parseFloat(priceStr), qty);
+  for (const [priceStr, qtyStr] of snapshot.bids || []) {
+    const price = Number(priceStr);
+    const qty = Number(qtyStr);
+    if (Number.isFinite(price) && price > 0 && Number.isFinite(qty) && qty > 0) {
+      state.bids.set(price, qty);
     }
   }
 
-  for (const [priceStr, qtyStr] of snapshot.asks) {
-    const qty = parseFloat(qtyStr);
-    if (qty > 0) {
-      state.asks.set(parseFloat(priceStr), qty);
+  for (const [priceStr, qtyStr] of snapshot.asks || []) {
+    const price = Number(priceStr);
+    const qty = Number(qtyStr);
+    if (Number.isFinite(price) && price > 0 && Number.isFinite(qty) && qty > 0) {
+      state.asks.set(price, qty);
     }
   }
 
-  state.lastUpdateId = snapshot.lastUpdateId;
+  state.lastUpdateId = snapshotId;
   state.lastDepthTime = Date.now();
   state.uiState = 'APPLYING_SNAPSHOT';
-
-  const result: SnapshotApplyResult = {
-    ok: true,
-    appliedCount: 0,
-    droppedCount: 0,
-    gapDetected: false,
-  };
+  state.snapshotRequired = false;
+  state.reorderBuffer.clear();
 
   if (state.buffer.length === 0) {
     return result;
   }
 
   const sorted = state.buffer
-    .filter((u) => u.u > snapshot.lastUpdateId)
+    .filter((u) => u.u > snapshotId)
     .sort((a, b) => a.U - b.U || a.u - b.u);
-
   state.buffer = [];
 
-  let started = false;
   for (const update of sorted) {
-    if (!started) {
-      if (update.U <= snapshot.lastUpdateId + 1 && update.u >= snapshot.lastUpdateId + 1) {
-        const apply = applyDelta(state, update);
-        result.appliedCount += apply.applied ? 1 : 0;
-        result.droppedCount += apply.dropped ? 1 : 0;
-        started = true;
-        continue;
-      }
-      result.droppedCount += 1;
-      continue;
-    }
-
     const apply = applyDepthUpdate(state, update);
     result.appliedCount += apply.applied ? 1 : 0;
     result.droppedCount += apply.dropped ? 1 : 0;
-    if (apply.gapDetected) {
+    if (!apply.ok && apply.gapDetected) {
       result.ok = false;
       result.gapDetected = true;
       break;
     }
   }
 
-  if (!started && sorted.length > 0) {
-    result.ok = false;
-    result.gapDetected = true;
-  }
-
   return result;
 }
 
 export function applyDepthUpdate(state: OrderbookState, update: BufferedDepthUpdate): DepthApplyResult {
-  if (state.uiState !== 'LIVE' && state.uiState !== 'APPLYING_SNAPSHOT') {
-    state.buffer.push(update);
-    state.stats.buffered++;
-    return { ok: true, applied: false, dropped: false, buffered: true, gapDetected: false };
+  const now = Number.isFinite(update.receiptTimeMs) && update.receiptTimeMs > 0
+    ? update.receiptTimeMs
+    : Date.now();
+
+  if (!isValidDepthUpdate(update)) {
+    state.stats.dropped++;
+    return { ok: true, applied: false, dropped: true, buffered: false, gapDetected: false };
   }
 
-  if (state.lastUpdateId === 0) {
-    state.buffer.push(update);
-    state.stats.buffered++;
-    return { ok: true, applied: false, dropped: false, buffered: true, gapDetected: false };
+  // During mandatory snapshot phases, ignore live diffs to avoid stale merge.
+  if (state.snapshotRequired || state.lastUpdateId <= 0 || !canApplyDeltaInState(state.uiState)) {
+    state.stats.dropped++;
+    return { ok: true, applied: false, dropped: true, buffered: false, gapDetected: false };
   }
 
   if (update.u <= state.lastUpdateId) {
@@ -164,44 +218,183 @@ export function applyDepthUpdate(state: OrderbookState, update: BufferedDepthUpd
   }
 
   const expected = state.lastUpdateId + 1;
-  const hasPrevUpdatePointer = Number.isFinite(update.pu) && Number(update.pu) > 0;
-  if (hasPrevUpdatePointer) {
-    // Binance Futures continuity rule: each event should chain via pu.
-    // We still allow the first overlapping event after snapshot/bootstrap.
-    const chainsByPu = Number(update.pu) === state.lastUpdateId;
-    const overlapsExpected = update.U <= expected && update.u >= expected;
-    if (!chainsByPu && !overlapsExpected) {
-      state.stats.desyncs++;
-      return { ok: false, applied: false, dropped: false, buffered: false, gapDetected: true };
-    }
-  } else {
-    // Legacy/spot-compatible sequence checks.
-    if (update.U > expected) {
-      state.stats.desyncs++;
-      return { ok: false, applied: false, dropped: false, buffered: false, gapDetected: true };
-    }
+  if (evictExpiredReorderEntries(state, now, expected)) {
+    state.stats.desyncs++;
+    return { ok: false, applied: false, dropped: false, buffered: false, gapDetected: true };
+  }
 
-    if (update.u < expected) {
-      state.stats.dropped++;
-      return { ok: true, applied: false, dropped: true, buffered: false, gapDetected: false };
+  const decision = classifyUpdate(state, update, expected);
+  if (decision === 'stale') {
+    state.stats.dropped++;
+    return { ok: true, applied: false, dropped: true, buffered: false, gapDetected: false };
+  }
+  if (decision === 'gap') {
+    state.stats.desyncs++;
+    return { ok: false, applied: false, dropped: false, buffered: false, gapDetected: true };
+  }
+  if (decision === 'future') {
+    const buffered = bufferFutureUpdate(state, update, now, expected);
+    if (!buffered) {
+      state.stats.desyncs++;
+      return { ok: false, applied: false, dropped: false, buffered: false, gapDetected: true };
     }
+    return { ok: true, applied: false, dropped: false, buffered: true, gapDetected: false };
   }
 
   const apply = applyDelta(state, update);
-  return { ok: true, applied: apply.applied, dropped: apply.dropped, buffered: false, gapDetected: false };
+  const drain = drainReorderBuffer(state, now);
+  if (drain.gapDetected) {
+    state.stats.desyncs++;
+    return { ok: false, applied: apply.applied, dropped: false, buffered: false, gapDetected: true };
+  }
+  return { ok: true, applied: apply.applied, dropped: false, buffered: false, gapDetected: false };
+}
+
+function canApplyDeltaInState(uiState: OrderbookUiState): boolean {
+  return uiState === 'LIVE' || uiState === 'APPLYING_SNAPSHOT';
+}
+
+function isValidDepthUpdate(update: BufferedDepthUpdate): boolean {
+  const U = Math.trunc(Number(update.U));
+  const u = Math.trunc(Number(update.u));
+  if (!(Number.isFinite(U) && Number.isFinite(u) && U > 0 && u > 0)) {
+    return false;
+  }
+  if (U > u) {
+    return false;
+  }
+  return Array.isArray(update.b) && Array.isArray(update.a);
+}
+
+function classifyUpdate(state: OrderbookState, update: BufferedDepthUpdate, expected: number): SequenceDecision {
+  if (update.u <= state.lastUpdateId) {
+    return 'stale';
+  }
+
+  const spansExpected = update.U <= expected && update.u >= expected;
+  const hasPrevUpdatePointer = Number.isFinite(update.pu) && Number(update.pu) > 0;
+  if (hasPrevUpdatePointer) {
+    const pu = Number(update.pu);
+    if (pu < state.lastUpdateId) {
+      return 'stale';
+    }
+    if (pu > state.lastUpdateId) {
+      return 'future';
+    }
+    if (spansExpected) {
+      return 'apply';
+    }
+    return update.U > expected ? 'future' : 'gap';
+  }
+
+  if (spansExpected) {
+    return 'apply';
+  }
+  if (update.U > expected) {
+    return 'future';
+  }
+  return 'stale';
+}
+
+function reorderKey(update: BufferedDepthUpdate): string {
+  return `${Math.trunc(update.U)}:${Math.trunc(update.u)}:${Math.trunc(Number(update.pu || 0))}`;
+}
+
+function bufferFutureUpdate(
+  state: OrderbookState,
+  update: BufferedDepthUpdate,
+  now: number,
+  expected: number
+): boolean {
+  if (evictExpiredReorderEntries(state, now, expected)) {
+    return false;
+  }
+  const key = reorderKey(update);
+  if (state.reorderBuffer.has(key)) {
+    state.stats.dropped++;
+    return true;
+  }
+  if (state.reorderBuffer.size >= REORDER_BUFFER_MAX) {
+    return false;
+  }
+  state.reorderBuffer.set(key, { update, insertedAtMs: now });
+  state.stats.buffered++;
+  return true;
+}
+
+function evictExpiredReorderEntries(state: OrderbookState, now: number, expected: number): boolean {
+  let expiredRelevant = false;
+  for (const [key, entry] of state.reorderBuffer.entries()) {
+    if (now - entry.insertedAtMs <= REORDER_BUFFER_TTL_MS) {
+      continue;
+    }
+    if (entry.update.u >= expected) {
+      expiredRelevant = true;
+    }
+    state.reorderBuffer.delete(key);
+  }
+  return expiredRelevant;
+}
+
+function selectNextBuffered(
+  state: OrderbookState,
+  expected: number
+): { key: string; entry: ReorderBufferEntry } | null {
+  const sorted = Array.from(state.reorderBuffer.entries())
+    .sort((a, b) => a[1].update.U - b[1].update.U || a[1].update.u - b[1].update.u);
+
+  for (const [key, entry] of sorted) {
+    const decision = classifyUpdate(state, entry.update, expected);
+    if (decision === 'stale') {
+      state.reorderBuffer.delete(key);
+      state.stats.dropped++;
+      continue;
+    }
+    if (decision === 'apply') {
+      return { key, entry };
+    }
+  }
+  return null;
+}
+
+function drainReorderBuffer(state: OrderbookState, now: number): { appliedCount: number; gapDetected: boolean } {
+  let appliedCount = 0;
+  while (state.reorderBuffer.size > 0) {
+    const expected = state.lastUpdateId + 1;
+    if (evictExpiredReorderEntries(state, now, expected)) {
+      return { appliedCount, gapDetected: true };
+    }
+    const next = selectNextBuffered(state, expected);
+    if (!next) {
+      break;
+    }
+    state.reorderBuffer.delete(next.key);
+    const apply = applyDelta(state, next.entry.update);
+    if (apply.applied) {
+      appliedCount += 1;
+      state.stats.reordered += 1;
+    }
+  }
+  return { appliedCount, gapDetected: false };
 }
 
 function applyDelta(state: OrderbookState, update: BufferedDepthUpdate): { applied: boolean; dropped: boolean } {
   for (const [p, q] of update.b) {
-    const price = parseFloat(p);
-    const qty = parseFloat(q);
+    const price = Number(p);
+    const qty = Number(q);
+    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(qty) || qty < 0) {
+      continue;
+    }
     if (qty === 0) state.bids.delete(price);
     else state.bids.set(price, qty);
   }
 
   for (const [p, q] of update.a) {
-    const price = parseFloat(p);
-    const qty = parseFloat(q);
+    const price = Number(p);
+    const qty = Number(q);
+    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(qty) || qty < 0) {
+      continue;
+    }
     if (qty === 0) state.asks.delete(price);
     else state.asks.set(price, qty);
   }
@@ -210,8 +403,9 @@ function applyDelta(state: OrderbookState, update: BufferedDepthUpdate): { appli
   pruneLevels(state.bids, false);
   pruneLevels(state.asks, true);
 
-  state.lastUpdateId = update.u;
+  state.lastUpdateId = Math.trunc(update.u);
   state.lastDepthTime = update.receiptTimeMs || Date.now();
+  state.lastSeenU_u = `${Math.trunc(update.U)}-${Math.trunc(update.u)}`;
   state.stats.applied++;
   return { applied: true, dropped: false };
 }
