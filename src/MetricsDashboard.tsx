@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import { getViewerToken, proxyWebSocketProtocols } from './services/proxyAuth';
 
 // Type definitions matching the telemetry contract
@@ -80,23 +80,36 @@ interface SymbolCardProps {
   showLatency: boolean;
 }
 
+const TIMEFRAMES: Array<keyof CvdMessage> = ['tf1m', 'tf5m', 'tf15m'];
+
+const areMetricsEqual = (prev: SymbolCardProps, next: SymbolCardProps): boolean =>
+  prev.metrics === next.metrics && prev.showLatency === next.showLatency;
+
 /**
  * A card component that renders all telemetry metrics for a single symbol. It
  * displays time & sales information, multi‑timeframe CVD and delta,
  * absorption status, open interest and funding context and the current
  * connection state. Colours and layout follow the dark “orderflow” aesthetic.
  */
-const SymbolCard: React.FC<SymbolCardProps> = ({ metrics, showLatency }) => {
+const SymbolCard: React.FC<SymbolCardProps> = memo(({ metrics, showLatency }) => {
   const { symbol, state, timeAndSales, cvd, openInterest, funding, absorption, legacyMetrics } = metrics;
-  const buy = timeAndSales.aggressiveBuyVolume;
-  const sell = timeAndSales.aggressiveSellVolume;
-  const totalTrade = buy + sell;
-  const buyPct = totalTrade > 0 ? (buy / totalTrade) * 100 : 0;
-  const sellPct = totalTrade > 0 ? (sell / totalTrade) * 100 : 0;
   const totalCount = timeAndSales.tradeCount || 1;
-  const smallPct = (timeAndSales.smallTrades / totalCount) * 100;
-  const midPct = (timeAndSales.midTrades / totalCount) * 100;
-  const largePct = (timeAndSales.largeTrades / totalCount) * 100;
+  const tradeValues = useMemo(() => {
+    const buy = timeAndSales.aggressiveBuyVolume;
+    const sell = timeAndSales.aggressiveSellVolume;
+    const totalTrade = buy + sell;
+    return {
+      buy,
+      sell,
+      buyPct: totalTrade > 0 ? (buy / totalTrade) * 100 : 0,
+      sellPct: totalTrade > 0 ? (sell / totalTrade) * 100 : 0,
+    };
+  }, [timeAndSales.aggressiveBuyVolume, timeAndSales.aggressiveSellVolume]);
+  const sizePercentages = useMemo(() => ({
+    smallPct: (timeAndSales.smallTrades / totalCount) * 100,
+    midPct: (timeAndSales.midTrades / totalCount) * 100,
+    largePct: (timeAndSales.largeTrades / totalCount) * 100,
+  }), [timeAndSales.smallTrades, timeAndSales.midTrades, timeAndSales.largeTrades, totalCount]);
   // Map states to tailwind colour classes
   const stateColours: Record<string, string> = {
     LIVE: 'bg-green-900/40 text-green-400',
@@ -129,12 +142,12 @@ const SymbolCard: React.FC<SymbolCardProps> = ({ metrics, showLatency }) => {
       {/* Aggressive buy/sell bar */}
       <div>
         <div className="flex justify-between text-xs text-zinc-500 mb-1">
-          <span>Agg Buy: {formatNumber(buy, 2)}</span>
-          <span>Agg Sell: {formatNumber(sell, 2)}</span>
+          <span>Agg Buy: {formatNumber(tradeValues.buy, 2)}</span>
+          <span>Agg Sell: {formatNumber(tradeValues.sell, 2)}</span>
         </div>
         <div className="flex h-2 w-full overflow-hidden rounded bg-zinc-800">
-          <div style={{ width: `${buyPct}%` }} className="bg-green-500"></div>
-          <div style={{ width: `${sellPct}%` }} className="bg-red-500"></div>
+          <div style={{ width: `${tradeValues.buyPct}%` }} className="bg-green-500"></div>
+          <div style={{ width: `${tradeValues.sellPct}%` }} className="bg-red-500"></div>
         </div>
       </div>
 
@@ -146,7 +159,7 @@ const SymbolCard: React.FC<SymbolCardProps> = ({ metrics, showLatency }) => {
           <span>{timeAndSales.smallTrades}</span>
         </div>
         <div className="flex h-1 w-full overflow-hidden rounded bg-zinc-800">
-          <div style={{ width: `${smallPct}%` }} className="bg-blue-500"></div>
+          <div style={{ width: `${sizePercentages.smallPct}%` }} className="bg-blue-500"></div>
         </div>
         {/* Mid trades */}
         <div className="flex justify-between text-xs text-zinc-500">
@@ -154,7 +167,7 @@ const SymbolCard: React.FC<SymbolCardProps> = ({ metrics, showLatency }) => {
           <span>{timeAndSales.midTrades}</span>
         </div>
         <div className="flex h-1 w-full overflow-hidden rounded bg-zinc-800">
-          <div style={{ width: `${midPct}%` }} className="bg-purple-500"></div>
+          <div style={{ width: `${sizePercentages.midPct}%` }} className="bg-purple-500"></div>
         </div>
         {/* Large trades */}
         <div className="flex justify-between text-xs text-zinc-500">
@@ -162,7 +175,7 @@ const SymbolCard: React.FC<SymbolCardProps> = ({ metrics, showLatency }) => {
           <span>{timeAndSales.largeTrades}</span>
         </div>
         <div className="flex h-1 w-full overflow-hidden rounded bg-zinc-800">
-          <div style={{ width: `${largePct}%` }} className="bg-orange-500"></div>
+          <div style={{ width: `${sizePercentages.largePct}%` }} className="bg-orange-500"></div>
         </div>
       </div>
 
@@ -193,7 +206,8 @@ const SymbolCard: React.FC<SymbolCardProps> = ({ metrics, showLatency }) => {
 
       {/* CVD multi‑timeframe section */}
       <div className="grid grid-cols-3 gap-2 mt-2 text-xs">
-        {Object.entries(cvd).map(([tf, obj]) => {
+        {TIMEFRAMES.map((tf) => {
+          const obj = cvd[tf];
           const deltaClass = obj.delta > 0 ? 'text-green-400' : obj.delta < 0 ? 'text-red-400' : 'text-zinc-300';
           return (
             <div key={tf} className="bg-zinc-800/50 p-2 rounded">
@@ -342,7 +356,7 @@ const SymbolCard: React.FC<SymbolCardProps> = ({ metrics, showLatency }) => {
       )}
     </div>
   );
-};
+}, areMetricsEqual);
 
 /**
  * Top‑level dashboard component. It connects to the WebSocket telemetry
@@ -354,6 +368,9 @@ const MetricsDashboard: React.FC = () => {
   const [metricsMap, setMetricsMap] = useState<Record<string, MetricsMessage>>({});
   const [wsStatus, setWsStatus] = useState<'connecting' | 'open' | 'closed'>('connecting');
   const [showLatency, setShowLatency] = useState<boolean>(false);
+  const handleToggleLatency = useCallback(() => {
+    setShowLatency(prev => !prev);
+  }, []);
   useEffect(() => {
     const proxyWs = (import.meta as any).env?.VITE_PROXY_WS || 'ws://localhost:8787';
     const defaultSymbols = ['BTCUSDT', 'ETHUSDT'];
@@ -392,7 +409,7 @@ const MetricsDashboard: React.FC = () => {
             <input
               type="checkbox"
               checked={showLatency}
-              onChange={e => setShowLatency(e.target.checked)}
+              onChange={handleToggleLatency}
               className="accent-blue-600"
             />
             <span>Show Latency</span>
