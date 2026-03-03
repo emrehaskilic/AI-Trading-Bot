@@ -80,6 +80,15 @@ import { HtfStructureMonitor } from './metrics/HtfStructureMonitor';
 import { OrchestratorV1 } from './orchestrator_v1/OrchestratorV1';
 import { OrchestratorV1Decision, OrchestratorV1Order, OrchestratorV1Side } from './orchestrator_v1/types';
 import { AnalyticsEngine } from './analytics';
+import {
+    ExampleChopFilterStrategy,
+    ExampleMeanRevertStrategy,
+    ExampleTrendFollowStrategy,
+    SignalSide as StrategySignalSide,
+    StrategyContextBuilder,
+    StrategyRegistry,
+} from './strategies';
+import { ConsensusEngine } from './consensus/ConsensusEngine';
 
 // =============================================================================
 // Configuration
@@ -397,6 +406,24 @@ const analyticsLastErrorByKind = new Map<string, number>();
 const orchestrator = createOrchestratorFromEnv(alertService);
 const dryRunSession = new DryRunSessionService(alertService);
 const orchestratorV1 = new OrchestratorV1();
+const strategyFrameworkEnabled = process.env.STRATEGY_FRAMEWORK_ENABLED == null
+    ? true
+    : parseEnvFlag(process.env.STRATEGY_FRAMEWORK_ENABLED);
+const strategyContextBuilder = new StrategyContextBuilder();
+const strategyRegistry = new StrategyRegistry();
+strategyRegistry.register(new ExampleTrendFollowStrategy());
+strategyRegistry.register(new ExampleMeanRevertStrategy());
+strategyRegistry.register(new ExampleChopFilterStrategy());
+const consensusEngine = new ConsensusEngine();
+const strategyConsensusBySymbol = new Map<string, {
+    timestampMs: number;
+    side: 'LONG' | 'SHORT' | 'FLAT';
+    confidence: number;
+    quorumMet: boolean;
+    riskGatePassed: boolean;
+    contributingStrategies: number;
+    totalStrategies: number;
+}>();
 const abTestManager = new ABTestManager(alertService);
 const marketArchive = new MarketDataArchive();
 const signalReplay = new SignalReplay(marketArchive);
@@ -2585,11 +2612,12 @@ function broadcastMetrics(
             ? buildDrpSnapshot('BTCUSDT')
             : null;
 
-    let resolvedOrchestratorDecision = defaultOrchestratorDecision(s, Number(eventTimeMs || now));
+    const canonicalTimeMs = Number(eventTimeMs || now);
+    let resolvedOrchestratorDecision = defaultOrchestratorDecision(s, canonicalTimeMs);
     try {
         resolvedOrchestratorDecision = orchestratorV1.evaluate({
             symbol: s,
-            nowMs: Number(eventTimeMs || now),
+            nowMs: canonicalTimeMs,
             price: Number(mid || legacyForUse?.price || 0),
             bestBid: bestBidPx,
             bestAsk: bestAskPx,
@@ -2626,7 +2654,7 @@ function broadcastMetrics(
             btcDryRunPosition,
         });
     } catch (e: any) {
-        const nowMs = Date.now();
+        const nowMs = now;
         const lastErrTs = orchestratorEvalErrorTs.get(s) || 0;
         if (nowMs - lastErrTs > 5000) {
             log('ORCHESTRATOR_V1_EVAL_ERROR', {
@@ -2636,9 +2664,158 @@ function broadcastMetrics(
             orchestratorEvalErrorTs.set(s, nowMs);
         }
     }
-    const orchestratorDebug = updateOrchestratorDiagnostics(s, resolvedOrchestratorDecision, Number(eventTimeMs || now));
+    const riskSummary = syncRiskEngineRuntime(s, canonicalTimeMs, mid);
+    const resolvedRiskState = RISK_ENGINE_ENABLED
+        ? (riskSummary?.state ?? institutionalRiskEngine.getRiskState())
+        : RiskState.TRACKING;
+    let strategySignals: ReturnType<StrategyRegistry['evaluateAll']> = [];
+    let consensusDecision: ReturnType<ConsensusEngine['evaluate']> | null = null;
+
+    if (strategyFrameworkEnabled) {
+        try {
+            const deltaZForStrategy = Number(legacyForUse?.deltaZ ?? tf1m?.delta ?? 0);
+            const cvdSlopeForStrategy = Number(legacyForUse?.cvdSlope ?? tf5m?.delta ?? 0);
+            const trendinessScore = Math.max(0, Math.min(1, Number(advancedBundle.regimeMetrics?.trendinessScore || 0)));
+            const trendDirection = cvdSlopeForStrategy > 0
+                ? 1
+                : cvdSlopeForStrategy < 0
+                    ? -1
+                    : deltaZForStrategy > 0
+                        ? 1
+                        : deltaZForStrategy < 0
+                            ? -1
+                            : 0;
+            const m3TrendScore = Math.max(-1, Math.min(1, Math.tanh(deltaZForStrategy / 3)));
+            const m5TrendScore = Math.max(-1, Math.min(1, trendDirection * trendinessScore));
+            const strategyContext = strategyContextBuilder.build({
+                symbol: s,
+                timestamp: canonicalTimeMs,
+                price: Number(mid || legacyForUse?.price || 0),
+                m3TrendScore,
+                m5TrendScore,
+                obiDeep: Number(legacyForUse?.obiDeep || 0),
+                deltaZ: deltaZForStrategy,
+                volatilityIndex: Number(advancedBundle.regimeMetrics?.realizedVol1m || advancedBundle.regimeMetrics?.volOfVol || 0),
+                spreadPct,
+                printsPerSecond: Number(tasMetrics?.printsPerSecond || 0),
+                position: rawStrategyPosition
+                    ? {
+                        side: (rawStrategyPosition.side === 'LONG' || rawStrategyPosition.side === 'SHORT')
+                            ? rawStrategyPosition.side
+                            : null,
+                        qty: Number(rawStrategyPosition.qty || 0),
+                        entryPrice: Number(rawStrategyPosition.entryPrice || 0) > 0
+                            ? Number(rawStrategyPosition.entryPrice || 0)
+                            : null,
+                        unrealizedPnl: Number(
+                            (rawStrategyPosition as any).unrealizedPnl
+                            ?? (rawStrategyPosition as any).unrealizedPnlPct
+                            ?? 0
+                        ),
+                    }
+                    : null,
+            }, resolvedRiskState, canonicalTimeMs);
+
+            strategySignals = strategyRegistry.evaluateAll(strategyContext);
+            consensusDecision = consensusEngine.evaluate(strategySignals, resolvedRiskState, canonicalTimeMs);
+            strategyConsensusBySymbol.set(s, {
+                timestampMs: canonicalTimeMs,
+                side: consensusDecision.side,
+                confidence: Number(consensusDecision.confidence || 0),
+                quorumMet: Boolean(consensusDecision.quorumMet),
+                riskGatePassed: Boolean(consensusDecision.riskGatePassed),
+                contributingStrategies: Number(consensusDecision.contributingStrategies || 0),
+                totalStrategies: Number(consensusDecision.totalStrategies || 0),
+            });
+
+            const hardStop = resolvedRiskState === RiskState.HALTED || resolvedRiskState === RiskState.KILL_SWITCH;
+            if (hardStop) {
+                if (resolvedOrchestratorDecision.intent !== 'HOLD' || resolvedOrchestratorDecision.orders.length > 0) {
+                    log('STRATEGY_CONSENSUS_HARD_STOP', {
+                        symbol: s,
+                        riskState: resolvedRiskState,
+                        previousIntent: resolvedOrchestratorDecision.intent,
+                        previousSide: resolvedOrchestratorDecision.side,
+                    });
+                }
+                resolvedOrchestratorDecision = {
+                    ...resolvedOrchestratorDecision,
+                    intent: 'HOLD',
+                    side: null,
+                    allGatesPassed: false,
+                    orders: [],
+                    readiness: {
+                        ready: false,
+                        reasons: [`RISK_${resolvedRiskState}_NO_TRADE`],
+                    },
+                };
+            } else {
+                const preTradeIntent = resolvedOrchestratorDecision.intent === 'ENTRY'
+                    || resolvedOrchestratorDecision.intent === 'ADD';
+                if (preTradeIntent) {
+                    const consensusAllowsTrade = consensusEngine.shouldTrade(consensusDecision);
+                    const consensusSide = consensusDecision.side === StrategySignalSide.LONG
+                        ? 'BUY'
+                        : consensusDecision.side === StrategySignalSide.SHORT
+                            ? 'SELL'
+                            : null;
+                    if (!consensusAllowsTrade) {
+                        log('STRATEGY_CONSENSUS_REJECTED', {
+                            symbol: s,
+                            reason: 'consensus_not_ready',
+                            intent: resolvedOrchestratorDecision.intent,
+                            orchestratorSide: resolvedOrchestratorDecision.side,
+                            consensusSide: consensusDecision.side,
+                            confidence: consensusDecision.confidence,
+                            quorumMet: consensusDecision.quorumMet,
+                            riskGatePassed: consensusDecision.riskGatePassed,
+                        });
+                        resolvedOrchestratorDecision = {
+                            ...resolvedOrchestratorDecision,
+                            intent: 'HOLD',
+                            side: null,
+                            allGatesPassed: false,
+                            orders: [],
+                            readiness: {
+                                ready: false,
+                                reasons: ['CONSENSUS_NOT_READY'],
+                            },
+                        };
+                    } else if (!consensusSide || resolvedOrchestratorDecision.side !== consensusSide) {
+                        log('STRATEGY_CONSENSUS_REJECTED', {
+                            symbol: s,
+                            reason: 'side_mismatch',
+                            intent: resolvedOrchestratorDecision.intent,
+                            orchestratorSide: resolvedOrchestratorDecision.side,
+                            consensusSide: consensusDecision.side,
+                            confidence: consensusDecision.confidence,
+                        });
+                        resolvedOrchestratorDecision = {
+                            ...resolvedOrchestratorDecision,
+                            intent: 'HOLD',
+                            side: null,
+                            allGatesPassed: false,
+                            orders: [],
+                            readiness: {
+                                ready: false,
+                                reasons: ['CONSENSUS_SIDE_MISMATCH'],
+                            },
+                        };
+                    }
+                }
+            }
+        } catch (error) {
+            log('STRATEGY_CONSENSUS_EVAL_ERROR', {
+                symbol: s,
+                error: (error as Error)?.message || 'strategy_consensus_eval_failed',
+            });
+        }
+    } else {
+        strategyConsensusBySymbol.delete(s);
+    }
+
+    const orchestratorDebug = updateOrchestratorDiagnostics(s, resolvedOrchestratorDecision, canonicalTimeMs);
     const decisionView = buildDecisionViewFromOrchestrator(resolvedOrchestratorDecision);
-    const riskSummary = syncRiskEngineRuntime(s, Number(eventTimeMs || now), mid);
     const strategyPosition = decisionView.suppressDryRunPosition && rawPositionSource === 'dryrun'
         ? null
         : rawStrategyPosition;
@@ -2703,6 +2880,27 @@ function broadcastMetrics(
             telemetry: resolvedOrchestratorDecision.telemetry,
             debug: orchestratorDebug,
         },
+        strategyConsensus: strategyFrameworkEnabled
+            ? {
+                timestampMs: consensusDecision?.timestamp ?? canonicalTimeMs,
+                side: consensusDecision?.side ?? StrategySignalSide.FLAT,
+                confidence: Number(consensusDecision?.confidence || 0),
+                quorumMet: Boolean(consensusDecision?.quorumMet),
+                riskGatePassed: Boolean(consensusDecision?.riskGatePassed),
+                contributingStrategies: Number(consensusDecision?.contributingStrategies || 0),
+                totalStrategies: Number(consensusDecision?.totalStrategies || strategyRegistry.size()),
+                vetoApplied: Boolean(consensusDecision?.vetoApplied),
+                shouldTrade: consensusDecision ? consensusEngine.shouldTrade(consensusDecision) : false,
+                signals: strategySignals.map((signal) => ({
+                    strategyId: signal.strategyId,
+                    strategyName: signal.strategyName,
+                    side: signal.side,
+                    confidence: signal.confidence,
+                    timestamp: signal.timestamp,
+                    validityDurationMs: signal.validityDurationMs,
+                })),
+            }
+            : null,
         advancedMetrics: {
             sweepFadeScore: decision?.dfsPercentile || 0,
             breakoutScore: decision?.dfsPercentile || 0,
