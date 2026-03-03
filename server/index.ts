@@ -252,8 +252,34 @@ interface SymbolMeta {
     lastLegacyMetrics: any | null;
 }
 
+// [P0-FIX-24] Symbol-level state isolation - Map<string, State> yapısı
 const symbolMeta = new Map<string, SymbolMeta>();
 const orderbookMap = createOrderbookStateMap();
+
+// [P0-FIX-25] Per-symbol processing locks
+const processingSymbols = new Set<string>();
+const snapshotInProgress = new Map<string, boolean>();
+
+// [P0-FIX-26] Symbol state validation helper
+function validateSymbolState(symbol: string): boolean {
+    const normalizedSymbol = String(symbol || '').trim().toUpperCase();
+    if (!normalizedSymbol) return false;
+
+    const meta = symbolMeta.get(normalizedSymbol);
+    if (!meta) return false;
+
+    // Check for cross-symbol contamination
+    for (const [key, value] of symbolMeta.entries()) {
+        if (key !== normalizedSymbol) {
+            // Ensure no shared references
+            if (value.depthQueue === meta.depthQueue) {
+                log('SYMBOL_STATE_CONTAMINATION', { symbol: normalizedSymbol, other: key, type: 'depthQueue' });
+                return false;
+            }
+        }
+    }
+    return true;
+}
 const orchestratorEvalErrorTs = new Map<string, number>();
 
 // Metrics
@@ -528,8 +554,15 @@ function updateOrchestratorDiagnostics(symbol: string, decision: OrchestratorV1D
 // Helpers
 // =============================================================================
 
+// [P0-FIX-23] Symbol-level state isolation - her symbol için bağımsız state
 function getMeta(symbol: string): SymbolMeta {
-    let meta = symbolMeta.get(symbol);
+    // Normalize symbol to ensure consistent lookup
+    const normalizedSymbol = String(symbol || '').trim().toUpperCase();
+    if (!normalizedSymbol) {
+        throw new Error('getMeta: empty symbol');
+    }
+
+    let meta = symbolMeta.get(normalizedSymbol);
     if (!meta) {
         meta = {
             lastSnapshotAttempt: 0,
@@ -541,13 +574,12 @@ function getMeta(symbol: string): SymbolMeta {
             lastResyncTrigger: 'none',
             depthMsgCount: 0,
             depthMsgCount10s: 0,
-            lastDepthMsgTs: Date.now(), // Avoid immediate stale check
+            lastDepthMsgTs: Date.now(),
             tradeMsgCount: 0,
             desyncCount: 0,
             snapshotCount: 0,
             lastSnapshotHttpStatus: 0,
             snapshotLastUpdateId: 0,
-            // Broadcast tracking
             lastBroadcastTs: 0,
             metricsBroadcastCount10s: 0,
             metricsBroadcastDepthCount10s: 0,
@@ -565,17 +597,16 @@ function getMeta(symbol: string): SymbolMeta {
             snapshotOkEvents: [],
             snapshotSkipEvents: [],
             liveSamples: [],
-            // [PHASE 1] Deterministic Queue
-            eventQueue: new SymbolEventQueue(symbol, async (ev) => {
-                await processSymbolEvent(symbol, ev);
+            eventQueue: new SymbolEventQueue(normalizedSymbol, async (ev) => {
+                await processSymbolEvent(normalizedSymbol, ev);
             }),
-            // [PHASE 1] Snapshot tracker
             snapshotTracker: new SnapshotTracker(),
             lastStrategyEvalTs: 0,
             lastStrategyDecision: null,
             lastLegacyMetrics: null,
         };
-        symbolMeta.set(symbol, meta);
+        symbolMeta.set(normalizedSymbol, meta);
+        log('META_CREATED', { symbol: normalizedSymbol });
     }
     return meta;
 }
@@ -681,26 +712,57 @@ function transitionOrderbookState(symbol: string, to: OrderbookState['uiState'],
 function requestOrderbookResync(symbol: string, trigger: string, detail: any = {}): void {
     const now = Date.now();
     const meta = getMeta(symbol);
-    if (meta.isResyncing) {
+
+    // [P0-FIX-17] Throttle resync attempts
+    const timeSinceResync = now - meta.lastResyncTs;
+    if (timeSinceResync < MIN_RESYNC_INTERVAL_MS) {
+        log('RESYNC_THROTTLED', { symbol, trigger, timeSinceResync, minInterval: MIN_RESYNC_INTERVAL_MS });
         return;
     }
 
+    if (meta.isResyncing) {
+        log('RESYNC_ALREADY_IN_PROGRESS', { symbol, trigger });
+        return;
+    }
+
+    // [P0-FIX-18] Set resync flag BEFORE any async operations
     meta.isResyncing = true;
+    snapshotInProgress.set(symbol, true);
+
     meta.lastResyncTs = now;
     meta.lastResyncTrigger = trigger;
-    meta.depthQueue = [];
     meta.goodSequenceStreak = 0;
     meta.desyncCount += 1;
     meta.desyncEvents.push(now);
 
+    // [P0-FIX-19] Clear processing lock
+    meta.isProcessingDepthQueue = false;
+    processingSymbols.delete(symbol);
+
     const ob = getOrderbook(symbol);
+
+    // [P0-FIX-20] Queue'yu temizle - eski diff'ler ile devam ETME
+    const queueSizeBefore = meta.depthQueue.length;
+    meta.depthQueue = [];
+
+    // [P0-FIX-21] Orderbook state reset
     resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true, desync: true });
     getIntegrity(symbol).markResyncStart(now);
 
+    log('RESYNC_STARTED', { symbol, trigger, queueCleared: queueSizeBefore, detail });
     transitionOrderbookState(symbol, 'RESYNCING', trigger, detail);
-    fetchSnapshot(symbol, trigger, true).catch((e) => {
-        log('RESYNC_FETCH_ERROR', { symbol, trigger, error: e?.message || 'resync_fetch_failed' });
-    });
+
+    // [P0-FIX-22] Always force snapshot on resync
+    fetchSnapshot(symbol, trigger, true)
+        .then(() => {
+            log('RESYNC_COMPLETED', { symbol, trigger });
+        })
+        .catch((e) => {
+            log('RESYNC_FETCH_ERROR', { symbol, trigger, error: e?.message || 'resync_fetch_failed' });
+            // Reset flags on error
+            meta.isResyncing = false;
+            snapshotInProgress.set(symbol, false);
+        });
 }
 
 // Lazy Metric Getters
@@ -803,14 +865,22 @@ async function fetchExchangeInfo() {
     }
 }
 
+// [P0-FIX-4] Snapshot processing pause flag per symbol
+// (declared once in global state section)
+
 async function fetchSnapshot(symbol: string, trigger: string, force = false) {
     const meta = getMeta(symbol);
     const ob = getOrderbook(symbol);
     const now = Date.now();
 
+    // [P0-FIX-5] Mark snapshot in progress to pause diff processing
+    snapshotInProgress.set(symbol, true);
+    meta.isResyncing = true;
+
     if (now < globalBackoffUntil) {
         log('SNAPSHOT_SKIP_GLOBAL', { symbol, wait: globalBackoffUntil - now });
         meta.isResyncing = false;
+        snapshotInProgress.set(symbol, false);
         return;
     }
 
@@ -822,11 +892,18 @@ async function fetchSnapshot(symbol: string, trigger: string, force = false) {
     }
 
     if (force) {
-        // Force mode always starts from a clean baseline to avoid stale merge.
-        resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true });
+        // [P0-FIX-6] Force mode: Complete cleanup before snapshot fetch
+        // Clear all pending diffs to prevent stale merge
         meta.depthQueue = [];
+        meta.isProcessingDepthQueue = false;
+        processingSymbols.delete(symbol);
         meta.goodSequenceStreak = 0;
+
+        // Reset orderbook to clean state
+        resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true, desync: true });
         getIntegrity(symbol).markResyncStart(now);
+
+        log('SNAPSHOT_FORCE_CLEANUP', { symbol, trigger, queueCleared: true });
     }
 
     meta.lastSnapshotAttempt = now;
@@ -885,17 +962,35 @@ async function fetchSnapshot(symbol: string, trigger: string, force = false) {
             gapDetected: snapshotResult.gapDetected
         });
 
+        // [P0-FIX-7] Snapshot sonrası queue validation
         if (snapshotResult.ok) {
             getIntegrity(symbol).resetAfterSnapshot(now);
-            // Directly transition to LIVE as per c4c8a70 logic
+
+            // [P0-FIX-8] Validate queue'daki diff'ler snapshot ile uyumlu mu?
+            const lastUpdateId = ob.lastUpdateId;
+            const validQueueItems = meta.depthQueue.filter(u => u.u > lastUpdateId);
+            const staleQueueItems = meta.depthQueue.length - validQueueItems.length;
+
+            if (staleQueueItems > 0) {
+                log('SNAPSHOT_QUEUE_CLEANUP', { symbol, staleItems: staleQueueItems, lastUpdateId });
+                meta.depthQueue = validQueueItems;
+            }
+
+            // Release snapshot lock
+            snapshotInProgress.set(symbol, false);
+            meta.isResyncing = false;
+
             transitionOrderbookState(symbol, 'LIVE', 'snapshot_applied_success');
-            log('SNAPSHOT_OK', { symbol, trigger, lastUpdateId: data.lastUpdateId });
-            // Ensure live sample is recorded immediately
+            log('SNAPSHOT_OK', { symbol, trigger, lastUpdateId: data.lastUpdateId, queueValid: validQueueItems.length });
             recordLiveSample(symbol, true);
         } else {
-            // Only go to RESYNCING if buffer gap detected
+            // [P0-FIX-9] Buffer gap detected - clear queue and force resync
+            meta.depthQueue = [];
+            snapshotInProgress.set(symbol, false);
+            meta.isResyncing = false;
+
             transitionOrderbookState(symbol, 'RESYNCING', 'snapshot_buffer_gap_detected');
-            log('SNAPSHOT_BUFFER_GAP', { symbol, trigger, lastUpdateId: data.lastUpdateId });
+            log('SNAPSHOT_BUFFER_GAP', { symbol, trigger, lastUpdateId: data.lastUpdateId, queueCleared: true });
         }
 
     } catch (e: any) {
@@ -1014,11 +1109,35 @@ function updateStreams() {
         activeSymbols.forEach((symbol) => {
             const ob = getOrderbook(symbol);
             const meta = getMeta(symbol);
-            resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true });
-            meta.depthQueue = [];
+
+            // [P0-FIX-14] Full reset on WebSocket open - eski state ile devam ETME
+            meta.depthQueue = []; // Tüm bekleyen diff'leri temizle
+            meta.isProcessingDepthQueue = false;
+            processingSymbols.delete(symbol);
+            meta.isResyncing = false;
             meta.goodSequenceStreak = 0;
+
+            // Orderbook state'ini sıfırla
+            resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true, desync: true });
+
+            // [P0-FIX-15] Snapshot zorunluluğu - force=true ile ALWAYS snapshot al
+            ob.snapshotRequired = true;
             transitionOrderbookState(symbol, 'SNAPSHOT_PENDING', 'ws_open_seed');
-            fetchSnapshot(symbol, 'ws_open_seed', true).catch(() => { });
+
+            // [P0-FIX-16] Sequential snapshot fetch to avoid race conditions
+            fetchSnapshot(symbol, 'ws_open_seed', true)
+                .then(() => {
+                    log('WS_OPEN_SNAPSHOT_OK', { symbol });
+                })
+                .catch((e) => {
+                    log('WS_OPEN_SNAPSHOT_ERR', { symbol, error: e.message });
+                    // Retry after delay
+                    setTimeout(() => {
+                        if (wsState === 'connected') {
+                            fetchSnapshot(symbol, 'ws_open_retry', true).catch(() => {});
+                        }
+                    }, 2000);
+                });
         });
     });
 
@@ -1034,10 +1153,23 @@ function updateStreams() {
         log('WS_CLOSE', {});
         const now = Date.now();
         for (const symbol of activeSymbols) {
+            const meta = getMeta(symbol);
             const ob = getOrderbook(symbol);
-            resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true });
-            getMeta(symbol).depthQueue = [];
+
+            // [P0-FIX-2] Full state reset on reconnect - queue temizleme
+            meta.depthQueue = []; // Tüm bekleyen diff'leri temizle
+            meta.isProcessingDepthQueue = false;
+            processingSymbols.delete(symbol); // Lock'u serbest bırak
+            meta.isResyncing = false;
+            meta.goodSequenceStreak = 0;
+
+            // Orderbook state'ini tamamen sıfırla
+            resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true, desync: true });
             getIntegrity(symbol).markReconnect(now);
+
+            // [P0-FIX-3] Snapshot zorunluluğu - eski state ile devam etme
+            ob.snapshotRequired = true;
+            transitionOrderbookState(symbol, 'SNAPSHOT_PENDING', 'ws_reconnect_reset');
         }
         setTimeout(updateStreams, 5000);
     });
@@ -1053,6 +1185,22 @@ function updateStreams() {
 
 function enqueueDepthUpdate(symbol: string, update: { U: number; u: number; pu?: number; b: [string, string][]; a: [string, string][]; eventTimeMs: number; receiptTimeMs: number }) {
     const meta = getMeta(symbol);
+
+    // [P0-FIX-10] Skip diff processing if snapshot is in progress
+    if (snapshotInProgress.get(symbol) === true) {
+        log('DEPTH_UPDATE_DEFERRED', { symbol, U: update.U, u: update.u, reason: 'snapshot_in_progress' });
+        // Still queue but don't process yet
+        meta.depthQueue.push(update);
+        return;
+    }
+
+    // [P0-FIX-11] Skip if resyncing
+    if (meta.isResyncing) {
+        log('DEPTH_UPDATE_DEFERRED', { symbol, U: update.U, u: update.u, reason: 'resync_in_progress' });
+        meta.depthQueue.push(update);
+        return;
+    }
+
     meta.depthQueue.push(update);
     if (meta.depthQueue.length > DEPTH_QUEUE_MAX) {
         requestOrderbookResync(symbol, 'queue_overflow', { max: DEPTH_QUEUE_MAX });
@@ -1063,13 +1211,38 @@ function enqueueDepthUpdate(symbol: string, update: { U: number; u: number; pu?:
     });
 }
 
+// [P0-FIX-1] Atomic queue processing with symbol-level lock
+// (declared once in global state section)
+
 async function processDepthQueue(symbol: string) {
     const meta = getMeta(symbol);
-    if (meta.isProcessingDepthQueue) {
+
+    // Atomic check-and-set for symbol-level lock
+    if (processingSymbols.has(symbol)) {
         return;
     }
+    processingSymbols.add(symbol);
     meta.isProcessingDepthQueue = true;
+
     try {
+        // [P0-FIX-2] Skip processing if resync is in progress
+        if (meta.isResyncing) {
+            return;
+        }
+
+        // [P0-FIX-27] Sort queue by U (sequence start) to handle out-of-order diffs
+        if (meta.depthQueue.length > 1) {
+            meta.depthQueue.sort((a, b) => a.U - b.U);
+        }
+
+        // [P0-FIX-28] Remove duplicate sequence IDs
+        const seen = new Set<number>();
+        meta.depthQueue = meta.depthQueue.filter(u => {
+            if (seen.has(u.u)) return false;
+            seen.add(u.u);
+            return true;
+        });
+
         while (meta.depthQueue.length > 0) {
             const update = meta.depthQueue.shift()!;
             const now = Date.now();
@@ -1083,6 +1256,24 @@ async function processDepthQueue(symbol: string) {
             const ob = getOrderbook(symbol);
             ob.lastSeenU_u = `${update.U}-${update.u}`;
             ob.lastDepthTime = now;
+
+            // [P0-FIX-12] Monotonic sequence validation
+            const lastUpdateId = ob.lastUpdateId;
+            if (update.U <= lastUpdateId && update.u <= lastUpdateId) {
+                // Completely stale update, drop it
+                log('DEPTH_UPDATE_STALE', { symbol, U: update.U, u: update.u, lastUpdateId });
+                continue;
+            }
+
+            if (update.U > lastUpdateId + 1) {
+                // [P0-FIX-13] Gap detected - U should be lastUpdateId + 1
+                log('DEPTH_GAP_DETECTED', { symbol, U: update.U, u: update.u, lastUpdateId, expected: lastUpdateId + 1 });
+
+                // Re-queue this update and trigger resync
+                meta.depthQueue.unshift(update);
+                requestOrderbookResync(symbol, 'sequence_gap', { U: update.U, u: update.u, lastUpdateId });
+                break;
+            }
 
             const applied = applyDepthUpdate(ob, update);
             if (!applied.ok && applied.gapDetected) {
@@ -1193,7 +1384,18 @@ async function processDepthQueue(symbol: string) {
             }
         }
     } finally {
+        // [P0-FIX-29] Always release locks
         meta.isProcessingDepthQueue = false;
+        processingSymbols.delete(symbol);
+
+        // [P0-FIX-30] If queue still has items and not resyncing, trigger another processing
+        if (meta.depthQueue.length > 0 && !meta.isResyncing && !snapshotInProgress.get(symbol)) {
+            setImmediate(() => {
+                processDepthQueue(symbol).catch(e => {
+                    log('DEPTH_QUEUE_RETRY_ERR', { symbol, error: e.message });
+                });
+            });
+        }
     }
 }
 
