@@ -66,4 +66,4 @@
 - Consensus config parametreleri env/config seviyesine çıkarılmadı; şu an default değerlerle çalışıyor.
 
 ## Main Merge
-- Main merge sonrası commit hash: `TBD`
+- Main merge sonrası commit hash: `1a1270cd1688fa0e066bba89a908b57187a615a3`
