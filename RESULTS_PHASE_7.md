@@ -1,7 +1,7 @@
-# RESULTS_PHASE_7
+ï»¿# RESULTS_PHASE_7
 
 ## Patch Application
-- Target package path: `C:\Users\emrehaskilic\Desktop\Kimi_Agent_U¨retim Hazirlig?i & Go¨zlemlenebilirlik`
+- Target package path: `C:\Users\emrehaskilic\Desktop\Kimi_Agent_UÂ¨retim Hazirlig?i & GoÂ¨zlemlenebilirlik`
 - Expected file `PATCH.diff` was not present.
 - Available patch file was `PATCH.md.diff`.
 - `git apply --3way` attempt failed due corrupt patch format (`corrupt patch at line 294`).
@@ -122,4 +122,5 @@ Runtime endpoint verification (local):
 - `server/integration/index.ts` is integrated and initialized, but most runtime wiring remains centralized in `server/index.ts` for compatibility with existing architecture.
 
 ## Main Merge Info
-- `main` merge commit hash: PENDING
+- `main` merge commit hash: `656622b9470478bbba3b0f4ba18fa95a46f4bd8a`
+
