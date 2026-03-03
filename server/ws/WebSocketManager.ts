@@ -185,6 +185,6 @@ export class WebSocketManager {
         normalized.add(symbol);
       }
     }
-    return [...normalized];
+    return [...normalized].sort();
   }
 }
