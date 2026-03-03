@@ -8,7 +8,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "start:dev": "ts-node index.ts",
-    "test": "node --require ts-node/register --test ./test/server.test.ts"
+    "test": "node --require ts-node/register --test ./test/server.test.ts",
+    "test:risk-sim": "ts-node ./test/risk_simulation_test.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",
