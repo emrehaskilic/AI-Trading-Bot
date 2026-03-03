@@ -252,6 +252,7 @@ interface SymbolMeta {
 
 const symbolMeta = new Map<string, SymbolMeta>();
 const orderbookMap = createOrderbookStateMap();
+const orchestratorEvalErrorTs = new Map<string, number>();
 
 // Metrics
 const timeAndSalesMap = new Map<string, TimeAndSales>();
@@ -1984,7 +1985,9 @@ function broadcastMetrics(
             ? buildDrpSnapshot('BTCUSDT')
             : null;
 
-    const orchestratorV1Decision = orchestratorV1.evaluate({
+    let resolvedOrchestratorDecision = defaultOrchestratorDecision(s, Number(eventTimeMs || now));
+    try {
+        resolvedOrchestratorDecision = orchestratorV1.evaluate({
             symbol: s,
             nowMs: Number(eventTimeMs || now),
             price: Number(mid || legacyM?.price || 0),
@@ -2021,8 +2024,18 @@ function broadcastMetrics(
             crossMarketActive: crossMarketRuntimeActive,
             dryRunPosition: dryRunPositionSnapshot,
             btcDryRunPosition,
-    });
-    const resolvedOrchestratorDecision = orchestratorV1Decision;
+        });
+    } catch (e: any) {
+        const nowMs = Date.now();
+        const lastErrTs = orchestratorEvalErrorTs.get(s) || 0;
+        if (nowMs - lastErrTs > 5000) {
+            log('ORCHESTRATOR_V1_EVAL_ERROR', {
+                symbol: s,
+                error: e?.message || 'orchestrator_eval_failed',
+            });
+            orchestratorEvalErrorTs.set(s, nowMs);
+        }
+    }
     const orchestratorDebug = updateOrchestratorDiagnostics(s, resolvedOrchestratorDecision, Number(eventTimeMs || now));
     const decisionView = buildDecisionViewFromOrchestrator(resolvedOrchestratorDecision);
     const strategyPosition = decisionView.suppressDryRunPosition && rawPositionSource === 'dryrun'
