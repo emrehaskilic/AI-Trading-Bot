@@ -1,0 +1,386 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "analytics-evidence-pack-v1",
+  "title": "Analytics Evidence Pack",
+  "description": "Schema for trade-level and session-level profitability analytics",
+  "type": "object",
+  "required": ["schema", "metadata", "pnl", "execution", "quality", "session"],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "analytics-evidence-pack-v1"
+    },
+    "metadata": {
+      "type": "object",
+      "required": ["generatedAt", "sessionId", "version", "source"],
+      "properties": {
+        "generatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 timestamp when the pack was generated"
+        },
+        "sessionId": {
+          "type": "string",
+          "description": "Unique session identifier"
+        },
+        "version": {
+          "type": "string",
+          "description": "Schema version"
+        },
+        "source": {
+          "type": "string",
+          "description": "Source system that generated the pack"
+        }
+      }
+    },
+    "pnl": {
+      "type": "object",
+      "required": ["realized", "unrealized", "fees"],
+      "properties": {
+        "realized": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/RealizedPnL"
+          }
+        },
+        "unrealized": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UnrealizedPnL"
+          }
+        },
+        "fees": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/FeeBreakdown"
+          }
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "required": ["slippage", "flips", "adverseSelection", "timeUnderWater"],
+      "properties": {
+        "slippage": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SlippageMetrics"
+          }
+        },
+        "flips": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/FlipMetrics"
+          }
+        },
+        "adverseSelection": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AdverseSelectionMetrics"
+          }
+        },
+        "timeUnderWater": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TimeUnderWaterMetrics"
+          }
+        }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "required": ["mfeMae", "scores", "drawdown"],
+      "properties": {
+        "mfeMae": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/MfeMaeMetrics"
+          }
+        },
+        "scores": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TradeQualityScore"
+          }
+        },
+        "drawdown": {
+          "$ref": "#/definitions/DrawdownMetrics"
+        }
+      }
+    },
+    "session": {
+      "$ref": "#/definitions/SessionSummary"
+    }
+  },
+  "definitions": {
+    "RealizedPnL": {
+      "type": "object",
+      "required": ["symbol", "totalRealizedPnl", "grossPnl", "totalFees", "tradeCount"],
+      "properties": {
+        "symbol": { "type": "string" },
+        "totalRealizedPnl": { "type": "number" },
+        "grossPnl": { "type": "number" },
+        "totalFees": { "type": "number" },
+        "makerFees": { "type": "number" },
+        "takerFees": { "type": "number" },
+        "tradeCount": { "type": "integer" },
+        "winningTrades": { "type": "integer" },
+        "losingTrades": { "type": "integer" },
+        "avgWin": { "type": "number" },
+        "avgLoss": { "type": "number" },
+        "largestWin": { "type": "number" },
+        "largestLoss": { "type": "number" }
+      }
+    },
+    "UnrealizedPnL": {
+      "type": "object",
+      "required": ["symbol", "side", "qty", "entryPrice", "markPrice", "unrealizedPnl"],
+      "properties": {
+        "symbol": { "type": "string" },
+        "side": { "enum": ["LONG", "SHORT", "FLAT"] },
+        "qty": { "type": "number" },
+        "entryPrice": { "type": "number" },
+        "markPrice": { "type": "number" },
+        "unrealizedPnl": { "type": "number" },
+        "unrealizedPnlPercent": { "type": "number" },
+        "notionalValue": { "type": "number" }
+      }
+    },
+    "FeeBreakdown": {
+      "type": "object",
+      "required": ["symbol", "totalFees", "makerFees", "takerFees"],
+      "properties": {
+        "symbol": { "type": "string" },
+        "totalFees": { "type": "number" },
+        "makerFees": { "type": "number" },
+        "takerFees": { "type": "number" },
+        "makerVolume": { "type": "number" },
+        "takerVolume": { "type": "number" },
+        "makerFeeCount": { "type": "integer" },
+        "takerFeeCount": { "type": "integer" }
+      }
+    },
+    "SlippageMetrics": {
+      "type": "object",
+      "required": ["symbol", "orderId", "expectedPrice", "executedPrice", "slippageBps", "slippageType"],
+      "properties": {
+        "symbol": { "type": "string" },
+        "orderId": { "type": "string" },
+        "expectedPrice": { "type": "number" },
+        "executedPrice": { "type": "number" },
+        "slippageBps": { "type": "number" },
+        "slippageType": { "enum": ["positive", "negative", "neutral"] },
+        "side": { "enum": ["BUY", "SELL"] },
+        "qty": { "type": "number" },
+        "timestamp": { "type": "integer" }
+      }
+    },
+    "FlipMetrics": {
+      "type": "object",
+      "required": ["symbol", "flipCount", "totalTrades", "flipRate", "flips"],
+      "properties": {
+        "symbol": { "type": "string" },
+        "flipCount": { "type": "integer" },
+        "totalTrades": { "type": "integer" },
+        "flipRate": { "type": "number" },
+        "lastFlipTimestamp": { "type": ["integer", "null"] },
+        "flips": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "from": { "enum": ["LONG", "SHORT"] },
+              "to": { "enum": ["LONG", "SHORT"] },
+              "timestamp": { "type": "integer" },
+              "price": { "type": "number" }
+            }
+          }
+        }
+      }
+    },
+    "AdverseSelectionMetrics": {
+      "type": "object",
+      "required": ["symbol", "tradeId", "entryPrice", "entrySide", "price1MinLater", "priceChangeBps", "isAdverse"],
+      "properties": {
+        "symbol": { "type": "string" },
+        "tradeId": { "type": "string" },
+        "entryPrice": { "type": "number" },
+        "entrySide": { "enum": ["LONG", "SHORT"] },
+        "price1MinLater": { "type": "number" },
+        "priceChangeBps": { "type": "number" },
+        "isAdverse": { "type": "boolean" },
+        "severity": { "enum": ["low", "medium", "high"] }
+      }
+    },
+    "TimeUnderWaterMetrics": {
+      "type": "object",
+      "required": ["symbol", "tradeId", "entryTimestamp", "timeUnderWaterMs", "maxDrawdownDuringTrade"],
+      "properties": {
+        "symbol": { "type": "string" },
+        "tradeId": { "type": "string" },
+        "entryTimestamp": { "type": "integer" },
+        "exitTimestamp": { "type": ["integer", "null"] },
+        "timeUnderWaterMs": { "type": "integer" },
+        "maxDrawdownDuringTrade": { "type": "number" },
+        "recoveredAt": { "type": ["integer", "null"] }
+      }
+    },
+    "MfeMaeMetrics": {
+      "type": "object",
+      "required": ["symbol", "tradeId", "entryPrice", "side", "mfePrice", "mfeValue", "mfePercent", "maePrice", "maeValue", "maePercent", "mfeMaeRatio"],
+      "properties": {
+        "symbol": { "type": "string" },
+        "tradeId": { "type": "string" },
+        "entryPrice": { "type": "number" },
+        "exitPrice": { "type": ["number", "null"] },
+        "side": { "enum": ["LONG", "SHORT"] },
+        "mfePrice": { "type": "number" },
+        "mfeValue": { "type": "number" },
+        "mfePercent": { "type": "number" },
+        "mfeTimestamp": { "type": "integer" },
+        "maePrice": { "type": "number" },
+        "maeValue": { "type": "number" },
+        "maePercent": { "type": "number" },
+        "maeTimestamp": { "type": "integer" },
+        "mfeMaeRatio": { "type": "number" },
+        "efficiencyRatio": { "type": "number" }
+      }
+    },
+    "DrawdownMetrics": {
+      "type": "object",
+      "required": ["currentDrawdown", "maxDrawdown", "maxDrawdownPercent", "peakEquity", "troughEquity"],
+      "properties": {
+        "currentDrawdown": { "type": "number" },
+        "maxDrawdown": { "type": "number" },
+        "maxDrawdownPercent": { "type": "number" },
+        "peakEquity": { "type": "number" },
+        "troughEquity": { "type": "number" },
+        "drawdownStart": { "type": "integer" },
+        "drawdownEnd": { "type": ["integer", "null"] },
+        "recoveryTimeMs": { "type": ["integer", "null"] }
+      }
+    },
+    "TradeQualityScore": {
+      "type": "object",
+      "required": ["symbol", "tradeId", "overallScore", "mfeMaeScore", "timingScore", "executionScore", "riskAdjustedScore", "weights", "explanations"],
+      "properties": {
+        "symbol": { "type": "string" },
+        "tradeId": { "type": "string" },
+        "overallScore": { "type": "number", "minimum": 0, "maximum": 100 },
+        "mfeMaeScore": { "type": "number", "minimum": 0, "maximum": 100 },
+        "timingScore": { "type": "number", "minimum": 0, "maximum": 100 },
+        "executionScore": { "type": "number", "minimum": 0, "maximum": 100 },
+        "riskAdjustedScore": { "type": "number", "minimum": 0, "maximum": 100 },
+        "weights": {
+          "type": "object",
+          "properties": {
+            "mfeMae": { "type": "number" },
+            "timing": { "type": "number" },
+            "execution": { "type": "number" },
+            "riskAdjusted": { "type": "number" }
+          }
+        },
+        "explanations": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "SessionSummary": {
+      "type": "object",
+      "required": ["metadata", "summary", "bySymbol", "execution", "quality", "trades", "drawdown"],
+      "properties": {
+        "metadata": {
+          "type": "object",
+          "properties": {
+            "sessionId": { "type": "string" },
+            "generatedAt": { "type": "string", "format": "date-time" },
+            "version": { "type": "string" },
+            "startTime": { "type": "integer" },
+            "endTime": { "type": ["integer", "null"] },
+            "durationMs": { "type": "integer" }
+          }
+        },
+        "summary": {
+          "type": "object",
+          "properties": {
+            "totalTrades": { "type": "integer" },
+            "winningTrades": { "type": "integer" },
+            "losingTrades": { "type": "integer" },
+            "winRate": { "type": "number" },
+            "totalRealizedPnl": { "type": "number" },
+            "totalFees": { "type": "number" },
+            "netPnl": { "type": "number" },
+            "avgTradePnl": { "type": "number" },
+            "avgWin": { "type": "number" },
+            "avgLoss": { "type": "number" },
+            "profitFactor": { "type": "number" },
+            "maxDrawdown": { "type": "number" },
+            "maxDrawdownPercent": { "type": "number" },
+            "totalVolume": { "type": "number" },
+            "makerVolume": { "type": "number" },
+            "takerVolume": { "type": "number" }
+          }
+        },
+        "bySymbol": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "trades": { "type": "integer" },
+              "realizedPnl": { "type": "number" },
+              "fees": { "type": "number" },
+              "volume": { "type": "number" },
+              "flipRate": { "type": "number" }
+            }
+          }
+        },
+        "execution": {
+          "type": "object",
+          "properties": {
+            "avgSlippageBps": { "type": "number" },
+            "positiveSlippageCount": { "type": "integer" },
+            "negativeSlippageCount": { "type": "integer" },
+            "totalFlips": { "type": "integer" },
+            "avgFlipRate": { "type": "number" },
+            "adverseSelectionCount": { "type": "integer" },
+            "adverseSelectionRate": { "type": "number" }
+          }
+        },
+        "quality": {
+          "type": "object",
+          "properties": {
+            "avgMfeMaeRatio": { "type": "number" },
+            "avgTradeScore": { "type": "number" },
+            "goodTrades": { "type": "integer" },
+            "badTrades": { "type": "integer" }
+          }
+        },
+        "trades": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "tradeId": { "type": "string" },
+              "symbol": { "type": "string" },
+              "side": { "enum": ["LONG", "SHORT"] },
+              "entryTimestamp": { "type": "integer" },
+              "entryPrice": { "type": "number" },
+              "entryQty": { "type": "number" },
+              "exitTimestamp": { "type": ["integer", "null"] },
+              "exitPrice": { "type": ["number", "null"] },
+              "exitQty": { "type": ["number", "null"] },
+              "status": { "enum": ["OPEN", "CLOSED"] },
+              "realizedPnl": { "type": "number" },
+              "fees": { "type": "number" },
+              "netPnl": { "type": "number" }
+            }
+          }
+        },
+        "drawdown": {
+          "$ref": "#/definitions/DrawdownMetrics"
+        }
+      }
+    }
+  }
+}

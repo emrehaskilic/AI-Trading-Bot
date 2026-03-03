@@ -65,6 +65,26 @@ export class PnLCalculator {
       this.feeBreakdown.set(symbol, fees);
     }
 
+    let stats = this.realizedPnL.get(symbol);
+    if (!stats) {
+      stats = {
+        symbol,
+        totalRealizedPnl: 0,
+        grossPnl: 0,
+        totalFees: 0,
+        makerFees: 0,
+        takerFees: 0,
+        tradeCount: 0,
+        winningTrades: 0,
+        losingTrades: 0,
+        avgWin: 0,
+        avgLoss: 0,
+        largestWin: 0,
+        largestLoss: 0,
+      };
+      this.realizedPnL.set(symbol, stats);
+    }
+
     // Update fees
     fees.totalFees += fee;
     if (feeType === 'maker') {
@@ -75,6 +95,12 @@ export class PnLCalculator {
       fees.takerFees += fee;
       fees.takerVolume += qty * price;
       fees.takerFeeCount++;
+    }
+    stats.totalFees += fee;
+    if (feeType === 'maker') {
+      stats.makerFees += fee;
+    } else {
+      stats.takerFees += fee;
     }
 
     // Calculate position changes
@@ -145,34 +171,8 @@ export class PnLCalculator {
       position.realizedPnl += tradeRealizedPnl;
 
       // Update realized PnL stats
-      let stats = this.realizedPnL.get(symbol);
-      if (!stats) {
-        stats = {
-          symbol,
-          totalRealizedPnl: 0,
-          grossPnl: 0,
-          totalFees: 0,
-          makerFees: 0,
-          takerFees: 0,
-          tradeCount: 0,
-          winningTrades: 0,
-          losingTrades: 0,
-          avgWin: 0,
-          avgLoss: 0,
-          largestWin: 0,
-          largestLoss: 0,
-        };
-        this.realizedPnL.set(symbol, stats);
-      }
-
       stats.totalRealizedPnl += tradeRealizedPnl;
       stats.grossPnl += tradeRealizedPnl;
-      stats.totalFees += fee;
-      if (feeType === 'maker') {
-        stats.makerFees += fee;
-      } else {
-        stats.takerFees += fee;
-      }
       stats.tradeCount++;
 
       if (tradeRealizedPnl > 0) {

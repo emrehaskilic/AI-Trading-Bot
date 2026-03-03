@@ -1,0 +1,337 @@
+{
+  "schema": "analytics-evidence-pack-v1",
+  "metadata": {
+    "generatedAt": "2026-03-03T14:30:00.000Z",
+    "sessionId": "session-1741012200000-abc123def",
+    "version": "1.0.0",
+    "source": "analytics-engine"
+  },
+  "pnl": {
+    "realized": [
+      {
+        "symbol": "BTCUSDT",
+        "totalRealizedPnl": 1250.75,
+        "grossPnl": 1280.50,
+        "totalFees": 29.75,
+        "makerFees": 12.50,
+        "takerFees": 17.25,
+        "tradeCount": 15,
+        "winningTrades": 9,
+        "losingTrades": 6,
+        "avgWin": 142.28,
+        "avgLoss": -45.67,
+        "largestWin": 320.50,
+        "largestLoss": -89.25
+      },
+      {
+        "symbol": "ETHUSDT",
+        "totalRealizedPnl": -180.25,
+        "grossPnl": -165.00,
+        "totalFees": 15.25,
+        "makerFees": 6.75,
+        "takerFees": 8.50,
+        "tradeCount": 8,
+        "winningTrades": 3,
+        "losingTrades": 5,
+        "avgWin": 55.00,
+        "avgLoss": -48.00,
+        "largestWin": 78.50,
+        "largestLoss": -95.00
+      }
+    ],
+    "unrealized": [
+      {
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "qty": 0.15,
+        "entryPrice": 65000.00,
+        "markPrice": 65500.00,
+        "unrealizedPnl": 75.00,
+        "unrealizedPnlPercent": 0.77,
+        "notionalValue": 9825.00
+      }
+    ],
+    "fees": [
+      {
+        "symbol": "BTCUSDT",
+        "totalFees": 29.75,
+        "makerFees": 12.50,
+        "takerFees": 17.25,
+        "makerVolume": 125000.00,
+        "takerVolume": 86250.00,
+        "makerFeeCount": 5,
+        "takerFeeCount": 10
+      },
+      {
+        "symbol": "ETHUSDT",
+        "totalFees": 15.25,
+        "makerFees": 6.75,
+        "takerFees": 8.50,
+        "makerVolume": 45000.00,
+        "takerVolume": 32000.00,
+        "makerFeeCount": 3,
+        "takerFeeCount": 5
+      }
+    ]
+  },
+  "execution": {
+    "slippage": [
+      {
+        "symbol": "BTCUSDT",
+        "orderId": "order-001",
+        "expectedPrice": 65000.00,
+        "executedPrice": 65003.25,
+        "slippageBps": 0.5,
+        "slippageType": "negative",
+        "side": "BUY",
+        "qty": 0.1,
+        "timestamp": 1741012200000
+      },
+      {
+        "symbol": "BTCUSDT",
+        "orderId": "order-002",
+        "expectedPrice": 65500.00,
+        "executedPrice": 65498.50,
+        "slippageBps": 0.23,
+        "slippageType": "positive",
+        "side": "SELL",
+        "qty": 0.05,
+        "timestamp": 1741012260000
+      }
+    ],
+    "flips": [
+      {
+        "symbol": "BTCUSDT",
+        "flipCount": 2,
+        "totalTrades": 15,
+        "flipRate": 13.33,
+        "lastFlipTimestamp": 1741012500000,
+        "flips": [
+          {
+            "from": "LONG",
+            "to": "SHORT",
+            "timestamp": 1741012400000,
+            "price": 65200.00
+          },
+          {
+            "from": "SHORT",
+            "to": "LONG",
+            "timestamp": 1741012500000,
+            "price": 64800.00
+          }
+        ]
+      }
+    ],
+    "adverseSelection": [
+      {
+        "symbol": "BTCUSDT",
+        "tradeId": "trade-001",
+        "entryPrice": 65000.00,
+        "entrySide": "LONG",
+        "price1MinLater": 64950.00,
+        "priceChangeBps": -7.69,
+        "isAdverse": true,
+        "severity": "low"
+      }
+    ],
+    "timeUnderWater": [
+      {
+        "symbol": "BTCUSDT",
+        "tradeId": "trade-003",
+        "entryTimestamp": 1741012300000,
+        "exitTimestamp": 1741012600000,
+        "timeUnderWaterMs": 180000,
+        "maxDrawdownDuringTrade": -125.50,
+        "recoveredAt": 1741012450000
+      }
+    ]
+  },
+  "quality": {
+    "mfeMae": [
+      {
+        "symbol": "BTCUSDT",
+        "tradeId": "trade-001",
+        "entryPrice": 65000.00,
+        "exitPrice": 65500.00,
+        "side": "LONG",
+        "mfePrice": 65650.00,
+        "mfeValue": 650.00,
+        "mfePercent": 1.0,
+        "mfeTimestamp": 1741012250000,
+        "maePrice": 64850.00,
+        "maeValue": -150.00,
+        "maePercent": 0.23,
+        "maeTimestamp": 1741012220000,
+        "mfeMaeRatio": 4.33,
+        "efficiencyRatio": 0.77
+      }
+    ],
+    "scores": [
+      {
+        "symbol": "BTCUSDT",
+        "tradeId": "trade-001",
+        "overallScore": 82,
+        "mfeMaeScore": 95,
+        "timingScore": 75,
+        "executionScore": 85,
+        "riskAdjustedScore": 80,
+        "weights": {
+          "mfeMae": 0.35,
+          "timing": 0.25,
+          "execution": 0.20,
+          "riskAdjusted": 0.20
+        },
+        "explanations": [
+          "Excellent MFE/MAE ratio (>= 3:1)",
+          "Good exit timing (captured 50%+ of MFE)",
+          "Excellent execution (slippage < 5 bps)",
+          "Good risk control (MAE < 1%)"
+        ]
+      }
+    ],
+    "drawdown": {
+      "currentDrawdown": 45.25,
+      "maxDrawdown": 320.50,
+      "maxDrawdownPercent": 2.5,
+      "peakEquity": 12820.50,
+      "troughEquity": 12500.00,
+      "drawdownStart": 1741012350000,
+      "drawdownEnd": null,
+      "recoveryTimeMs": null
+    }
+  },
+  "session": {
+    "metadata": {
+      "sessionId": "session-1741012200000-abc123def",
+      "generatedAt": "2026-03-03T14:30:00.000Z",
+      "version": "1.0.0",
+      "startTime": 1741012200000,
+      "endTime": 1741015800000,
+      "durationMs": 3600000
+    },
+    "summary": {
+      "totalTrades": 23,
+      "winningTrades": 12,
+      "losingTrades": 11,
+      "winRate": 52.17,
+      "totalRealizedPnl": 1070.50,
+      "totalFees": 45.00,
+      "netPnl": 1025.50,
+      "avgTradePnl": 44.59,
+      "avgWin": 120.42,
+      "avgLoss": -46.36,
+      "profitFactor": 1.42,
+      "maxDrawdown": 320.50,
+      "maxDrawdownPercent": 2.5,
+      "totalVolume": 288250.00,
+      "makerVolume": 170000.00,
+      "takerVolume": 118250.00
+    },
+    "bySymbol": {
+      "BTCUSDT": {
+        "trades": 15,
+        "realizedPnl": 1250.75,
+        "fees": 29.75,
+        "volume": 211250.00,
+        "flipRate": 13.33
+      },
+      "ETHUSDT": {
+        "trades": 8,
+        "realizedPnl": -180.25,
+        "fees": 15.25,
+        "volume": 77000.00,
+        "flipRate": 0
+      }
+    },
+    "execution": {
+      "avgSlippageBps": 0.37,
+      "positiveSlippageCount": 8,
+      "negativeSlippageCount": 15,
+      "totalFlips": 2,
+      "avgFlipRate": 13.33,
+      "adverseSelectionCount": 5,
+      "adverseSelectionRate": 21.74
+    },
+    "quality": {
+      "avgMfeMaeRatio": 2.85,
+      "avgTradeScore": 71,
+      "goodTrades": 14,
+      "badTrades": 4
+    },
+    "trades": [
+      {
+        "tradeId": "BTCUSDT-1",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "entryTimestamp": 1741012200000,
+        "entryPrice": 65000.00,
+        "entryQty": 0.1,
+        "entryOrderId": "order-001",
+        "entrySlippageBps": 0.5,
+        "exitTimestamp": 1741012260000,
+        "exitPrice": 65500.00,
+        "exitQty": 0.1,
+        "exitOrderId": "order-002",
+        "exitSlippageBps": 0.23,
+        "status": "CLOSED",
+        "realizedPnl": 500.00,
+        "fees": 12.50,
+        "netPnl": 487.50,
+        "mfeMae": {
+          "symbol": "BTCUSDT",
+          "tradeId": "BTCUSDT-1",
+          "entryPrice": 65000.00,
+          "exitPrice": 65500.00,
+          "side": "LONG",
+          "mfePrice": 65650.00,
+          "mfeValue": 650.00,
+          "mfePercent": 1.0,
+          "mfeTimestamp": 1741012250000,
+          "maePrice": 64850.00,
+          "maeValue": -150.00,
+          "maePercent": 0.23,
+          "maeTimestamp": 1741012220000,
+          "mfeMaeRatio": 4.33,
+          "efficiencyRatio": 0.77
+        },
+        "timeUnderWater": {
+          "symbol": "BTCUSDT",
+          "tradeId": "BTCUSDT-1",
+          "entryTimestamp": 1741012200000,
+          "exitTimestamp": 1741012260000,
+          "timeUnderWaterMs": 120000,
+          "maxDrawdownDuringTrade": -150.00,
+          "recoveredAt": 1741012240000
+        },
+        "adverseSelection": null,
+        "priceHistory": [
+          {
+            "timestamp": 1741012200000,
+            "price": 65000.00,
+            "markPrice": 65000.00
+          },
+          {
+            "timestamp": 1741012250000,
+            "price": 65650.00,
+            "markPrice": 65650.00
+          },
+          {
+            "timestamp": 1741012260000,
+            "price": 65500.00,
+            "markPrice": 65500.00
+          }
+        ]
+      }
+    ],
+    "drawdown": {
+      "currentDrawdown": 45.25,
+      "maxDrawdown": 320.50,
+      "maxDrawdownPercent": 2.5,
+      "peakEquity": 12820.50,
+      "troughEquity": 12500.00,
+      "drawdownStart": 1741012350000,
+      "drawdownEnd": null,
+      "recoveryTimeMs": null
+    }
+  }
+}
