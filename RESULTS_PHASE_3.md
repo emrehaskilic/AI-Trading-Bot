@@ -90,5 +90,5 @@
 - `MetricsDashboard` now memoizes card rendering by object reference; if upstream mutates in-place instead of replacing objects, updates can be missed.
 
 ## 8) Main Merge Record
-- main merge commit hash: **PENDING**
+- main merge commit hash (phase-3-perf-latency -> main): **0608b98**
 
