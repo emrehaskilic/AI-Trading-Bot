@@ -25,6 +25,36 @@ export default defineConfig(({ mode }) => {
           changeOrigin: true,
           secure: false,
         },
+        '/health': {
+          target: apiProxyTarget,
+          changeOrigin: true,
+          secure: false,
+        },
+        '/ready': {
+          target: apiProxyTarget,
+          changeOrigin: true,
+          secure: false,
+        },
+        '/metrics': {
+          target: apiProxyTarget,
+          changeOrigin: true,
+          secure: false,
+        },
+        '/health/liveness': {
+          target: apiProxyTarget,
+          changeOrigin: true,
+          secure: false,
+        },
+        '/health/readiness': {
+          target: apiProxyTarget,
+          changeOrigin: true,
+          secure: false,
+        },
+        '/health/metrics': {
+          target: apiProxyTarget,
+          changeOrigin: true,
+          secure: false,
+        },
         '/ws': {
           target: wsProxyTarget,
           ws: true,
