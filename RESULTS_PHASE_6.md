@@ -67,4 +67,4 @@
 - `server/perf/LatencyGuard.ts` keeps a default `Date.now` time provider only for runtime event-loop monitor fallback; core test path is timestamp-driven.
 
 ## Main Merge
-- Main merge commit hash: `TBD`
+- Main merge commit hash: `0b6d657c8d52ad201f6a64f30964b72d1ecf858f`
