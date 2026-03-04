@@ -247,9 +247,50 @@ const RISK_ENGINE_CONFIG = {
 const RESILIENCE_PATCHES_ENABLED = process.env.RESILIENCE_PATCHES_ENABLED == null
     ? true
     : parseEnvFlag(process.env.RESILIENCE_PATCHES_ENABLED);
+const RESILIENCE_AUTO_KILL_SWITCH = process.env.RESILIENCE_AUTO_KILL_SWITCH == null
+    ? false
+    : parseEnvFlag(process.env.RESILIENCE_AUTO_KILL_SWITCH);
+const RESILIENCE_AUTO_HALT = process.env.RESILIENCE_AUTO_HALT == null
+    ? true
+    : parseEnvFlag(process.env.RESILIENCE_AUTO_HALT);
 const RESILIENCE_SUPPRESS_MIN_MULTIPLIER = Math.max(
     0,
     Math.min(1, parseEnvNumber(process.env.RESILIENCE_SUPPRESS_MIN_MULTIPLIER, 0.75))
+);
+const RESILIENCE_LATENCY_P95_THRESHOLD_MS = Math.max(
+    50,
+    parseEnvNumber(process.env.RESILIENCE_LATENCY_P95_THRESHOLD_MS, 1000)
+);
+const RESILIENCE_LATENCY_P99_THRESHOLD_MS = Math.max(
+    RESILIENCE_LATENCY_P95_THRESHOLD_MS,
+    parseEnvNumber(process.env.RESILIENCE_LATENCY_P99_THRESHOLD_MS, 2000)
+);
+const RESILIENCE_EVENT_LOOP_LAG_THRESHOLD_MS = Math.max(
+    10,
+    parseEnvNumber(process.env.RESILIENCE_EVENT_LOOP_LAG_THRESHOLD_MS, 200)
+);
+const RESILIENCE_LATENCY_CONSECUTIVE_VIOLATIONS = Math.max(
+    1,
+    Math.trunc(parseEnvNumber(process.env.RESILIENCE_LATENCY_CONSECUTIVE_VIOLATIONS, 5))
+);
+const RESILIENCE_LATENCY_KILL_SWITCH_AFTER_VIOLATIONS = Math.max(
+    RESILIENCE_LATENCY_CONSECUTIVE_VIOLATIONS,
+    Math.trunc(parseEnvNumber(process.env.RESILIENCE_LATENCY_KILL_SWITCH_AFTER_VIOLATIONS, 20))
+);
+const RESILIENCE_LATENCY_COOLDOWN_MS = Math.max(
+    250,
+    parseEnvNumber(process.env.RESILIENCE_LATENCY_COOLDOWN_MS, 5000)
+);
+const RESILIENCE_ACTION_DEDUP_MS = Math.max(
+    250,
+    parseEnvNumber(process.env.RESILIENCE_ACTION_DEDUP_MS, 2000)
+);
+const RISK_LATENCY_USE_EVENT_AGE = process.env.RISK_LATENCY_USE_EVENT_AGE == null
+    ? false
+    : parseEnvFlag(process.env.RISK_LATENCY_USE_EVENT_AGE);
+const RISK_LATENCY_EVENT_AGE_CAP_MS = Math.max(
+    250,
+    parseEnvNumber(process.env.RISK_LATENCY_EVENT_AGE_CAP_MS, 5000)
 );
 const ANALYTICS_PERSIST_TO_DISK = process.env.ANALYTICS_PERSIST_TO_DISK == null
     ? false
@@ -451,6 +492,7 @@ const strategyConsensusBySymbol = new Map<string, {
     totalStrategies: number;
 }>();
 const resilienceGuardActions: ResilienceGuardAction[] = [];
+const resilienceActionDedupMap = new Map<string, number>();
 const resilienceTriggerCounters = {
     antiSpoof: 0,
     deltaBurst: 0,
@@ -465,8 +507,16 @@ const latencyTracker = new LatencyTracker();
 const institutionalRiskEngine = new InstitutionalRiskEngine(RISK_ENGINE_CONFIG);
 const resiliencePatches = new ResiliencePatches({
     enableAll: RESILIENCE_PATCHES_ENABLED,
-    autoKillSwitch: true,
-    autoHalt: true,
+    autoKillSwitch: RESILIENCE_AUTO_KILL_SWITCH,
+    autoHalt: RESILIENCE_AUTO_HALT,
+    latency: {
+        p95ThresholdMs: RESILIENCE_LATENCY_P95_THRESHOLD_MS,
+        p99ThresholdMs: RESILIENCE_LATENCY_P99_THRESHOLD_MS,
+        eventLoopLagThresholdMs: RESILIENCE_EVENT_LOOP_LAG_THRESHOLD_MS,
+        consecutiveViolations: RESILIENCE_LATENCY_CONSECUTIVE_VIOLATIONS,
+        killSwitchAfterViolations: RESILIENCE_LATENCY_KILL_SWITCH_AFTER_VIOLATIONS,
+        cooldownMs: RESILIENCE_LATENCY_COOLDOWN_MS,
+    },
 });
 const resilienceLastSideBySymbol = new Map<string, 'BUY' | 'SELL' | null>();
 let riskEngineLastKnownEquity = RISK_ENGINE_DEFAULT_EQUITY_USDT;
@@ -568,10 +618,29 @@ function trackResilience(reason: string, symbol: string, action: string, timesta
         severity = 'medium';
     }
 
+    const dedupeNow = Date.now();
+    const eventTimestamp = Number.isFinite(Number(timestamp)) && Number(timestamp) > 0
+        ? Number(timestamp)
+        : dedupeNow;
+    const dedupeKey = `${guardType}:${symbol}:${action}:${normalized}`;
+    const lastSeen = resilienceActionDedupMap.get(dedupeKey) || 0;
+    if ((dedupeNow - lastSeen) < RESILIENCE_ACTION_DEDUP_MS) {
+        return;
+    }
+    resilienceActionDedupMap.set(dedupeKey, dedupeNow);
+    if (resilienceActionDedupMap.size > 5000) {
+        const cutoff = dedupeNow - (RESILIENCE_ACTION_DEDUP_MS * 4);
+        for (const [key, seenAt] of resilienceActionDedupMap.entries()) {
+            if (seenAt < cutoff) {
+                resilienceActionDedupMap.delete(key);
+            }
+        }
+    }
+
     resilienceTriggerCounters[counterKey] += 1;
     resilienceGuardActions.push({
         guardType,
-        timestamp,
+        timestamp: eventTimestamp,
         symbol,
         action,
         reason,
@@ -924,23 +993,37 @@ function submitRiskAwareStrategyDecision(
     } as any, timestampMs);
 }
 
-function syncRiskEngineRuntime(symbol: string, eventTimeMs: number, midPrice: number | null): ReturnType<InstitutionalRiskEngine['getRiskSummary']> | null {
+function syncRiskEngineRuntime(
+    symbol: string,
+    eventTimeMs: number,
+    midPrice: number | null,
+    receiptTimeMs?: number
+): ReturnType<InstitutionalRiskEngine['getRiskSummary']> | null {
     if (!RISK_ENGINE_ENABLED) {
         return null;
     }
 
     const now = Date.now();
     const ts = Number.isFinite(eventTimeMs) && eventTimeMs > 0 ? eventTimeMs : now;
-    const latencyMs = Math.max(0, now - ts);
+    const normalizedReceiptMs = Number(receiptTimeMs);
+    const receiptTs = Number.isFinite(normalizedReceiptMs) && normalizedReceiptMs > 0
+        ? normalizedReceiptMs
+        : now;
+    const processingLatencyMs = Math.max(0, now - receiptTs);
+    const eventAgeMs = Math.max(0, now - ts);
+    const latencyMs = (RISK_LATENCY_USE_EVENT_AGE && eventAgeMs <= RISK_LATENCY_EVENT_AGE_CAP_MS)
+        ? Math.max(processingLatencyMs, eventAgeMs)
+        : processingLatencyMs;
+
     observabilityMetrics.recordWsLatency(latencyMs);
-    institutionalRiskEngine.recordHeartbeat(ts);
-    institutionalRiskEngine.recordLatency(latencyMs, ts);
+    institutionalRiskEngine.recordHeartbeat(now);
+    institutionalRiskEngine.recordLatency(latencyMs, now);
     if (RESILIENCE_PATCHES_ENABLED) {
-        resiliencePatches.recordLatency(latencyMs, ts, 'network');
+        resiliencePatches.recordLatency(latencyMs, now, 'processing');
     }
 
     if (Number(midPrice || 0) > 0) {
-        institutionalRiskEngine.recordPrice(symbol, Number(midPrice), ts);
+        institutionalRiskEngine.recordPrice(symbol, Number(midPrice), now);
     }
 
     if (dryRunSession.isTrackingSymbol(symbol)) {
@@ -1768,7 +1851,7 @@ async function processDepthQueue(symbol: string) {
             const update = meta.depthQueue.shift()!;
             const now = Date.now();
             const lagMs = now - update.receiptTimeMs;
-            latencyTracker.record('depth_ingest_ms', Math.max(0, now - Number(update.eventTimeMs || now)));
+            latencyTracker.record('depth_ingest_ms', Math.max(0, now - Number(update.receiptTimeMs || now)));
             if (lagMs > DEPTH_LAG_MAX_MS) {
                 requestOrderbookResync(symbol, 'lag_too_high', { lagMs, max: DEPTH_LAG_MAX_MS });
                 break;
@@ -1893,7 +1976,7 @@ async function processDepthQueue(symbol: string) {
                 asks: top50.asks,
             });
             const absVal = absorptionResult.get(symbol) ?? 0;
-            broadcastMetrics(symbol, ob, tas, cvd, absVal, leg, update.eventTimeMs || 0, null, 'depth');
+            broadcastMetrics(symbol, ob, tas, cvd, absVal, leg, update.eventTimeMs || 0, null, 'depth', undefined, update.receiptTimeMs || now);
 
             if (BACKFILL_RECORDING_ENABLED) {
                 const lastArchive = meta.lastArchiveSnapshotTs || 0;
@@ -2084,7 +2167,7 @@ async function processSymbolEvent(s: string, d: any) {
         const q = validatedTrade.quantity;
         const t = validatedTrade.timestamp;
         const side = d.m ? 'sell' : 'buy';
-        latencyTracker.record('trade_ingest_ms', Math.max(0, now - Number(t || now)));
+        latencyTracker.record('trade_ingest_ms', Math.max(0, Date.now() - now));
         if (p > 0) {
             portfolioMonitor.ingestPrice(s, p);
             try {
@@ -2310,7 +2393,8 @@ async function processSymbolEvent(s: string, d: any) {
             'trade',
             shouldEvaluateStrategy
                 ? { tasMetrics, legacyMetrics: legMetrics, advancedBundle }
-                : { advancedBundle }
+                : { advancedBundle },
+            now
         );
     }
 }
@@ -2661,7 +2745,8 @@ function broadcastMetrics(
     eventTimeMs: number,
     decision: any = null,
     reason: 'depth' | 'trade' = 'trade',
-    precomputed?: { tasMetrics?: any; cvdMetrics?: any[]; legacyMetrics?: any; advancedBundle?: AdvancedMicrostructureBundle }
+    precomputed?: { tasMetrics?: any; cvdMetrics?: any[]; legacyMetrics?: any; advancedBundle?: AdvancedMicrostructureBundle },
+    receiptTimeMs?: number
 ) {
     const THROTTLE_MS = 250; // 4Hz max per symbol
     const meta = getMeta(s);
@@ -2900,7 +2985,7 @@ function broadcastMetrics(
             orchestratorEvalErrorTs.set(s, nowMs);
         }
     }
-    const riskSummary = syncRiskEngineRuntime(s, canonicalTimeMs, mid);
+    const riskSummary = syncRiskEngineRuntime(s, canonicalTimeMs, mid, receiptTimeMs);
     const resolvedRiskState = RISK_ENGINE_ENABLED
         ? (riskSummary?.state ?? institutionalRiskEngine.getRiskState())
         : RiskState.TRACKING;

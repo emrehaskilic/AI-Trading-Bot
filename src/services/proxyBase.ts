@@ -43,12 +43,27 @@ function unique(values: string[]): string[] {
 export function getProxyApiCandidates(): string[] {
   const candidates: string[] = [];
   const envBase = String((import.meta as any).env?.VITE_PROXY_API || '').trim();
-  if (envBase && shouldUseEnvBase(envBase)) {
-    candidates.push(envBase);
-  }
+  const isDev = Boolean((import.meta as any).env?.DEV);
 
   const { origin, hostname } = window.location;
+  const envIsUsable = envBase && shouldUseEnvBase(envBase);
+
+  // In local development, prefer direct backend first to avoid proxy/host resolution stalls.
+  if (isDev && isLoopbackHost(hostname)) {
+    candidates.push('http://127.0.0.1:8787');
+    candidates.push('http://localhost:8787');
+    candidates.push(origin);
+    if (envIsUsable) {
+      candidates.push(envBase);
+    }
+    return unique(candidates);
+  }
+
+  // For non-local contexts, try same-origin first and then configured env base.
   candidates.push(origin);
+  if (envIsUsable) {
+    candidates.push(envBase);
+  }
 
   // Hard fallback for local development when proxy/env resolution fails.
   candidates.push('http://localhost:8787');
@@ -66,18 +81,15 @@ export function getProxyApiBase(): string {
 
 export function getProxyWsCandidates(): string[] {
   const candidates: string[] = [];
+
+  // Keep WS resolution aligned with API candidate order.
+  for (const apiBase of getProxyApiCandidates()) {
+    candidates.push(toWsBase(apiBase));
+  }
+
   const envWsBase = String((import.meta as any).env?.VITE_PROXY_WS || '').trim();
   if (envWsBase && shouldUseEnvBase(envWsBase)) {
     candidates.push(toWsBase(envWsBase));
-  }
-
-  const envApiBase = String((import.meta as any).env?.VITE_PROXY_API || '').trim();
-  if (envApiBase && shouldUseEnvBase(envApiBase)) {
-    candidates.push(toWsBase(envApiBase));
-  }
-
-  for (const apiBase of getProxyApiCandidates()) {
-    candidates.push(toWsBase(apiBase));
   }
 
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';

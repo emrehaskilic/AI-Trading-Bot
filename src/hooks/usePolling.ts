@@ -158,7 +158,9 @@ export function usePolling<T>(
     onSuccess,
     onStart,
     onStop,
-    pollWhenHidden = false,
+    // Keep polling active by default to avoid permanent "first load" stalls on
+    // browsers/runtimes that report hidden visibility unexpectedly.
+    pollWhenHidden = true,
     resetRetryOnSuccess = true,
   } = options;
 
@@ -387,6 +389,9 @@ export function usePolling<T>(
 
   // Cleanup on unmount
   useEffect(() => {
+    // React.StrictMode re-mount cycle can leave this ref as false unless we
+    // explicitly restore it on effect setup.
+    isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
       clearTimers();

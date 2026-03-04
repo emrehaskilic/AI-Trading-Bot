@@ -1,14 +1,12 @@
-import React, { memo, useState, useCallback, Suspense, useRef } from 'react';
+import React, { memo, useState, useCallback, useRef } from 'react';
 import { PanelErrorBoundary } from '../ErrorBoundary';
 import { useHealth } from '../../hooks/useHealth';
 import { useMetrics } from '../../hooks/useMetrics';
-
-// Lazy load panels for code splitting
-const SystemStatusPanel = React.lazy(() => import('./SystemStatusPanel'));
-const TelemetryPanel = React.lazy(() => import('./TelemetryPanel'));
-const AnalyticsPanel = React.lazy(() => import('./AnalyticsPanel'));
-const StrategyPanel = React.lazy(() => import('./StrategyPanel'));
-const ResiliencePanel = React.lazy(() => import('./ResiliencePanel'));
+import SystemStatusPanel from './SystemStatusPanel';
+import TelemetryPanel from './TelemetryPanel';
+import AnalyticsPanel from './AnalyticsPanel';
+import StrategyPanel from './StrategyPanel';
+import ResiliencePanel from './ResiliencePanel';
 
 interface PanelWrapperProps {
   children: React.ReactNode;
@@ -17,17 +15,7 @@ interface PanelWrapperProps {
 
 const PanelWrapper = memo<PanelWrapperProps>(({ children, panelName }) => (
   <PanelErrorBoundary panelName={panelName}>
-    <Suspense
-      fallback={
-        <div className="bg-zinc-900/60 border border-zinc-800 rounded-lg p-4 h-48">
-          <div className="flex items-center justify-center h-full">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
-          </div>
-        </div>
-      }
-    >
-      {children}
-    </Suspense>
+    {children}
   </PanelErrorBoundary>
 ));
 
@@ -128,7 +116,6 @@ ConnectionStatusBar.displayName = 'ConnectionStatusBar';
  * 
  * Optimizations:
  * - React.memo for all panels to prevent unnecessary re-renders
- * - Lazy loading with Suspense for code splitting
  * - Panel-level error boundaries for graceful degradation
  * - usePolling hooks with optimized intervals
  */

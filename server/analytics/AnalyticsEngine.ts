@@ -130,11 +130,14 @@ export class AnalyticsEngine {
     const allTrades = this.pnlCalculator.getAllTrades();
     const closedTrades = allTrades.filter(t => t.status === 'CLOSED');
     const openTrades = allTrades.filter(t => t.status === 'OPEN');
+    const unrealizedPnL = this.pnlCalculator.getAllUnrealizedPnL();
 
     const realizedPnL = this.pnlCalculator.getAllRealizedPnL();
     const totalRealizedPnl = realizedPnL.reduce((sum, r) => sum + r.totalRealizedPnl, 0);
+    const totalUnrealizedPnl = unrealizedPnL.reduce((sum, p) => sum + Number(p.unrealizedPnl || 0), 0);
+    const openPositions = unrealizedPnL.filter((p) => p.side !== 'FLAT' && Number(p.qty || 0) > 0).length;
     const totalFees = realizedPnL.reduce((sum, r) => sum + r.totalFees, 0);
-    const netPnl = totalRealizedPnl - totalFees;
+    const netPnl = totalRealizedPnl - totalFees + totalUnrealizedPnl;
 
     const winningTrades = realizedPnL.reduce((sum, r) => sum + r.winningTrades, 0);
     const losingTrades = realizedPnL.reduce((sum, r) => sum + r.losingTrades, 0);
@@ -193,10 +196,12 @@ export class AnalyticsEngine {
       },
       summary: {
         totalTrades,
+        openPositions,
         winningTrades,
         losingTrades,
         winRate,
         totalRealizedPnl,
+        unrealizedPnl: totalUnrealizedPnl,
         totalFees,
         netPnl,
         avgTradePnl: totalTrades > 0 ? netPnl / totalTrades : 0,
@@ -246,7 +251,7 @@ export class AnalyticsEngine {
       },
       pnl: {
         realized: this.pnlCalculator.getAllRealizedPnL(),
-        unrealized: [], // Would populate from positions
+        unrealized: this.pnlCalculator.getAllUnrealizedPnL(),
         fees: this.pnlCalculator.getAllFeeBreakdowns(),
       },
       execution: {

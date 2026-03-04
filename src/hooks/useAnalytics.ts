@@ -39,6 +39,8 @@ export interface AnalyticsSnapshot {
   fees: FeeMetrics;
   slippage: SlippageMetrics;
   drawdown: DrawdownMetrics;
+  totalTrades?: number;
+  openPositions?: number;
   sharpeRatio?: number;
   sortinoRatio?: number;
   winRate?: number;
@@ -55,6 +57,8 @@ interface BackendAnalyticsSnapshot {
     unrealizedPnl: number;
   };
   trades: {
+    totalTrades: number;
+    openPositions: number;
     winRate: number;
     profitFactor: number;
   };
@@ -115,6 +119,8 @@ export function useAnalytics(): {
         recovery: Number(raw?.drawdown?.recoveryFactor || 0),
         duration: 0,
       },
+      totalTrades: Number(raw?.trades?.totalTrades || 0),
+      openPositions: Number(raw?.trades?.openPositions || 0),
       winRate: Number(raw?.trades?.winRate || 0) / 100,
       profitFactor: Number(raw?.trades?.profitFactor || 0),
       evidencePackUrl: '/api/analytics/evidence-pack',

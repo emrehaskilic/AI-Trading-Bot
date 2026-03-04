@@ -265,11 +265,13 @@ export interface SessionSummary {
   
   summary: {
     totalTrades: number;
+    openPositions: number;
     winningTrades: number;
     losingTrades: number;
     winRate: number;
     
     totalRealizedPnl: number;
+    unrealizedPnl: number;
     totalFees: number;
     netPnl: number;
     

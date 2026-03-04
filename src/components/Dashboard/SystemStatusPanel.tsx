@@ -181,11 +181,11 @@ export const SystemStatusPanel = memo<SystemStatusPanelProps>(({ className = '' 
     return lastUpdated.toLocaleTimeString();
   }, [lastUpdated]);
 
-  if (isLoading && !health && !ready) {
+  if (isLoading && !health && !ready && !error && !riskError) {
     return (
       <div className={`bg-zinc-900/60 border border-zinc-800 rounded-lg p-4 ${className}`}>
-        <div className="flex items-center justify-center h-32">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
+        <div className="flex items-center justify-center h-32 text-sm text-zinc-500">
+          Initial system snapshot loading...
         </div>
       </div>
     );

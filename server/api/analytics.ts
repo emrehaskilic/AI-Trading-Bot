@@ -24,6 +24,7 @@ export interface AnalyticsSnapshotResponse {
   };
   trades: {
     totalTrades: number;
+    openPositions: number;
     winningTrades: number;
     losingTrades: number;
     winRate: number;
@@ -89,11 +90,12 @@ export function createAnalyticsRoutes(options: AnalyticsRoutesOptions): Router {
           totalRealizedPnl: snapshot.summary.totalRealizedPnl,
           totalFees: snapshot.summary.totalFees,
           netPnl: snapshot.summary.netPnl,
-          unrealizedPnl: 0,
+          unrealizedPnl: snapshot.summary.unrealizedPnl,
           totalReturn: 0,
         },
         trades: {
           totalTrades: snapshot.summary.totalTrades,
+          openPositions: snapshot.summary.openPositions,
           winningTrades: snapshot.summary.winningTrades,
           losingTrades: snapshot.summary.losingTrades,
           winRate: snapshot.summary.winRate,
@@ -159,7 +161,7 @@ export function createAnalyticsRoutes(options: AnalyticsRoutesOptions): Router {
           totalRealizedPnl: snapshot.summary.totalRealizedPnl,
           totalFees: snapshot.summary.totalFees,
           netPnl: snapshot.summary.netPnl,
-          unrealizedPnl: 0,
+          unrealizedPnl: snapshot.summary.unrealizedPnl,
           totalReturn: 0,
         },
         bySymbol: snapshot.bySymbol,
@@ -179,6 +181,7 @@ export function createAnalyticsRoutes(options: AnalyticsRoutesOptions): Router {
         timestamp: Date.now(),
         trades: {
           totalTrades: snapshot.summary.totalTrades,
+          openPositions: snapshot.summary.openPositions,
           winningTrades: snapshot.summary.winningTrades,
           losingTrades: snapshot.summary.losingTrades,
           winRate: snapshot.summary.winRate,

@@ -132,11 +132,15 @@ export const AnalyticsPanel = memo<AnalyticsPanelProps>(({ className = '' }) => 
     return 'text-red-400';
   }, [data?.drawdown.current]);
 
-  if (isLoading && !data) {
+  const totalTrades = data?.totalTrades ?? 0;
+  const openPositions = data?.openPositions ?? 0;
+  const hasTradeHistory = totalTrades > 0 || openPositions > 0;
+
+  if (isLoading && !data && !error) {
     return (
       <div className={`bg-zinc-900/60 border border-zinc-800 rounded-lg p-4 ${className}`}>
-        <div className="flex items-center justify-center h-48">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
+        <div className="flex items-center justify-center h-48 text-sm text-zinc-500">
+          Initial analytics snapshot loading...
         </div>
       </div>
     );
@@ -157,6 +161,12 @@ export const AnalyticsPanel = memo<AnalyticsPanelProps>(({ className = '' }) => 
           </span>
         )}
       </div>
+
+      {data && !error && !hasTradeHistory && (
+        <div className="mb-4 rounded-lg border border-blue-800/60 bg-blue-900/20 px-3 py-2 text-xs text-blue-300">
+          No open or completed trades yet. Analytics metrics will populate after first entry.
+        </div>
+      )}
 
       {/* PnL Section */}
       <div className="mb-4">

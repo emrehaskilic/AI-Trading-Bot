@@ -201,11 +201,11 @@ export const StrategyPanel = memo<StrategyPanelProps>(({ className = '', maxSign
     return 'text-red-400';
   }, [consensus?.agreementRatio]);
 
-  if (isLoading && !data) {
+  if (isLoading && !data && !error) {
     return (
       <div className={`bg-zinc-900/60 border border-zinc-800 rounded-lg p-4 ${className}`}>
-        <div className="flex items-center justify-center h-48">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
+        <div className="flex items-center justify-center h-48 text-sm text-zinc-500">
+          Initial strategy snapshot loading...
         </div>
       </div>
     );

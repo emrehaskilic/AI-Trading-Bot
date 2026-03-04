@@ -25,6 +25,7 @@ interface PositionState {
 export class PnLCalculator {
   private positions = new Map<string, PositionState>();
   private realizedPnL = new Map<string, RealizedPnL>();
+  private unrealizedBySymbol = new Map<string, UnrealizedPnL>();
   private feeBreakdown = new Map<string, FeeBreakdown>();
   private trades = new Map<string, TradeLifecycle>();
   private tradeCounter = 0;
@@ -233,22 +234,60 @@ export class PnLCalculator {
    */
   processPositionUpdate(update: PositionUpdateEvent): UnrealizedPnL {
     const { symbol, side, qty, entryPrice, markPrice, unrealizedPnl } = update;
-    
-    const notionalValue = qty * markPrice;
-    const unrealizedPnlPercent = entryPrice > 0 
-      ? (unrealizedPnl / (qty * entryPrice)) * 100 
+    const normalizedQty = Math.max(0, Number(qty || 0));
+    const normalizedEntry = Math.max(0, Number(entryPrice || 0));
+    const normalizedMark = Math.max(0, Number(markPrice || 0));
+    const normalizedUnrealized = Number.isFinite(Number(unrealizedPnl))
+      ? Number(unrealizedPnl)
+      : 0;
+    const effectiveSide: 'LONG' | 'SHORT' | 'FLAT' = normalizedQty > 0 ? side : 'FLAT';
+
+    const notionalValue = normalizedQty * normalizedMark;
+    const unrealizedPnlPercent = normalizedEntry > 0 && normalizedQty > 0
+      ? (normalizedUnrealized / (normalizedQty * normalizedEntry)) * 100 
       : 0;
 
-    return {
+    const snapshot: UnrealizedPnL = {
       symbol,
-      side,
-      qty,
-      entryPrice,
-      markPrice,
-      unrealizedPnl,
+      side: effectiveSide,
+      qty: normalizedQty,
+      entryPrice: normalizedEntry,
+      markPrice: normalizedMark,
+      unrealizedPnl: normalizedUnrealized,
       unrealizedPnlPercent,
       notionalValue,
     };
+
+    if (effectiveSide === 'FLAT' || normalizedQty <= 0) {
+      this.unrealizedBySymbol.delete(symbol);
+    } else {
+      this.unrealizedBySymbol.set(symbol, snapshot);
+    }
+
+    let position = this.positions.get(symbol);
+    if (!position) {
+      position = {
+        symbol,
+        side: 'FLAT',
+        qty: 0,
+        avgEntryPrice: 0,
+        totalFees: 0,
+        realizedPnl: 0,
+      };
+      this.positions.set(symbol, position);
+    }
+
+    if (effectiveSide === 'FLAT' || normalizedQty <= 0) {
+      position.side = 'FLAT';
+      position.qty = 0;
+      position.avgEntryPrice = 0;
+    } else {
+      position.side = effectiveSide;
+      position.qty = normalizedQty;
+      position.avgEntryPrice = normalizedEntry;
+    }
+
+    return snapshot;
   }
 
   /**
@@ -269,23 +308,14 @@ export class PnLCalculator {
    * Get unrealized PnL for a symbol
    */
   getUnrealizedPnL(symbol: string): UnrealizedPnL | undefined {
-    const position = this.positions.get(symbol);
-    if (!position || position.side === 'FLAT') {
-      return undefined;
-    }
+    return this.unrealizedBySymbol.get(symbol);
+  }
 
-    // This would need current mark price from external source
-    // For now, return basic structure
-    return {
-      symbol,
-      side: position.side,
-      qty: position.qty,
-      entryPrice: position.avgEntryPrice,
-      markPrice: position.avgEntryPrice, // Placeholder
-      unrealizedPnl: 0, // Would be calculated with mark price
-      unrealizedPnlPercent: 0,
-      notionalValue: position.qty * position.avgEntryPrice,
-    };
+  /**
+   * Get all unrealized PnL snapshots
+   */
+  getAllUnrealizedPnL(): UnrealizedPnL[] {
+    return Array.from(this.unrealizedBySymbol.values());
   }
 
   /**
@@ -337,6 +367,7 @@ export class PnLCalculator {
   reset(): void {
     this.positions.clear();
     this.realizedPnL.clear();
+    this.unrealizedBySymbol.clear();
     this.feeBreakdown.clear();
     this.trades.clear();
     this.tradeCounter = 0;

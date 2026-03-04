@@ -93,16 +93,35 @@ export function useResilience(): {
       '/api/resilience/snapshot',
       withProxyApiKey({ cache: 'no-store' }),
     );
+    const snapshotTs = Number(raw?.timestamp || Date.now());
+    const recentWindowMs = 60_000;
+    const recentActionsRaw = ((raw?.recentActions) || []).filter((action) => {
+      const actionTs = Number(action?.timestamp || 0);
+      if (!Number.isFinite(actionTs) || actionTs <= 0) return false;
+      const ageMs = snapshotTs - actionTs;
+      return ageMs >= 0 && ageMs <= recentWindowMs;
+    });
+
+    const recentByGuard = recentActionsRaw.reduce((acc, action) => {
+      acc[action.guardType] = (acc[action.guardType] || 0) + 1;
+      return acc;
+    }, {
+      anti_spoof: 0,
+      delta_burst: 0,
+      latency: 0,
+      flash_crash: 0,
+    } as Record<BackendResilienceSnapshot['recentActions'][number]['guardType'], number>);
+
     const triggerCounters: TriggerCounters = {
-      rateLimit: Number(raw?.triggerCounters?.antiSpoof || 0),
-      circuitBreaker: Number(raw?.triggerCounters?.flashCrash || 0),
-      throttle: Number(raw?.triggerCounters?.deltaBurst || 0),
+      rateLimit: recentByGuard.anti_spoof,
+      circuitBreaker: recentByGuard.flash_crash,
+      throttle: recentByGuard.delta_burst,
       requestDrop: 0,
-      errorSpike: Number(raw?.triggerCounters?.latencySpike || 0),
+      errorSpike: recentByGuard.latency,
       recovery: 0,
     };
 
-    const guardActions: GuardAction[] = ((raw?.recentActions) || []).map((action, index) => ({
+    const guardActions: GuardAction[] = recentActionsRaw.map((action, index) => ({
       id: `${action.guardType}-${action.timestamp}-${index}`,
       timestamp: new Date(action.timestamp).toISOString(),
       type: mapActionType(action.guardType),
@@ -116,10 +135,11 @@ export function useResilience(): {
     if (raw?.guards?.deltaBurst?.currentCooldownActive) activeGuards.push('delta_burst');
     if (raw?.guards?.flashCrash?.activeProtections) activeGuards.push('flash_crash');
 
-    const total = Number(raw?.triggerCounters?.total || 0);
+    const hasActiveProtection = raw?.guards?.deltaBurst?.currentCooldownActive || raw?.guards?.flashCrash?.activeProtections;
+    const hasRecentCritical = recentActionsRaw.some((action) => action.severity === 'high');
     const status = raw?.guards?.flashCrash?.activeProtections
       ? 'unhealthy'
-      : total > 0
+      : (hasActiveProtection || hasRecentCritical || recentActionsRaw.length > 0)
         ? 'degraded'
         : 'healthy';
 
@@ -130,7 +150,11 @@ export function useResilience(): {
       activeGuards,
       systemHealth: {
         status,
-        message: status === 'healthy' ? 'No active resilience suppressions' : 'Resilience protections active',
+        message: status === 'healthy'
+          ? 'No active resilience suppressions'
+          : status === 'unhealthy'
+            ? 'Critical resilience protections active'
+            : 'Recent resilience suppressions detected',
       },
       recentEvents: guardActions.slice(-10).map((action) => ({
         timestamp: action.timestamp,
