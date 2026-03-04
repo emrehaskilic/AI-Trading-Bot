@@ -2,6 +2,7 @@ import { useCallback, useMemo } from 'react';
 import { usePolling } from './usePolling';
 import { parsePrometheusMetrics, ParsedPrometheusMetrics, extractHistogramPercentiles } from '../utils/prometheusParser';
 import { withProxyApiKey } from '../services/proxyAuth';
+import { fetchApiJson, fetchApiText } from '../services/apiFetch';
 
 export interface TelemetrySnapshot {
   timestamp: number;
@@ -44,8 +45,6 @@ export interface MetricsData {
   };
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
-
 export function useMetrics(): {
   data: MetricsData | null;
   isLoading: boolean;
@@ -54,25 +53,17 @@ export function useMetrics(): {
   refresh: () => Promise<void>;
 } {
   const fetchPrometheus = useCallback(async (): Promise<string> => {
-    const response = await fetch(
-      `${API_BASE_URL}/metrics`,
+    return fetchApiText(
+      '/metrics',
       withProxyApiKey({ cache: 'no-store' }),
     );
-    if (!response.ok) {
-      throw new Error(`Metrics fetch failed: ${response.status} ${response.statusText}`);
-    }
-    return response.text();
   }, []);
 
   const fetchTelemetry = useCallback(async (): Promise<TelemetrySnapshot> => {
-    const response = await fetch(
-      `${API_BASE_URL}/api/telemetry/snapshot`,
+    return fetchApiJson<TelemetrySnapshot>(
+      '/api/telemetry/snapshot',
       withProxyApiKey({ cache: 'no-store' }),
     );
-    if (!response.ok) {
-      throw new Error(`Telemetry fetch failed: ${response.status} ${response.statusText}`);
-    }
-    return response.json();
   }, []);
 
   const prometheusPolling = usePolling<string>({
@@ -92,9 +83,14 @@ export function useMetrics(): {
   const parsedMetrics = useMemo((): MetricsData | null => {
     if (!prometheusPolling.data && !telemetryPolling.data) return null;
 
-    const prometheus = prometheusPolling.data
-      ? parsePrometheusMetrics(prometheusPolling.data)
-      : null;
+    let prometheus: ParsedPrometheusMetrics | null = null;
+    if (prometheusPolling.data) {
+      try {
+        prometheus = parsePrometheusMetrics(prometheusPolling.data);
+      } catch {
+        prometheus = null;
+      }
+    }
 
     const telemetry = telemetryPolling.data ?? null;
     const fromProm = prometheus

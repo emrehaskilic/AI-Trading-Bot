@@ -1,6 +1,7 @@
 import { useCallback, useMemo } from 'react';
 import { usePolling } from './usePolling';
 import { withProxyApiKey } from '../services/proxyAuth';
+import { fetchApiJson } from '../services/apiFetch';
 
 export type GuardActionType =
   | 'rate_limit_triggered'
@@ -70,8 +71,6 @@ interface BackendResilienceSnapshot {
   }>;
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
-
 function mapActionType(guardType: BackendResilienceSnapshot['recentActions'][number]['guardType']): GuardActionType {
   if (guardType === 'anti_spoof') return 'throttle_applied';
   if (guardType === 'delta_burst') return 'rate_limit_triggered';
@@ -90,25 +89,20 @@ export function useResilience(): {
   totalTriggers: number;
 } {
   const fetchResilience = useCallback(async (): Promise<ResilienceSnapshot> => {
-    const response = await fetch(
-      `${API_BASE_URL}/api/resilience/snapshot`,
+    const raw = await fetchApiJson<BackendResilienceSnapshot>(
+      '/api/resilience/snapshot',
       withProxyApiKey({ cache: 'no-store' }),
     );
-    if (!response.ok) {
-      throw new Error(`Resilience fetch failed: ${response.status} ${response.statusText}`);
-    }
-
-    const raw = (await response.json()) as BackendResilienceSnapshot;
     const triggerCounters: TriggerCounters = {
-      rateLimit: Number(raw.triggerCounters.antiSpoof || 0),
-      circuitBreaker: Number(raw.triggerCounters.flashCrash || 0),
-      throttle: Number(raw.triggerCounters.deltaBurst || 0),
+      rateLimit: Number(raw?.triggerCounters?.antiSpoof || 0),
+      circuitBreaker: Number(raw?.triggerCounters?.flashCrash || 0),
+      throttle: Number(raw?.triggerCounters?.deltaBurst || 0),
       requestDrop: 0,
-      errorSpike: Number(raw.triggerCounters.latencySpike || 0),
+      errorSpike: Number(raw?.triggerCounters?.latencySpike || 0),
       recovery: 0,
     };
 
-    const guardActions: GuardAction[] = (raw.recentActions || []).map((action, index) => ({
+    const guardActions: GuardAction[] = ((raw?.recentActions) || []).map((action, index) => ({
       id: `${action.guardType}-${action.timestamp}-${index}`,
       timestamp: new Date(action.timestamp).toISOString(),
       type: mapActionType(action.guardType),
@@ -119,18 +113,18 @@ export function useResilience(): {
     }));
 
     const activeGuards: string[] = [];
-    if (raw.guards.deltaBurst.currentCooldownActive) activeGuards.push('delta_burst');
-    if (raw.guards.flashCrash.activeProtections) activeGuards.push('flash_crash');
+    if (raw?.guards?.deltaBurst?.currentCooldownActive) activeGuards.push('delta_burst');
+    if (raw?.guards?.flashCrash?.activeProtections) activeGuards.push('flash_crash');
 
-    const total = Number(raw.triggerCounters.total || 0);
-    const status = raw.guards.flashCrash.activeProtections
+    const total = Number(raw?.triggerCounters?.total || 0);
+    const status = raw?.guards?.flashCrash?.activeProtections
       ? 'unhealthy'
       : total > 0
         ? 'degraded'
         : 'healthy';
 
     return {
-      timestamp: new Date(raw.timestamp).toISOString(),
+      timestamp: new Date(raw?.timestamp || Date.now()).toISOString(),
       guardActions,
       triggerCounters,
       activeGuards,

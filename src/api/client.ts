@@ -3,9 +3,7 @@
  */
 
 import { proxyWebSocketProtocols, withProxyApiKey } from '../services/proxyAuth';
-
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
-const WS_URL = import.meta.env.VITE_WS_URL || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
+import { getProxyApiBase, getProxyWsBase } from '../services/proxyBase';
 
 export interface RequestOptions {
   skipRetry?: boolean;
@@ -14,6 +12,7 @@ export interface RequestOptions {
 }
 
 async function request<T>(method: string, url: string, body?: unknown, options: RequestOptions = {}): Promise<T> {
+  const apiBase = getProxyApiBase();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeout ?? 30000);
   try {
@@ -27,7 +26,7 @@ async function request<T>(method: string, url: string, body?: unknown, options: 
       signal: controller.signal,
       cache: 'no-store',
     });
-    const response = await fetch(`${API_BASE_URL}${url}`, init);
+    const response = await fetch(`${apiBase}${url}`, init);
     if (!response.ok) {
       const text = await response.text().catch(() => '');
       throw new Error(text || `${response.status} ${response.statusText}`);
@@ -141,8 +140,9 @@ export function createWebSocketClient(
   symbols: string[],
   options: WebSocketClientOptions = {},
 ): WebSocket {
+  const wsBase = getProxyWsBase();
   const query = symbols.length > 0 ? `?symbols=${encodeURIComponent(symbols.join(','))}` : '';
-  const ws = new WebSocket(`${WS_URL}/ws${query}`, proxyWebSocketProtocols());
+  const ws = new WebSocket(`${wsBase}/ws${query}`, proxyWebSocketProtocols());
   ws.onopen = () => options.onConnect?.();
   ws.onclose = () => options.onDisconnect?.();
   ws.onerror = (error) => options.onError?.(error);

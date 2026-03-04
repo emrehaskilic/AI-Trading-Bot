@@ -1,6 +1,7 @@
 import { useCallback, useMemo } from 'react';
 import { usePolling } from './usePolling';
 import { withProxyApiKey } from '../services/proxyAuth';
+import { fetchApiJson } from '../services/apiFetch';
 
 export type RiskState = 'normal' | 'elevated' | 'high' | 'critical' | 'kill_switch';
 export type TradingMode = 'normal' | 'reduced' | 'paused' | 'emergency_close';
@@ -72,8 +73,6 @@ interface BackendRiskSnapshot {
   };
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
-
 function mapState(state: BackendRiskSnapshot['state']['current']): RiskState {
   if (state === 'KILL_SWITCH') return 'kill_switch';
   if (state === 'HALTED') return 'critical';
@@ -82,9 +81,9 @@ function mapState(state: BackendRiskSnapshot['state']['current']): RiskState {
 }
 
 function mapTradingMode(raw: BackendRiskSnapshot): TradingMode {
-  if (raw.killSwitch.active || raw.state.current === 'KILL_SWITCH') return 'emergency_close';
-  if (!raw.state.canTrade) return 'paused';
-  if (raw.state.isReducedRisk || raw.state.current === 'REDUCED_RISK') return 'reduced';
+  if (raw?.killSwitch?.active || raw?.state?.current === 'KILL_SWITCH') return 'emergency_close';
+  if (!raw?.state?.canTrade) return 'paused';
+  if (raw?.state?.isReducedRisk || raw?.state?.current === 'REDUCED_RISK') return 'reduced';
   return 'normal';
 }
 
@@ -98,46 +97,42 @@ export function useRisk(): {
   canTrade: boolean;
 } {
   const fetchRisk = useCallback(async (): Promise<RiskSnapshot> => {
-    const response = await fetch(
-      `${API_BASE_URL}/api/risk/snapshot`,
+    const raw = await fetchApiJson<BackendRiskSnapshot>(
+      '/api/risk/snapshot',
       withProxyApiKey({ cache: 'no-store' }),
     );
-    if (!response.ok) {
-      throw new Error(`Risk fetch failed: ${response.status} ${response.statusText}`);
-    }
-
-    const raw = (await response.json()) as BackendRiskSnapshot;
-    const state = mapState(raw.state.current);
+    const rawStateCurrent = raw?.state?.current || 'TRACKING';
+    const state = mapState(rawStateCurrent as BackendRiskSnapshot['state']['current']);
     const tradingMode = mapTradingMode(raw);
 
     return {
       timestamp: new Date(raw.timestamp).toISOString(),
       state,
       tradingMode,
-      killSwitchActive: Boolean(raw.killSwitch.active),
-      killSwitchReason: raw.killSwitch.reason || undefined,
+      killSwitchActive: Boolean(raw?.killSwitch?.active),
+      killSwitchReason: raw?.killSwitch?.reason || undefined,
       limits: {
-        maxPositionSize: Number(raw.limits.maxPositionNotional || 0),
-        maxDailyLoss: Number(raw.limits.dailyLossLimit || 0),
-        maxDrawdown: Number(raw.limits.reducedRiskPositionMultiplier || 0),
-        maxLeverage: Number(raw.limits.maxLeverage || 0),
+        maxPositionSize: Number(raw?.limits?.maxPositionNotional || 0),
+        maxDailyLoss: Number(raw?.limits?.dailyLossLimit || 0),
+        maxDrawdown: Number(raw?.limits?.reducedRiskPositionMultiplier || 0),
+        maxLeverage: Number(raw?.limits?.maxLeverage || 0),
       },
       exposure: {
-        totalPosition: Number(raw.exposure.totalPositionNotional || 0),
-        marginUsed: Number(raw.exposure.totalMarginUsed || 0),
-        availableMargin: Number(raw.exposure.availableMargin || 0),
-        leverage: Number(raw.limits.maxLeverage || 0),
-        concentration: Number(raw.exposure.marginUtilizationPercent || 0) / 100,
+        totalPosition: Number(raw?.exposure?.totalPositionNotional || 0),
+        marginUsed: Number(raw?.exposure?.totalMarginUsed || 0),
+        availableMargin: Number(raw?.exposure?.availableMargin || 0),
+        leverage: Number(raw?.limits?.maxLeverage || 0),
+        concentration: Number(raw?.exposure?.marginUtilizationPercent || 0) / 100,
       },
       utilization: {
-        position: Number(raw.exposure.marginUtilizationPercent || 0) / 100,
+        position: Number(raw?.exposure?.marginUtilizationPercent || 0) / 100,
         dailyLoss: 0,
-        drawdown: raw.state.current === 'REDUCED_RISK' ? 0.5 : raw.state.current === 'HALTED' ? 1 : 0,
-        leverage: Number(raw.limits.maxLeverage || 0) > 0
-          ? Number(raw.exposure.totalMarginUsed || 0) / Math.max(1, Number(raw.limits.maxLeverage || 1))
+        drawdown: rawStateCurrent === 'REDUCED_RISK' ? 0.5 : rawStateCurrent === 'HALTED' ? 1 : 0,
+        leverage: Number(raw?.limits?.maxLeverage || 0) > 0
+          ? Number(raw?.exposure?.totalMarginUsed || 0) / Math.max(1, Number(raw?.limits?.maxLeverage || 1))
           : 0,
       },
-      alerts: (raw.triggers.recentTriggers || []).slice(-5).map((trigger) => ({
+      alerts: ((raw?.triggers?.recentTriggers) || []).slice(-5).map((trigger) => ({
         level: state === 'critical' || state === 'kill_switch' ? 'critical' : 'warning',
         message: String(trigger.reason || 'risk_triggered'),
         timestamp: new Date(trigger.timestamp || raw.timestamp).toISOString(),

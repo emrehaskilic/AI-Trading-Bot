@@ -9,7 +9,7 @@ type AppTab = 'ui-v1' | 'telemetry' | 'dry-run';
 function tabFromHash(hash: string): AppTab {
   if (hash === '#ui-v1') return 'ui-v1';
   if (hash === '#dry-run') return 'dry-run';
-  return 'telemetry';
+  return 'ui-v1';
 }
 
 const Dashboard: React.FC = () => {

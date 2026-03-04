@@ -1,6 +1,7 @@
 import { useCallback, useMemo } from 'react';
 import { usePolling } from './usePolling';
 import { withProxyApiKey } from '../services/proxyAuth';
+import { fetchApiJson } from '../services/apiFetch';
 
 export type SignalDirection = 'buy' | 'sell' | 'neutral';
 export type SignalStrength = 'strong' | 'moderate' | 'weak';
@@ -56,8 +57,6 @@ interface BackendStrategySnapshot {
   }>;
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
-
 function toDirection(side: 'LONG' | 'SHORT' | 'FLAT'): SignalDirection {
   if (side === 'LONG') return 'buy';
   if (side === 'SHORT') return 'sell';
@@ -80,16 +79,11 @@ export function useStrategy(): {
   getSignalsByDirection: (direction: SignalDirection) => StrategySignal[];
 } {
   const fetchStrategy = useCallback(async (): Promise<StrategySnapshot> => {
-    const response = await fetch(
-      `${API_BASE_URL}/api/strategy/snapshot`,
+    const raw = await fetchApiJson<BackendStrategySnapshot>(
+      '/api/strategy/snapshot',
       withProxyApiKey({ cache: 'no-store' }),
     );
-    if (!response.ok) {
-      throw new Error(`Strategy fetch failed: ${response.status} ${response.statusText}`);
-    }
-
-    const raw = (await response.json()) as BackendStrategySnapshot;
-    const signals: StrategySignal[] = (raw.signals || []).map((signal) => {
+    const signals: StrategySignal[] = ((raw?.signals) || []).map((signal) => {
       const direction = toDirection(signal.side);
       const metadata = signal.metadata || {};
       const symbol = typeof metadata.symbol === 'string' ? String(metadata.symbol) : 'N/A';
@@ -126,9 +120,9 @@ export function useStrategy(): {
     }
 
     return {
-      timestamp: new Date(raw.timestamp).toISOString(),
+      timestamp: new Date(raw?.timestamp || Date.now()).toISOString(),
       consensus: {
-        timestamp: new Date(raw.timestamp).toISOString(),
+        timestamp: new Date(raw?.timestamp || Date.now()).toISOString(),
         direction: consensusDirection,
         confidence: Number(consensus?.confidence || 0),
         agreementRatio,

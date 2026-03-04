@@ -1,6 +1,7 @@
 import { useCallback, useMemo } from 'react';
 import { usePolling } from './usePolling';
 import { withProxyApiKey } from '../services/proxyAuth';
+import { fetchApiJson } from '../services/apiFetch';
 
 export interface HealthStatus {
   status: 'healthy' | 'unhealthy' | 'degraded';
@@ -25,8 +26,6 @@ export interface HealthState {
   lastUpdated: Date | null;
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
-
 function toIso(value: unknown): string {
   if (typeof value === 'string') return value;
   if (typeof value === 'number' && Number.isFinite(value)) return new Date(value).toISOString();
@@ -35,14 +34,10 @@ function toIso(value: unknown): string {
 
 export function useHealth(): HealthState & { refresh: () => Promise<void> } {
   const fetchHealth = useCallback(async (): Promise<HealthStatus> => {
-    const response = await fetch(
-      `${API_BASE_URL}/health`,
+    const raw = await fetchApiJson<any>(
+      '/health',
       withProxyApiKey({ cache: 'no-store' }),
     );
-    if (!response.ok) {
-      throw new Error(`Health check failed: ${response.status} ${response.statusText}`);
-    }
-    const raw = await response.json();
     const statusRaw = String(raw?.status || '').toUpperCase();
     const status = statusRaw === 'HEALTHY'
       ? 'healthy'
@@ -59,14 +54,10 @@ export function useHealth(): HealthState & { refresh: () => Promise<void> } {
   }, []);
 
   const fetchReady = useCallback(async (): Promise<ReadyStatus> => {
-    const response = await fetch(
-      `${API_BASE_URL}/ready`,
+    const raw = await fetchApiJson<any>(
+      '/ready',
       withProxyApiKey({ cache: 'no-store' }),
     );
-    if (!response.ok) {
-      throw new Error(`Ready check failed: ${response.status} ${response.statusText}`);
-    }
-    const raw = await response.json();
     const dependencies = raw?.dependencies || raw?.checks || {};
     const ready = String(raw?.status || '').toUpperCase() === 'READY' || Boolean(raw?.ready);
 

@@ -1,5 +1,7 @@
-import React, { memo, useState, useCallback, Suspense } from 'react';
+import React, { memo, useState, useCallback, Suspense, useRef } from 'react';
 import { PanelErrorBoundary } from '../ErrorBoundary';
+import { useHealth } from '../../hooks/useHealth';
+import { useMetrics } from '../../hooks/useMetrics';
 
 // Lazy load panels for code splitting
 const SystemStatusPanel = React.lazy(() => import('./SystemStatusPanel'));
@@ -76,14 +78,38 @@ const DashboardHeader = memo<DashboardHeaderProps>(({ onRefresh, isRefreshing })
 DashboardHeader.displayName = 'DashboardHeader';
 
 interface ConnectionStatusBarProps {
-  connected: boolean;
+  state: 'connected' | 'degraded' | 'disconnected' | 'connecting';
 }
 
-const ConnectionStatusBar = memo<ConnectionStatusBarProps>(({ connected }) => (
-  <div className={`px-4 py-1 text-xs text-center ${connected ? 'bg-green-900/20 text-green-400' : 'bg-red-900/20 text-red-400'}`}>
+const ConnectionStatusBar = memo<ConnectionStatusBarProps>(({ state }) => (
+  <div className={`px-4 py-1 text-xs text-center ${
+    state === 'connected'
+      ? 'bg-green-900/20 text-green-400'
+      : state === 'connecting'
+        ? 'bg-blue-900/20 text-blue-400'
+      : state === 'degraded'
+        ? 'bg-yellow-900/20 text-yellow-400'
+        : 'bg-red-900/20 text-red-400'
+  }`}>
     <div className="flex items-center justify-center space-x-2">
-      <span className={`w-2 h-2 rounded-full ${connected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></span>
-      <span>{connected ? 'Connected to trading system' : 'Disconnected from trading system'}</span>
+      <span className={`w-2 h-2 rounded-full ${
+        state === 'connected'
+          ? 'bg-green-500 animate-pulse'
+          : state === 'connecting'
+            ? 'bg-blue-500 animate-pulse'
+          : state === 'degraded'
+            ? 'bg-yellow-500 animate-pulse'
+            : 'bg-red-500'
+      }`}></span>
+      <span>{
+        state === 'connected'
+          ? 'Connected to trading system'
+          : state === 'connecting'
+            ? 'Connecting to trading system'
+          : state === 'degraded'
+            ? 'Connected, waiting telemetry data'
+            : 'Disconnected from trading system'
+      }</span>
     </div>
   </div>
 ));
@@ -108,7 +134,26 @@ ConnectionStatusBar.displayName = 'ConnectionStatusBar';
  */
 const Dashboard: React.FC = () => {
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [isConnected, setIsConnected] = useState(true);
+  const mountedAtRef = useRef<number>(Date.now());
+  const { health, error: healthError } = useHealth();
+  const { data: metricsData, error: metricsError } = useMetrics();
+  const hasHealthData = Boolean(health);
+  const hasTelemetryData = Boolean(metricsData);
+  const hasAnyData = hasHealthData || hasTelemetryData;
+  const hasAnyError = Boolean(healthError || metricsError);
+  const isWithinGrace = Date.now() - mountedAtRef.current < 15000;
+
+  const connectionState: 'connected' | 'degraded' | 'disconnected' | 'connecting' = (
+    hasHealthData && hasTelemetryData
+      ? 'connected'
+      : hasAnyData
+        ? 'degraded'
+        : hasAnyError
+          ? 'disconnected'
+          : isWithinGrace
+            ? 'connecting'
+            : 'disconnected'
+  );
 
   const handleRefresh = useCallback(async () => {
     setIsRefreshing(true);
@@ -121,7 +166,7 @@ const Dashboard: React.FC = () => {
   return (
     <div className="min-h-screen bg-zinc-950">
       <DashboardHeader onRefresh={handleRefresh} isRefreshing={isRefreshing} />
-      <ConnectionStatusBar connected={isConnected} />
+      <ConnectionStatusBar state={connectionState} />
       
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
         {/* Top Row - System Status & Telemetry */}
@@ -157,7 +202,7 @@ const Dashboard: React.FC = () => {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between text-xs text-zinc-600">
             <div>
-              Trading Dashboard v1.0 | 
+              Trading Dashboard v1.1 | 
               <span className="ml-1">Polling: Health 1s | Metrics/Analytics/Strategy 2s | Risk 1s</span>
             </div>
             <div>
