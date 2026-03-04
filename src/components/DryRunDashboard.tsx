@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import SymbolRow from './SymbolRow';
 import MobileSymbolCard from './MobileSymbolCard';
-import { useTelemetrySocket } from '../services/useTelemetrySocket';
+import { TelemetrySocketStatus, useTelemetrySocket } from '../services/useTelemetrySocket';
 import { withProxyApiKey } from '../services/proxyAuth';
 import { getProxyApiBase } from '../services/proxyBase';
 import { MetricsMessage } from '../types/metrics';
@@ -153,6 +153,19 @@ const formatTs = (ts: number): string => {
   return new Date(ts).toLocaleTimeString();
 };
 
+const normalizeSymbol = (value: string): string => String(value || '').trim().toUpperCase();
+
+const normalizeSymbolList = (values: string[]): string[] => {
+  const unique = new Set<string>();
+  for (const raw of values) {
+    const symbol = normalizeSymbol(raw);
+    if (symbol) {
+      unique.add(symbol);
+    }
+  }
+  return [...unique];
+};
+
 const DryRunDashboard: React.FC = () => {
   const proxyUrl = getProxyApiBase();
   const fetchWithAuth = (url: string, init?: RequestInit) => fetch(url, withProxyApiKey(init));
@@ -172,14 +185,15 @@ const DryRunDashboard: React.FC = () => {
   const [heartbeatSec, setHeartbeatSec] = useState('10');
   const [debugAggressiveEntry, setDebugAggressiveEntry] = useState(true);
   const [isRefreshingPositions, setIsRefreshingPositions] = useState(false);
+  const [telemetryWsStatus, setTelemetryWsStatus] = useState<TelemetrySocketStatus>('connecting');
 
   const [testOrderSymbol, setTestOrderSymbol] = useState('BTCUSDT');
 
-  const activeMetricSymbols = useMemo(
-    () => (status.running && status.symbols.length > 0 ? status.symbols : selectedPairs),
-    [status.running, status.symbols, selectedPairs]
-  );
-  const marketData = useTelemetrySocket(activeMetricSymbols);
+  const activeMetricSymbols = useMemo(() => {
+    const source = status.running && status.symbols.length > 0 ? status.symbols : selectedPairs;
+    return normalizeSymbolList(source);
+  }, [status.running, status.symbols, selectedPairs]);
+  const marketData = useTelemetrySocket(activeMetricSymbols, setTelemetryWsStatus);
 
   useEffect(() => {
     const loadPairs = async () => {
@@ -193,7 +207,7 @@ const DryRunDashboard: React.FC = () => {
         }
         const data = await res.json();
         const pairs = Array.isArray(data?.symbols)
-          ? data.symbols.filter((p: unknown): p is string => typeof p === 'string' && p.length > 0)
+          ? normalizeSymbolList(data.symbols.filter((p: unknown): p is string => typeof p === 'string' && p.length > 0))
           : [];
         if (pairs.length === 0) {
           throw new Error('symbols_empty');
@@ -217,7 +231,7 @@ const DryRunDashboard: React.FC = () => {
           const cachedRaw = window.localStorage.getItem('orderflow.symbols.cache');
           const cachedParsed = cachedRaw ? JSON.parse(cachedRaw) : [];
           if (Array.isArray(cachedParsed)) {
-            fallbackPairs = cachedParsed.filter((p: unknown): p is string => typeof p === 'string' && p.length > 0);
+            fallbackPairs = normalizeSymbolList(cachedParsed.filter((p: unknown): p is string => typeof p === 'string' && p.length > 0));
           }
         } catch {
           fallbackPairs = [];
@@ -252,8 +266,9 @@ const DryRunDashboard: React.FC = () => {
           const next = data.status as DryRunStatus;
           setStatus(next);
           if (next.running && next.symbols.length > 0) {
-            setSelectedPairs(next.symbols);
-            setTestOrderSymbol(next.symbols[0]);
+            const normalized = normalizeSymbolList(next.symbols);
+            setSelectedPairs(normalized);
+            setTestOrderSymbol(normalized[0]);
           } else if (!next.running && next.config) {
             setStartBalance(String(next.config.walletBalanceStartUsdt));
             setInitialMargin(String(next.config.initialMarginUsdt));
@@ -287,11 +302,13 @@ const DryRunDashboard: React.FC = () => {
   );
 
   const togglePair = (pair: string) => {
+    const normalizedPair = normalizeSymbol(pair);
+    if (!normalizedPair) return;
     setSelectedPairs((prev) => {
-      if (prev.includes(pair)) {
-        return prev.filter((p) => p !== pair);
+      if (prev.includes(normalizedPair)) {
+        return prev.filter((p) => p !== normalizedPair);
       }
-      return [...prev, pair];
+      return [...prev, normalizedPair];
     });
   };
 
@@ -391,6 +408,105 @@ const DryRunDashboard: React.FC = () => {
   const perf = summary.performance || DEFAULT_STATUS.summary.performance!;
   const marginHealthPct = summary.marginHealth * 100;
   const symbolRows = useMemo(() => Object.values(status.perSymbol), [status.perSymbol]);
+  const resolvedMarketData = useMemo(() => {
+    const next: Record<string, MetricsMessage> = {};
+
+    for (const rawSymbol of activeMetricSymbols) {
+      const symbol = normalizeSymbol(rawSymbol);
+      if (!symbol) continue;
+
+      const live = marketData[symbol] || marketData[rawSymbol];
+      if (live) {
+        next[symbol] = live;
+        continue;
+      }
+
+      const row = status.perSymbol[symbol] || status.perSymbol[rawSymbol];
+      if (!row) {
+        continue;
+      }
+
+      const markPrice = Number(row.metrics?.markPrice || row.position?.markPrice || 0);
+      const side = row.position?.side;
+      const eventTs = Number(row.lastEventTimestampMs || 0) || Date.now();
+      const eventCount = Number(row.eventCount || 0);
+
+      next[symbol] = {
+        type: 'metrics',
+        symbol,
+        state: markPrice > 0 ? 'LIVE' : 'UNKNOWN',
+        event_time_ms: eventTs,
+        snapshot: {
+          eventId: eventCount,
+          stateHash: `dryrun-fallback-${status.runId || 'local'}-${symbol}-${eventCount}`,
+          ts: eventTs,
+        },
+        timeAndSales: {
+          aggressiveBuyVolume: 0,
+          aggressiveSellVolume: 0,
+          tradeCount: eventCount,
+          smallTrades: 0,
+          midTrades: 0,
+          largeTrades: 0,
+          bidHitAskLiftRatio: 0,
+          consecutiveBurst: { side: 'buy', count: 0 },
+          printsPerSecond: 0,
+        },
+        cvd: {
+          tf1m: { cvd: 0, delta: 0, state: 'Normal' },
+          tf5m: { cvd: 0, delta: 0, state: 'Normal' },
+          tf15m: { cvd: 0, delta: 0, state: 'Normal' },
+        },
+        absorption: null,
+        openInterest: null,
+        funding: null,
+        legacyMetrics: {
+          price: markPrice,
+          obiWeighted: 0,
+          obiDeep: 0,
+          obiDivergence: 0,
+          delta1s: 0,
+          delta5s: 0,
+          deltaZ: 0,
+          cvdSession: 0,
+          cvdSlope: 0,
+          vwap: markPrice,
+          totalVolume: 0,
+          totalNotional: 0,
+          tradeCount: eventCount,
+        },
+        signalDisplay: {
+          signal: side === 'LONG' ? 'POSITION_LONG' : side === 'SHORT' ? 'POSITION_SHORT' : 'NONE',
+          score: side ? 100 : 0,
+          confidence: side ? 'HIGH' : 'LOW',
+          vetoReason: side ? null : 'DRYRUN_WS_FALLBACK',
+          candidate: null,
+        },
+        strategyPosition: side && row.position
+          ? {
+              side,
+              qty: Number(row.position.qty || 0),
+              entryPrice: Number(row.position.entryPrice || 0),
+              unrealizedPnlPct: Number(row.position.entryPrice || 0) > 0
+                ? (Number(row.position.unrealizedPnl || 0) / Math.max(1e-9, Number(row.position.entryPrice || 0) * Math.max(1e-9, Number(row.position.qty || 0)))) * 100
+                : 0,
+              addsUsed: 0,
+              timeInPositionMs: 0,
+            }
+          : null,
+        advancedMetrics: {
+          sweepFadeScore: 0,
+          breakoutScore: 0,
+          volatilityIndex: 0,
+        },
+        bids: [],
+        asks: [],
+        midPrice: markPrice > 0 ? markPrice : null,
+      };
+    }
+
+    return next;
+  }, [activeMetricSymbols, marketData, status.perSymbol, status.runId]);
 
   const logLines = useMemo(() => {
     return status.logTail.slice(-200).map((item) => {
@@ -764,7 +880,13 @@ const DryRunDashboard: React.FC = () => {
         <div className="bg-gradient-to-br from-zinc-900 to-zinc-950 border border-zinc-800 rounded-lg overflow-hidden shadow-2xl">
           <div className="px-4 py-3 flex items-center justify-between text-xs uppercase tracking-wider text-zinc-400 border-b border-zinc-800 bg-zinc-900/70">
             <span>Live Orderflow Metrics (Selected Pairs)</span>
-            <span className="text-[10px] normal-case tracking-normal text-zinc-500">Click any row to expand details</span>
+            <span className="text-[10px] normal-case tracking-normal text-zinc-500">
+              {telemetryWsStatus === 'open'
+                ? 'Click any row to expand details'
+                : telemetryWsStatus === 'connecting'
+                  ? 'Telemetry connecting...'
+                  : 'Telemetry reconnecting...'}
+            </span>
           </div>
           <div className="hidden md:block overflow-x-auto">
             <div className="min-w-[1100px]">
@@ -784,11 +906,18 @@ const DryRunDashboard: React.FC = () => {
               </div>
               <div className="bg-black/30 divide-y divide-zinc-900">
                 {activeMetricSymbols.map((symbol) => {
-                  const msg: MetricsMessage | undefined = marketData[symbol];
+                  const normalizedSymbol = normalizeSymbol(symbol);
+                  const msg: MetricsMessage | undefined =
+                    resolvedMarketData[normalizedSymbol] || resolvedMarketData[symbol];
                   if (!msg) {
+                    const waitingText = telemetryWsStatus === 'open'
+                      ? `Waiting metrics for ${symbol}...`
+                      : telemetryWsStatus === 'connecting'
+                        ? `Connecting telemetry for ${symbol}...`
+                        : `Telemetry disconnected for ${symbol}, reconnecting...`;
                     return (
                       <div key={symbol} className="px-5 py-4 text-xs text-zinc-600 italic">
-                        Waiting metrics for {symbol}...
+                        {waitingText}
                       </div>
                     );
                   }
@@ -800,7 +929,12 @@ const DryRunDashboard: React.FC = () => {
 
           <div className="md:hidden p-3 space-y-3">
             {activeMetricSymbols.map((symbol) => (
-              <MobileSymbolCard key={symbol} symbol={symbol} metrics={marketData[symbol]} showLatency={false} />
+              <MobileSymbolCard
+                key={symbol}
+                symbol={symbol}
+                metrics={resolvedMarketData[normalizeSymbol(symbol)] || resolvedMarketData[symbol]}
+                showLatency={false}
+              />
             ))}
           </div>
         </div>

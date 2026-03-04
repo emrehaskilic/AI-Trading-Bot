@@ -86,6 +86,7 @@ import {
     ExampleMeanRevertStrategy,
     ExampleTrendFollowStrategy,
     SignalSide as StrategySignalSide,
+    type StrategySignal,
     StrategyContextBuilder,
     StrategyRegistry,
 } from './strategies';
@@ -96,6 +97,14 @@ import {
     RiskState as TelemetryRiskState,
 } from './telemetry';
 import { initializeProductionReadiness } from './integration';
+import {
+    createAnalyticsRoutes,
+    createResilienceRoutes,
+    createRiskRoutes,
+    createStrategyRoutes,
+    createTelemetryRoutes,
+    type GuardAction as ResilienceGuardAction,
+} from './api';
 
 // =============================================================================
 // Configuration
@@ -431,6 +440,7 @@ strategyRegistry.register(new ExampleTrendFollowStrategy());
 strategyRegistry.register(new ExampleMeanRevertStrategy());
 strategyRegistry.register(new ExampleChopFilterStrategy());
 const consensusEngine = new ConsensusEngine();
+const strategySignalsBySymbol = new Map<string, StrategySignal[]>();
 const strategyConsensusBySymbol = new Map<string, {
     timestampMs: number;
     side: 'LONG' | 'SHORT' | 'FLAT';
@@ -440,6 +450,13 @@ const strategyConsensusBySymbol = new Map<string, {
     contributingStrategies: number;
     totalStrategies: number;
 }>();
+const resilienceGuardActions: ResilienceGuardAction[] = [];
+const resilienceTriggerCounters = {
+    antiSpoof: 0,
+    deltaBurst: 0,
+    latencySpike: 0,
+    flashCrash: 0,
+};
 const abTestManager = new ABTestManager(alertService);
 const marketArchive = new MarketDataArchive();
 const signalReplay = new SignalReplay(marketArchive);
@@ -522,6 +539,47 @@ function logAnalyticsError(kind: string, symbol: string | null, error: unknown):
         symbol,
         error: serializeError(error),
     });
+}
+
+function trackResilience(reason: string, symbol: string, action: string, timestamp: number): void {
+    const normalized = String(reason || '').toLowerCase();
+    let guardType: ResilienceGuardAction['guardType'] = 'latency';
+    let counterKey: keyof typeof resilienceTriggerCounters = 'latencySpike';
+    let severity: ResilienceGuardAction['severity'] = 'low';
+
+    if (normalized.includes('spoof')) {
+        guardType = 'anti_spoof';
+        counterKey = 'antiSpoof';
+    } else if (normalized.includes('delta_burst') || normalized.includes('burst')) {
+        guardType = 'delta_burst';
+        counterKey = 'deltaBurst';
+    } else if (normalized.includes('flash_crash') || normalized.includes('flash')) {
+        guardType = 'flash_crash';
+        counterKey = 'flashCrash';
+        severity = 'high';
+    } else {
+        guardType = 'latency';
+        counterKey = 'latencySpike';
+    }
+
+    if (normalized.includes('kill') || normalized.includes('halt') || normalized.includes('critical')) {
+        severity = 'high';
+    } else if (normalized.includes('suppress') || normalized.includes('cooldown')) {
+        severity = 'medium';
+    }
+
+    resilienceTriggerCounters[counterKey] += 1;
+    resilienceGuardActions.push({
+        guardType,
+        timestamp,
+        symbol,
+        action,
+        reason,
+        severity,
+    });
+    if (resilienceGuardActions.length > 500) {
+        resilienceGuardActions.splice(0, resilienceGuardActions.length - 500);
+    }
 }
 
 const executionConnector = orchestrator.getConnector();
@@ -2914,6 +2972,7 @@ function broadcastMetrics(
             }, resolvedRiskState, canonicalTimeMs);
 
             strategySignals = strategyRegistry.evaluateAll(strategyContext);
+            strategySignalsBySymbol.set(s, strategySignals.map((signal) => ({ ...signal })));
             consensusDecision = consensusEngine.evaluate(strategySignals, resolvedRiskState, canonicalTimeMs);
             observabilityMetrics.recordDecisionConfidence(
                 Math.max(0, Math.min(1, Number(consensusDecision.confidence || 0)))
@@ -3011,10 +3070,20 @@ function broadcastMetrics(
             });
         }
     } else {
+        strategySignalsBySymbol.delete(s);
         strategyConsensusBySymbol.delete(s);
     }
 
     if (RESILIENCE_PATCHES_ENABLED && resilienceGuardResult) {
+        if (resilienceGuardResult.reasons.length > 0 || resilienceGuardResult.action !== 'ALLOW') {
+            if (resilienceGuardResult.reasons.length === 0) {
+                trackResilience('guard_action', s, resilienceGuardResult.action, canonicalTimeMs);
+            } else {
+                for (const reason of resilienceGuardResult.reasons) {
+                    trackResilience(reason, s, resilienceGuardResult.action, canonicalTimeMs);
+                }
+            }
+        }
         if (resilienceGuardResult.action === 'KILL_SWITCH' && RISK_ENGINE_ENABLED && institutionalRiskEngine.getRiskState() !== RiskState.KILL_SWITCH) {
             institutionalRiskEngine.activateKillSwitch(`ResiliencePatches blocked ${s}: ${resilienceGuardResult.reasons.join(',')}`);
         } else if (resilienceGuardResult.action === 'HALT' && RISK_ENGINE_ENABLED) {
@@ -3231,6 +3300,42 @@ function broadcastMetrics(
     }
 }
 
+
+function resolveDashboardSymbol(requested?: string): string | undefined {
+    const normalized = String(requested || '').trim().toUpperCase();
+    if (normalized && strategySignalsBySymbol.has(normalized)) {
+        return normalized;
+    }
+    if (normalized && strategyConsensusBySymbol.has(normalized)) {
+        return normalized;
+    }
+    const fromSignals = strategySignalsBySymbol.keys().next();
+    if (!fromSignals.done) {
+        return fromSignals.value;
+    }
+    const fromConsensus = strategyConsensusBySymbol.keys().next();
+    if (!fromConsensus.done) {
+        return fromConsensus.value;
+    }
+    const active = activeSymbols.values().next();
+    if (!active.done) {
+        return active.value;
+    }
+    return undefined;
+}
+
+function getDashboardStrategySignals(symbol?: string): StrategySignal[] {
+    const target = resolveDashboardSymbol(symbol);
+    if (!target) return [];
+    return (strategySignalsBySymbol.get(target) || []).map((signal) => ({ ...signal }));
+}
+
+function getDashboardRiskState(): RiskState {
+    if (!RISK_ENGINE_ENABLED) {
+        return RiskState.TRACKING;
+    }
+    return institutionalRiskEngine.getRiskState();
+}
 
 // =============================================================================
 // Server
@@ -3823,6 +3928,64 @@ app.get('/api/risk/status', (_req, res) => {
         summary: RISK_ENGINE_ENABLED ? institutionalRiskEngine.getRiskSummary() : null,
     });
 });
+
+app.use('/api/telemetry', createTelemetryRoutes({
+    metricsCollector: observabilityMetrics.collector,
+    latencyTracker,
+    getUptimeMs: () => healthController.getUptime(),
+}));
+
+app.use('/api/strategy', createStrategyRoutes({
+    consensusEngine,
+    getCurrentSignals: (symbol?: string) => getDashboardStrategySignals(symbol),
+    getCurrentRiskState: () => getDashboardRiskState(),
+}));
+
+app.use('/api/risk', createRiskRoutes({
+    riskStateManager: institutionalRiskEngine.getStateManager(),
+    killSwitchManager: {
+        isActive: () => institutionalRiskEngine.getGuards().killSwitch.isKillSwitchActive(),
+        getLastTrigger: () => {
+            const events = institutionalRiskEngine.getGuards().killSwitch.getKillSwitchEvents();
+            const last = events.length > 0 ? events[events.length - 1] : null;
+            if (!last) return null;
+            return { timestamp: last.timestamp, reason: last.reason };
+        },
+    },
+    getPositionExposure: () => {
+        const summary = RISK_ENGINE_ENABLED ? institutionalRiskEngine.getRiskSummary() : null;
+        const totalPositionNotional = Number(summary?.guards?.multiSymbol?.totalNotional || 0);
+        const leverageBase = Math.max(1, Number(RISK_ENGINE_CONFIG.position.maxLeverage || 1));
+        const totalMarginUsed = totalPositionNotional / leverageBase;
+        const availableMargin = Math.max(0, riskEngineLastKnownEquity - totalMarginUsed);
+        const marginUtilizationPercent = riskEngineLastKnownEquity > 0
+            ? (totalMarginUsed / riskEngineLastKnownEquity) * 100
+            : 0;
+        return {
+            totalPositionNotional,
+            totalMarginUsed,
+            availableMargin,
+            marginUtilizationPercent,
+        };
+    },
+    riskLimits: {
+        maxPositionNotional: Number(RISK_ENGINE_CONFIG.position.maxPositionNotional || 0),
+        maxLeverage: Number(RISK_ENGINE_CONFIG.position.maxLeverage || 0),
+        maxPositionQty: Number(RISK_ENGINE_CONFIG.position.maxPositionQty || 0),
+        dailyLossLimit: Number(RISK_ENGINE_CONFIG.drawdown.dailyLossLimitRatio || 0) * riskEngineLastKnownEquity,
+        reducedRiskPositionMultiplier: Number(RISK_ENGINE_CONFIG.state.reducedRiskPositionMultiplier || 1),
+    },
+}));
+
+app.use('/api/resilience', createResilienceRoutes({
+    latencyTracker,
+    getGuardActions: () => resilienceGuardActions,
+    getTriggerCounters: () => ({ ...resilienceTriggerCounters }),
+}));
+
+app.use('/api/analytics', createAnalyticsRoutes({
+    analyticsEngine,
+}));
 
 app.post('/api/abtest/start', (req, res) => {
     try {

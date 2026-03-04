@@ -1,26 +1,33 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import LiveTelemetryDashboard from './LiveTelemetryDashboard';
 import DryRunDashboard from './DryRunDashboard';
+import { Dashboard as DashboardV1 } from './Dashboard/index';
 import { isViewerModeEnabled } from '../services/proxyAuth';
 
-type AppTab = 'telemetry' | 'dry-run';
+type AppTab = 'ui-v1' | 'telemetry' | 'dry-run';
 
 function tabFromHash(hash: string): AppTab {
+  if (hash === '#ui-v1') return 'ui-v1';
   if (hash === '#dry-run') return 'dry-run';
-  return 'telemetry';
+  return 'ui-v1';
 }
 
 const Dashboard: React.FC = () => {
   const readonlyViewer = useMemo(() => isViewerModeEnabled(), []);
   const [activeTab, setActiveTab] = useState<AppTab>(() => {
     const initial = tabFromHash(window.location.hash);
-    return readonlyViewer ? 'telemetry' : initial;
+    if (readonlyViewer && initial === 'dry-run') return 'ui-v1';
+    return initial;
   });
 
   useEffect(() => {
     const onHashChange = () => {
       const next = tabFromHash(window.location.hash);
-      setActiveTab(readonlyViewer ? 'telemetry' : next);
+      if (readonlyViewer && next === 'dry-run') {
+        setActiveTab('ui-v1');
+        return;
+      }
+      setActiveTab(next);
     };
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
@@ -28,8 +35,12 @@ const Dashboard: React.FC = () => {
 
   const tabs = useMemo<Array<{ id: AppTab; label: string }>>(() => (
     readonlyViewer
-      ? [{ id: 'telemetry', label: 'Live Telemetry' }]
+      ? [
+          { id: 'ui-v1', label: 'Dashboard v1' },
+          { id: 'telemetry', label: 'Live Telemetry' },
+        ]
       : [
+          { id: 'ui-v1', label: 'Dashboard v1' },
           { id: 'telemetry', label: 'Live Telemetry' },
           { id: 'dry-run', label: 'Dry Run' },
         ]
@@ -37,12 +48,15 @@ const Dashboard: React.FC = () => {
 
   const setTab = (tab: AppTab) => {
     if (readonlyViewer && tab !== 'telemetry') {
-      return;
+      // Viewer mode keeps dry-run disabled but still allows UI v1.
+      if (tab === 'dry-run') return;
     }
     setActiveTab(tab);
     const hash = tab === 'dry-run'
       ? '#dry-run'
-      : '#telemetry';
+      : tab === 'ui-v1'
+        ? '#ui-v1'
+        : '#telemetry';
     if (window.location.hash !== hash) {
       window.history.replaceState(null, '', hash);
     }
@@ -74,6 +88,10 @@ const Dashboard: React.FC = () => {
             Read-only external viewer mode aktif
           </div>
         )}
+      </div>
+
+      <div className={activeTab === 'ui-v1' ? 'block' : 'hidden'}>
+        <DashboardV1 />
       </div>
 
       <div className={activeTab === 'telemetry' ? 'block' : 'hidden'}>
