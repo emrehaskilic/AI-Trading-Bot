@@ -230,7 +230,7 @@ export const defaultStrategyConfig: StrategyConfig = {
   hardRevTicks: Number(process.env.HARDREV_TICKS || 8),
   hardRevDfsP: Number(process.env.HARDREV_DFS_P || 0.10),
   hardRevRequireAbsorption: String(process.env.HARDREV_REQUIRE_ABSORPTION || 'true').toLowerCase() === 'true',
-  defensiveAddEnabled: String(process.env.DEFENSIVE_ADD_ENABLED || 'false').toLowerCase() === 'true',
+  defensiveAddEnabled: String(process.env.DEFENSIVE_ADD_ENABLED || 'true').toLowerCase() === 'true',
   dryRun: String(process.env.DRY_RUN || 'true').toLowerCase() === 'true',
   addSizing: [1.0, 0.6, 0.4],
 };

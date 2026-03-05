@@ -327,9 +327,23 @@ export class NewStrategyV11 {
   private maybeAdd(input: StrategyInput, dfsP: number, volLevel: number): StrategyAction | null {
     if (!input.position) return null;
     if (input.position.addsUsed >= this.config.addSizing.length) return null;
-    if (input.position.unrealizedPnlPct <= 0) return null;
-    if (dfsP < 0.75 || dfsP < this.lastDfsPercentile) return null;
+    const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
+    const defensiveAddEnabled = Boolean(this.config.defensiveAddEnabled);
+    const isWinnerAdd = unrealizedPnlPct > 0;
+    if (!isWinnerAdd && !defensiveAddEnabled) return null;
     const side = input.position.side;
+    const sideStrength = side === 'LONG' ? dfsP : (1 - dfsP);
+    const lastSideStrength = side === 'LONG' ? this.lastDfsPercentile : (1 - this.lastDfsPercentile);
+    if (isWinnerAdd) {
+      if (sideStrength < 0.75 || sideStrength < lastSideStrength) return null;
+    } else {
+      const configuredMaxLossPct = Number.isFinite(this.config.maxLossPct as number)
+        ? Math.min(-0.0001, Number(this.config.maxLossPct))
+        : -0.02;
+      const defensiveAddFloorPct = configuredMaxLossPct * 0.7;
+      if (unrealizedPnlPct <= defensiveAddFloorPct) return null;
+      if (sideStrength < 0.62 || sideStrength < (lastSideStrength - 0.02)) return null;
+    }
     if (side === 'LONG' && input.market.cvdSlope <= 0) return null;
     if (side === 'SHORT' && input.market.cvdSlope >= 0) return null;
     if (Math.abs(input.market.price - input.market.vwap) > Math.abs(input.market.vwap) * 0.01) return null;
@@ -340,16 +354,23 @@ export class NewStrategyV11 {
     const proposedAddSize = this.config.addSizing[addIndex] ?? 0.4;
     const newPositionPct = currentPositionPct + proposedAddSize;
     if (newPositionPct > maxPositionSizePct) return null;
-    const sizeMultiplier = proposedAddSize;
+    const sizeMultiplier = isWinnerAdd ? proposedAddSize : (proposedAddSize * 0.5);
     this.lastAddTs = input.nowMs;
 
     return {
       type: StrategyActionType.ADD,
       side: input.position.side,
-      reason: 'ADD_WINNER',
+      reason: isWinnerAdd ? 'ADD_WINNER' : 'STRAT_ADD',
       sizeMultiplier: clamp(sizeMultiplier, 0.1, 1),
       expectedPrice: input.market.price,
-      metadata: { volLevel, currentPositionPct, newPositionPct, maxPositionSizePct },
+      metadata: {
+        volLevel,
+        currentPositionPct,
+        newPositionPct,
+        maxPositionSizePct,
+        addMode: isWinnerAdd ? 'WINNER' : 'DEFENSIVE',
+        unrealizedPnlPct,
+      },
     };
   }
 
@@ -388,15 +409,27 @@ export class NewStrategyV11 {
     const price = input.market.price;
     const vwap = input.market.vwap;
     const vwapHoldTicks = this.config.hardRevTicks;
-    const maxLossPct = this.config.maxLossPct ?? -0.02;
+    const configuredMaxLossPct = Number.isFinite(this.config.maxLossPct as number)
+      ? Math.min(-0.0001, Number(this.config.maxLossPct))
+      : -0.02;
+    const hasDefensiveAddCapacity = Boolean(this.config.defensiveAddEnabled)
+      && input.position.addsUsed < this.config.addSizing.length;
+    const stopLossThreshold = hasDefensiveAddCapacity
+      ? configuredMaxLossPct * 1.5
+      : configuredMaxLossPct;
     const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
-    if (unrealizedPnlPct <= maxLossPct) {
+    if (unrealizedPnlPct <= stopLossThreshold) {
       return {
         type: StrategyActionType.EXIT,
         side,
         reason: 'EXIT_STOP_LOSS',
         expectedPrice: price,
-        metadata: { unrealizedPnlPct, maxLossPct },
+        metadata: {
+          unrealizedPnlPct,
+          maxLossPct: configuredMaxLossPct,
+          stopLossThreshold,
+          defensiveAddArmed: hasDefensiveAddCapacity,
+        },
       };
     }
     if (side === 'LONG') {

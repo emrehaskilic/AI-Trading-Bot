@@ -831,7 +831,20 @@ export class DryRunSessionService {
       createdOrders.push(order);
     };
 
-    for (const action of decision.actions) {
+    const explicitExitActionIndexBySide = new Map<StrategySide, number>();
+    for (let idx = 0; idx < decision.actions.length; idx += 1) {
+      const candidate = decision.actions[idx];
+      const side = candidate.side;
+      if (candidate.type !== StrategyActionType.EXIT || (side !== 'LONG' && side !== 'SHORT')) {
+        continue;
+      }
+      if (!explicitExitActionIndexBySide.has(side)) {
+        explicitExitActionIndexBySide.set(side, idx);
+      }
+    }
+
+    for (let actionIndex = 0; actionIndex < decision.actions.length; actionIndex += 1) {
+      const action = decision.actions[actionIndex];
       if (action.type === StrategyActionType.NOOP) continue;
 
       const position = session.lastState.position;
@@ -847,35 +860,40 @@ export class DryRunSessionService {
       const laddersRequested = Math.max(0, Math.min(5, Math.trunc(Number(aiPlan?.maxAdds ?? 2))));
 
       if (action.type === StrategyActionType.ENTRY && desiredOrderSide) {
-        // AI policy path must never auto-close just to reverse.
+        // Autonomous path must never auto-close just to reverse.
         if (position && position.side !== actionSide) {
-          if (aiPolicyAction) {
-            // Throttle: log at most once per 60 seconds per symbol
-            const nowMs = Date.now();
-            const lastWarnTs = (session as any)._lastReversalWarnTs || 0;
-            if (nowMs - lastWarnTs >= 60_000) {
-              (session as any)._lastReversalWarnTs = nowMs;
-              this.addConsoleLog(
-                'WARN',
-                normalized,
-                `AI reversal blocked without direction lock confirmation: ${position.side} -> ${actionSide}`,
-                session.lastEventTimestampMs
-              );
+          const explicitExitIndex = explicitExitActionIndexBySide.get(position.side);
+          const hasPriorExplicitExitInSameDecision =
+            explicitExitIndex != null && explicitExitIndex <= actionIndex;
+          if (!hasPriorExplicitExitInSameDecision) {
+            if (aiPolicyAction) {
+              // Throttle: log at most once per 60 seconds per symbol
+              const nowMs = Date.now();
+              const lastWarnTs = (session as any)._lastReversalWarnTs || 0;
+              if (nowMs - lastWarnTs >= 60_000) {
+                (session as any)._lastReversalWarnTs = nowMs;
+                this.addConsoleLog(
+                  'WARN',
+                  normalized,
+                  `Strategy reversal blocked without direction lock confirmation: ${position.side} -> ${actionSide}`,
+                  session.lastEventTimestampMs
+                );
+              }
+              continue;
             }
-            continue;
-          }
-          const closeQty = roundTo(position.qty, 6);
-          if (closeQty > 0) {
-            const closeOrder = this.buildAiLimitOrder(
-              session,
-              position.side === 'LONG' ? 'SELL' : 'BUY',
-              closeQty,
-              true,
-              'STRAT_REVERSAL_EXIT'
-            );
-            if (closeOrder) {
-              queueOrder(closeOrder);
-              this.addConsoleLog('INFO', normalized, `AI reversal: closing ${position.side} before ${actionSide}`, session.lastEventTimestampMs);
+            const closeQty = roundTo(position.qty, 6);
+            if (closeQty > 0) {
+              const closeOrder = this.buildAiLimitOrder(
+                session,
+                position.side === 'LONG' ? 'SELL' : 'BUY',
+                closeQty,
+                true,
+                'STRAT_REVERSAL_EXIT'
+              );
+              if (closeOrder) {
+                queueOrder(closeOrder);
+                this.addConsoleLog('INFO', normalized, `Strategy reversal: closing ${position.side} before ${actionSide}`, session.lastEventTimestampMs);
+              }
             }
           }
         }
@@ -917,7 +935,7 @@ export class DryRunSessionService {
             }
             session.addOnState.count += 1;
             session.addOnState.lastAddOnTs = decisionTs;
-            this.addConsoleLog('INFO', normalized, `AI add ${actionSide} +${sizing.qty}`, session.lastEventTimestampMs);
+            this.addConsoleLog('INFO', normalized, `Strategy add ${actionSide} +${sizing.qty}`, session.lastEventTimestampMs);
           }
           continue;
         }
@@ -958,7 +976,7 @@ export class DryRunSessionService {
           }
         }
         session.lastEntryEventTs = decisionTs;
-        this.addConsoleLog('INFO', normalized, `AI entry ${actionSide} ${sizing.qty} @ ~${referencePrice}`, session.lastEventTimestampMs);
+        this.addConsoleLog('INFO', normalized, `Strategy entry ${actionSide} ${sizing.qty} @ ~${referencePrice}`, session.lastEventTimestampMs);
         continue;
       }
 
@@ -1002,7 +1020,7 @@ export class DryRunSessionService {
         }
         session.addOnState.count += 1;
         session.addOnState.lastAddOnTs = decisionTs;
-        this.addConsoleLog('INFO', normalized, `AI add to ${currentPosition.side} +${sizing.qty}`, session.lastEventTimestampMs);
+        this.addConsoleLog('INFO', normalized, `Strategy add to ${currentPosition.side} +${sizing.qty}`, session.lastEventTimestampMs);
         continue;
       }
 
@@ -1047,9 +1065,9 @@ export class DryRunSessionService {
           queueOrder(reduceOrder);
           if (forceFullClose) {
             session.pendingExitReason = action.reason || session.pendingExitReason || 'STRAT_DUST_FLATTEN';
-            this.addConsoleLog('INFO', normalized, `AI reduce escalated to full exit for ${position.side} (dust guard)`, session.lastEventTimestampMs);
+            this.addConsoleLog('INFO', normalized, `Strategy reduce escalated to full exit for ${position.side} (dust guard)`, session.lastEventTimestampMs);
           } else {
-            this.addConsoleLog('INFO', normalized, `AI reduce ${position.side} -${reduceQty} (${(reducePct * 100).toFixed(0)}%)`, session.lastEventTimestampMs);
+            this.addConsoleLog('INFO', normalized, `Strategy reduce ${position.side} -${reduceQty} (${(reducePct * 100).toFixed(0)}%)`, session.lastEventTimestampMs);
           }
         }
         continue;
@@ -1067,7 +1085,7 @@ export class DryRunSessionService {
         );
         if (exitOrder) {
           queueOrder(exitOrder);
-          this.addConsoleLog('INFO', normalized, `AI exit ${position.side} completely`, session.lastEventTimestampMs);
+          this.addConsoleLog('INFO', normalized, `Strategy exit ${position.side} completely`, session.lastEventTimestampMs);
           session.pendingExitReason = action.reason;
         }
       }
@@ -1645,7 +1663,7 @@ export class DryRunSessionService {
         this.addConsoleLog(
           'INFO',
           session.symbol,
-          `Winner stop armed (${winnerDecision.action}) at ${roundTo(winnerDecision.stopPrice ?? markPrice, 4)}; waiting AI decision.`,
+          `Winner stop armed (${winnerDecision.action}) at ${roundTo(winnerDecision.stopPrice ?? markPrice, 4)}; waiting strategy decision.`,
           eventTimestampMs
         );
         session.lastWinnerSignalLogTs = eventTimestampMs;
@@ -2308,7 +2326,7 @@ export class DryRunSessionService {
     }
     if (nowMs - session.lastAiEntryCooldownLogTs >= 5000) {
       const waitMs = Math.max(0, session.aiEntryCooldownUntilMs - nowMs);
-      this.addConsoleLog('WARN', symbol, `AI entry cooldown active (${waitMs}ms remaining)`, nowMs);
+      this.addConsoleLog('WARN', symbol, `Strategy entry cooldown active (${waitMs}ms remaining)`, nowMs);
       session.lastAiEntryCooldownLogTs = nowMs;
     }
     return true;
@@ -2346,7 +2364,7 @@ export class DryRunSessionService {
       this.addConsoleLog(
         'WARN',
         symbol,
-        `AI entry paused for ${cooldownMs}ms after ${session.aiEntryCancelStreak} consecutive unfilled TTL cancels`,
+        `Strategy entry paused for ${cooldownMs}ms after ${session.aiEntryCancelStreak} consecutive unfilled TTL cancels`,
         eventTimestampMs
       );
       session.lastAiEntryCooldownLogTs = eventTimestampMs;
