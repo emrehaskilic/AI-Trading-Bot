@@ -240,6 +240,16 @@ export class ExecutionRiskGuard {
   }
 
   /**
+   * Expose active guard thresholds for external coordinators.
+   */
+  getThresholds(): Pick<ExecutionRiskConfig, 'maxPartialFillRate' | 'maxRejectRate'> {
+    return {
+      maxPartialFillRate: this.config.maxPartialFillRate,
+      maxRejectRate: this.config.maxRejectRate,
+    };
+  }
+
+  /**
    * Get pending orders
    */
   getPendingOrders(): { orderId: string; symbol: string; qty: number; elapsedMs: number }[] {

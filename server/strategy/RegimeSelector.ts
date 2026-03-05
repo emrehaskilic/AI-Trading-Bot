@@ -23,19 +23,37 @@ export interface RegimeOutput {
   reasons: string[];
 }
 
+export interface RegimeSelectorConfig {
+  lockTRMR: number;
+  lockEV: number;
+  mrScoreThreshold: number;
+  evScoreThreshold: number;
+  evExitThreshold: number;
+}
+
 export class RegimeSelector {
   private readonly norm: NormalizationStore;
-  private readonly lockTRMR: number;
-  private readonly lockEV: number;
+  private readonly config: RegimeSelectorConfig;
   private regime: StrategyRegime = 'MR';
   private trmrStreak = 0;
   private evStreak = 0;
   private evExitStreak = 0;
 
-  constructor(norm: NormalizationStore, lockTRMR: number, lockEV: number) {
+  constructor(
+    norm: NormalizationStore,
+    lockTRMR: number,
+    lockEV: number,
+    config?: Partial<RegimeSelectorConfig>
+  ) {
     this.norm = norm;
-    this.lockTRMR = Math.max(1, lockTRMR);
-    this.lockEV = Math.max(1, lockEV);
+    this.config = {
+      lockTRMR: Math.max(1, lockTRMR),
+      lockEV: Math.max(1, lockEV),
+      mrScoreThreshold: 0.6,
+      evScoreThreshold: 0.85,
+      evExitThreshold: 0.7,
+      ...(config || {}),
+    };
   }
 
   update(input: RegimeInput): RegimeOutput {
@@ -58,9 +76,9 @@ export class RegimeSelector {
     const trendScore = (0.7 * trendStrength) + (0.3 * (devP < 0.7 ? 1 : 0));
 
     let candidate: StrategyRegime = 'TR';
-    if (eventScore >= 0.85) {
+    if (eventScore >= this.config.evScoreThreshold) {
       candidate = 'EV';
-    } else if (meanRevScore >= 0.6) {
+    } else if (meanRevScore >= this.config.mrScoreThreshold) {
       candidate = 'MR';
     } else {
       candidate = 'TR';
@@ -68,25 +86,26 @@ export class RegimeSelector {
 
     const reasons: string[] = [];
 
-    if (candidate === 'EV' && eventScore >= 0.95) {
+    const evOverrideThreshold = Math.min(1, this.config.evScoreThreshold + 0.1);
+    if (candidate === 'EV' && eventScore >= evOverrideThreshold) {
       this.evStreak += 1;
     } else {
       this.evStreak = 0;
     }
 
-    if (this.regime !== 'EV' && this.evStreak >= this.lockEV) {
+    if (this.regime !== 'EV' && this.evStreak >= this.config.lockEV) {
       this.regime = 'EV';
       this.evExitStreak = 0;
       reasons.push('REGIME_EV_OVERRIDE');
     }
 
     if (this.regime === 'EV') {
-      if (candidate !== 'EV' && eventScore < 0.7) {
+      if (candidate !== 'EV' && eventScore < this.config.evExitThreshold) {
         this.evExitStreak += 1;
       } else {
         this.evExitStreak = 0;
       }
-      if (this.evExitStreak >= this.lockEV) {
+      if (this.evExitStreak >= this.config.lockEV) {
         this.regime = candidate === 'EV' ? 'TR' : candidate;
         this.trmrStreak = 0;
       }
@@ -94,7 +113,7 @@ export class RegimeSelector {
 
     if (this.regime !== 'EV' && candidate !== 'EV' && candidate !== this.regime) {
       this.trmrStreak += 1;
-      if (this.trmrStreak >= this.lockTRMR) {
+      if (this.trmrStreak >= this.config.lockTRMR) {
         this.regime = candidate;
         this.trmrStreak = 0;
         reasons.push('REGIME_TRMR_LOCK');

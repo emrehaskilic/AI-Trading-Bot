@@ -125,8 +125,9 @@ export class NewStrategyV11 {
     } else {
       const hardRev = this.checkHardReversal(input, dfsOut.dfsPercentile);
       if (hardRev.valid) {
+        const hardRevSize = this.config.hardRevSizeMultiplier ?? 0.75;
         actions.push({ type: StrategyActionType.EXIT, side: input.position.side, reason: 'EXIT_HARD_REVERSAL' });
-        actions.push({ type: StrategyActionType.ENTRY, side: this.flipSide(input.position.side), reason: 'HARD_REVERSAL_ENTRY', sizeMultiplier: 0.35 });
+        actions.push({ type: StrategyActionType.ENTRY, side: this.flipSide(input.position.side), reason: 'HARD_REVERSAL_ENTRY', sizeMultiplier: hardRevSize });
         reasons.push('EXIT_HARD_REVERSAL', 'HARD_REVERSAL_ENTRY');
         this.lastExitTs = nowMs;
         this.lastExitSide = input.position.side;
@@ -303,7 +304,10 @@ export class NewStrategyV11 {
       const deltaImproving = desiredSide === 'LONG'
         ? input.market.deltaZ > this.lastDeltaZ
         : input.market.deltaZ < this.lastDeltaZ;
-      const absorptionOk = input.absorption?.value ? (input.absorption.side === (desiredSide === 'LONG' ? 'buy' : 'sell')) : false;
+      const mrRequireAbsorption = this.config.mrRequireAbsorption ?? false;
+      const absorptionOk = mrRequireAbsorption
+        ? (input.absorption?.value ? (input.absorption.side === (desiredSide === 'LONG' ? 'buy' : 'sell')) : false)
+        : true;
       const obiDivOk = desiredSide === 'LONG' ? input.market.obiDivergence > 0 : input.market.obiDivergence < 0;
       const evLow = volLevel < 0.8;
       return devP >= 0.7 && deltaAbsP >= 0.8 && deltaImproving && absorptionOk && obiDivOk && evLow;
@@ -330,8 +334,13 @@ export class NewStrategyV11 {
     if (side === 'SHORT' && input.market.cvdSlope >= 0) return null;
     if (Math.abs(input.market.price - input.market.vwap) > Math.abs(input.market.vwap) * 0.01) return null;
 
+    const maxPositionSizePct = this.config.maxPositionSizePct ?? 0.25;
+    const currentPositionPct = input.position.sizePct ?? 0;
     const addIndex = input.position.addsUsed;
-    const sizeMultiplier = this.config.addSizing[addIndex] ?? 0.4;
+    const proposedAddSize = this.config.addSizing[addIndex] ?? 0.4;
+    const newPositionPct = currentPositionPct + proposedAddSize;
+    if (newPositionPct > maxPositionSizePct) return null;
+    const sizeMultiplier = proposedAddSize;
     this.lastAddTs = input.nowMs;
 
     return {
@@ -340,7 +349,7 @@ export class NewStrategyV11 {
       reason: 'ADD_WINNER',
       sizeMultiplier: clamp(sizeMultiplier, 0.1, 1),
       expectedPrice: input.market.price,
-      metadata: { volLevel },
+      metadata: { volLevel, currentPositionPct, newPositionPct, maxPositionSizePct },
     };
   }
 
@@ -350,6 +359,9 @@ export class NewStrategyV11 {
     thresholds: { longBreak: number; shortBreak: number }
   ): StrategyAction | null {
     if (!input.position) return null;
+    const softReduceRequireProfit = this.config.softReduceRequireProfit ?? true;
+    const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
+    if (softReduceRequireProfit && unrealizedPnlPct <= 0) return null;
     const side = input.position.side;
     const weakening = this.lastDfsPercentile >= 0.85 && dfsP <= 0.6;
     const breakLevel = side === 'LONG' ? dfsP <= thresholds.longBreak : dfsP >= thresholds.shortBreak;
@@ -360,6 +372,7 @@ export class NewStrategyV11 {
         reason: 'REDUCE_SOFT',
         reducePct: weakening ? 0.5 : 0.3,
         expectedPrice: input.market.price,
+        metadata: { unrealizedPnlPct },
       };
     }
     return null;
@@ -375,6 +388,17 @@ export class NewStrategyV11 {
     const price = input.market.price;
     const vwap = input.market.vwap;
     const vwapHoldTicks = this.config.hardRevTicks;
+    const maxLossPct = this.config.maxLossPct ?? -0.02;
+    const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
+    if (unrealizedPnlPct <= maxLossPct) {
+      return {
+        type: StrategyActionType.EXIT,
+        side,
+        reason: 'EXIT_STOP_LOSS',
+        expectedPrice: price,
+        metadata: { unrealizedPnlPct, maxLossPct },
+      };
+    }
     if (side === 'LONG') {
       const vwapHold = this.vwapBelowTicks >= Math.max(3, Math.floor(vwapHoldTicks / 2));
       if (price < vwap && vwapHold && dfsP <= thresholds.longBreak) {

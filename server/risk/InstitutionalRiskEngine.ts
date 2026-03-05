@@ -198,11 +198,15 @@ export class InstitutionalRiskEngine {
       return result;
     }
 
-    // R16-R18: Execution quality check
+    // R16-R18: Execution quality check (aligned with guard configuration)
     const executionStats = this.executionGuard.getExecutionStats();
-    if (executionStats.partialFillRate > 0.5 || executionStats.rejectRate > 0.3) {
+    const thresholds = this.executionGuard.getThresholds();
+    if (
+      executionStats.partialFillRate > thresholds.maxPartialFillRate ||
+      executionStats.rejectRate > thresholds.maxRejectRate
+    ) {
       result.allowed = false;
-      result.reason = 'Execution quality too low';
+      result.reason = `Execution quality too low: partialFill=${(executionStats.partialFillRate * 100).toFixed(1)}%, reject=${(executionStats.rejectRate * 100).toFixed(1)}%`;
       result.guards.execution = false;
       return result;
     }

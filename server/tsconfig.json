@@ -15,5 +15,5 @@
     "noUnusedParameters": false
   },
   "include": ["./**/*.ts"],
-  "exclude": ["node_modules", "dist"]
+  "exclude": ["node_modules", "dist", "test", "tools"]
 }

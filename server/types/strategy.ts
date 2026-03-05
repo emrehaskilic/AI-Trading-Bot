@@ -46,6 +46,7 @@ export type DecisionReason =
   | 'REDUCE_SOFT'
   | 'REDUCE_EXHAUSTION'
   | 'EXIT_HARD'
+  | 'EXIT_STOP_LOSS'
   | 'EXIT_HARD_REVERSAL'
   | 'HARD_REVERSAL_ENTRY'
   | 'HARD_REVERSAL_REJECTED'
@@ -104,6 +105,7 @@ export interface StrategyPositionState {
   entryPrice: number;
   unrealizedPnlPct: number;
   addsUsed: number;
+  sizePct?: number;
   timeInPositionMs?: number;
   peakPnlPct?: number;
 }
@@ -202,6 +204,11 @@ export interface StrategyConfig {
   defensiveAddEnabled: boolean;
   dryRun: boolean;
   addSizing: number[];
+  maxLossPct?: number;
+  maxPositionSizePct?: number;
+  hardRevSizeMultiplier?: number;
+  mrRequireAbsorption?: boolean;
+  softReduceRequireProfit?: boolean;
 }
 
 export const defaultStrategyConfig: StrategyConfig = {
