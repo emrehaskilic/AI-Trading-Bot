@@ -233,6 +233,7 @@ type SymbolSession = {
   aiEntryCancelStreak: number;
   aiEntryCooldownUntilMs: number;
   lastAiEntryCooldownLogTs: number;
+  lastExitOrderTs: number;
 };
 
 type AIIntentMetadata = {
@@ -323,6 +324,14 @@ const DEFAULT_STRAT_ENTRY_CANCEL_MAX_COOLDOWN_MS = Math.max(
   Math.trunc(clampNumber(process.env.STRAT_ENTRY_CANCEL_MAX_COOLDOWN_MS, 120_000, DEFAULT_STRAT_ENTRY_CANCEL_BASE_COOLDOWN_MS, 900_000))
 );
 const DEFAULT_STRAT_ENTRY_CANCEL_BACKOFF_MULT = clampNumber(process.env.STRAT_ENTRY_CANCEL_BACKOFF_MULT, 1.75, 1, 4);
+const DEFAULT_STRAT_ENTRY_MIN_INTERVAL_MS = Math.max(
+  0,
+  Math.trunc(clampNumber(process.env.STRAT_ENTRY_MIN_INTERVAL_MS, 1200, 0, 60_000))
+);
+const DEFAULT_STRAT_EXIT_MIN_INTERVAL_MS = Math.max(
+  0,
+  Math.trunc(clampNumber(process.env.STRAT_EXIT_MIN_INTERVAL_MS, 2500, 0, 60_000))
+);
 
 function parseLimitStrategy(input: string): LimitStrategyMode {
   switch (input) {
@@ -551,6 +560,7 @@ export class DryRunSessionService {
         aiEntryCancelStreak: 0,
         aiEntryCooldownUntilMs: 0,
         lastAiEntryCooldownLogTs: 0,
+        lastExitOrderTs: 0,
       });
     }
 
@@ -715,6 +725,7 @@ export class DryRunSessionService {
         aiEntryCancelStreak: 0,
         aiEntryCooldownUntilMs: 0,
         lastAiEntryCooldownLogTs: 0,
+        lastExitOrderTs: 0,
       });
     }
 
@@ -825,10 +836,50 @@ export class DryRunSessionService {
     const decisionTs = Number.isFinite(timestampMs as number) ? Number(timestampMs) : this.clock.now();
     this.clock.set(decisionTs);
     const createdOrders: DryRunOrderRequest[] = [];
+    const queuedOrderSignatures = new Set<string>();
 
-    const queueOrder = (order: DryRunOrderRequest) => {
+    const buildOrderSignature = (order: DryRunOrderRequest): string => {
+      const price = Number.isFinite(order.price as number) ? Number(order.price) : 0;
+      const ttlMs = Number.isFinite(order.ttlMs as number) ? Number(order.ttlMs) : 0;
+      return [
+        order.side,
+        order.type,
+        roundTo(Number(order.qty || 0), 6),
+        roundTo(price, 6),
+        order.timeInForce || '',
+        order.reduceOnly ? '1' : '0',
+        order.postOnly ? '1' : '0',
+        order.reasonCode || '',
+        ttlMs,
+      ].join('|');
+    };
+
+    const queueOrder = (order: DryRunOrderRequest): boolean => {
+      const signature = buildOrderSignature(order);
+      if (queuedOrderSignatures.has(signature)) {
+        return false;
+      }
+      queuedOrderSignatures.add(signature);
       session.manualOrders.push(order);
       createdOrders.push(order);
+      return true;
+    };
+
+    const canQueueExitOrder = (positionSide: StrategySide): boolean => {
+      if (positionSide !== 'LONG' && positionSide !== 'SHORT') {
+        return false;
+      }
+      if (this.hasLiveReduceOnlyOrderForPosition(session, positionSide)) {
+        return false;
+      }
+      if (
+        DEFAULT_STRAT_EXIT_MIN_INTERVAL_MS > 0
+        && session.lastExitOrderTs > 0
+        && (decisionTs - session.lastExitOrderTs) < DEFAULT_STRAT_EXIT_MIN_INTERVAL_MS
+      ) {
+        return false;
+      }
+      return true;
     };
 
     const explicitExitActionIndexBySide = new Map<StrategySide, number>();
@@ -883,6 +934,9 @@ export class DryRunSessionService {
             }
             const closeQty = roundTo(position.qty, 6);
             if (closeQty > 0) {
+              if (!canQueueExitOrder(position.side)) {
+                continue;
+              }
               const closeOrder = this.buildAiLimitOrder(
                 session,
                 position.side === 'LONG' ? 'SELL' : 'BUY',
@@ -891,7 +945,10 @@ export class DryRunSessionService {
                 'STRAT_REVERSAL_EXIT'
               );
               if (closeOrder) {
-                queueOrder(closeOrder);
+                if (!queueOrder(closeOrder)) {
+                  continue;
+                }
+                session.lastExitOrderTs = decisionTs;
                 this.addConsoleLog('INFO', normalized, `Strategy reversal: closing ${position.side} before ${actionSide}`, session.lastEventTimestampMs);
               }
             }
@@ -916,7 +973,7 @@ export class DryRunSessionService {
               if (this.hasLiveWorkingOrderForSide(session, desiredOrderSide)) continue;
               const addOrder = this.buildAiPostOnlyEntryOrder(session, desiredOrderSide, sizing.qty, 'STRAT_ADD', strictMeta.enabled);
               if (!addOrder) continue;
-              queueOrder(addOrder);
+              if (!queueOrder(addOrder)) continue;
             } else {
               const addOrders = this.limitStrategy.buildEntryOrders({
                 side: desiredOrderSide,
@@ -954,11 +1011,18 @@ export class DryRunSessionService {
         session.engine.setLeverageOverride(sizing.leverage);
         if (aiPolicyAction) {
           if (!this.isAiExecutionHealthy(session)) continue;
+          if (
+            DEFAULT_STRAT_ENTRY_MIN_INTERVAL_MS > 0
+            && session.lastEntryEventTs > 0
+            && (decisionTs - session.lastEntryEventTs) < DEFAULT_STRAT_ENTRY_MIN_INTERVAL_MS
+          ) {
+            continue;
+          }
           if (this.shouldBlockAiEntryByCooldown(session, normalized, decisionTs)) continue;
           if (this.hasLiveWorkingOrderForSide(session, desiredOrderSide)) continue;
           const entryOrder = this.buildAiPostOnlyEntryOrder(session, desiredOrderSide, sizing.qty, 'STRAT_ENTRY', strictMeta.enabled);
           if (!entryOrder) continue;
-          queueOrder(entryOrder);
+          if (!queueOrder(entryOrder)) continue;
         } else {
           const entryOrders = this.limitStrategy.buildEntryOrders({
             side: desiredOrderSide,
@@ -1001,7 +1065,7 @@ export class DryRunSessionService {
           if (this.hasLiveWorkingOrderForSide(session, currentSide)) continue;
           const addOrder = this.buildAiPostOnlyEntryOrder(session, currentSide, sizing.qty, 'STRAT_ADD', strictMeta.enabled);
           if (!addOrder) continue;
-          queueOrder(addOrder);
+          if (!queueOrder(addOrder)) continue;
         } else {
           const addOrders = this.limitStrategy.buildEntryOrders({
             side: currentSide,
@@ -1054,6 +1118,7 @@ export class DryRunSessionService {
           }
         }
         if (!(reduceQty > 0)) continue;
+        if (!canQueueExitOrder(position.side)) continue;
         const reduceOrder = this.buildAiLimitOrder(
           session,
           position.side === 'LONG' ? 'SELL' : 'BUY',
@@ -1062,7 +1127,8 @@ export class DryRunSessionService {
           forceFullClose ? 'STRAT_EXIT' : 'STRAT_REDUCE'
         );
         if (reduceOrder) {
-          queueOrder(reduceOrder);
+          if (!queueOrder(reduceOrder)) continue;
+          session.lastExitOrderTs = decisionTs;
           if (forceFullClose) {
             session.pendingExitReason = action.reason || session.pendingExitReason || 'STRAT_DUST_FLATTEN';
             this.addConsoleLog('INFO', normalized, `Strategy reduce escalated to full exit for ${position.side} (dust guard)`, session.lastEventTimestampMs);
@@ -1076,6 +1142,7 @@ export class DryRunSessionService {
       if (action.type === StrategyActionType.EXIT && position) {
         const exitQty = roundTo(position.qty, 6);
         if (!(exitQty > 0)) continue;
+        if (!canQueueExitOrder(position.side)) continue;
         const exitOrder = this.buildAiLimitOrder(
           session,
           position.side === 'LONG' ? 'SELL' : 'BUY',
@@ -1084,7 +1151,8 @@ export class DryRunSessionService {
           'STRAT_EXIT'
         );
         if (exitOrder) {
-          queueOrder(exitOrder);
+          if (!queueOrder(exitOrder)) continue;
+          session.lastExitOrderTs = decisionTs;
           this.addConsoleLog('INFO', normalized, `Strategy exit ${position.side} completely`, session.lastEventTimestampMs);
           session.pendingExitReason = action.reason;
         }
@@ -2318,6 +2386,13 @@ export class DryRunSessionService {
     const hasOpen = session.lastState.openLimitOrders.some((o) => o.side === side && !o.reduceOnly);
     if (hasOpen) return true;
     return session.manualOrders.some((o) => o.side === side && o.type === 'LIMIT' && !o.reduceOnly);
+  }
+
+  private hasLiveReduceOnlyOrderForPosition(session: SymbolSession, positionSide: 'LONG' | 'SHORT'): boolean {
+    const closeSide: 'BUY' | 'SELL' = positionSide === 'LONG' ? 'SELL' : 'BUY';
+    const hasOpen = session.lastState.openLimitOrders.some((o) => o.side === closeSide && Boolean(o.reduceOnly));
+    if (hasOpen) return true;
+    return session.manualOrders.some((o) => o.side === closeSide && Boolean(o.reduceOnly));
   }
 
   private shouldBlockAiEntryByCooldown(session: SymbolSession, symbol: string, nowMs: number): boolean {
