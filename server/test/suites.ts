@@ -29,6 +29,11 @@ import * as OrderbookIntegrityMonitorTests from './OrderbookIntegrityMonitor.tes
 import * as DryRunClockTests from './DryRunClock.test';
 import * as FreezeControllerTests from './FreezeController.test';
 import * as PositionSizerTests from './PositionSizer.test';
+import * as ResiliencePatchesTests from './ResiliencePatches.test';
+import * as StrategyApiConsensusTests from './StrategyApiConsensus.test';
+import * as AnalyticsEngineMetricsTests from './AnalyticsEngineMetrics.test';
+import * as TelemetryApiTests from './TelemetryApi.test';
+import * as AnalyticsApiFallbackTests from './AnalyticsApiFallback.test';
 
 export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'TimeAndSales', fn: TimeAndSalesTests.runTests },
@@ -61,4 +66,9 @@ export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'DryRunClock', fn: DryRunClockTests.runTests },
     { name: 'FreezeController', fn: FreezeControllerTests.runTests },
     { name: 'PositionSizer', fn: PositionSizerTests.runTests },
+    { name: 'ResiliencePatches', fn: ResiliencePatchesTests.runTests },
+    { name: 'StrategyApiConsensus', fn: StrategyApiConsensusTests.runTests },
+    { name: 'AnalyticsEngineMetrics', fn: AnalyticsEngineMetricsTests.runTests },
+    { name: 'TelemetryApi', fn: TelemetryApiTests.runTests },
+    { name: 'AnalyticsApiFallback', fn: AnalyticsApiFallbackTests.runTests },
 ];

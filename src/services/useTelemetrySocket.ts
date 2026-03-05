@@ -144,7 +144,15 @@ export function useTelemetrySocket(
           try {
             const msg = JSON.parse(event.data);
             if (msg.type === 'metrics' && msg.symbol) {
-              const metricsMsg = msg as MetricsMessage;
+              const receivedAt = Date.now();
+              const serverSent = Number(msg?.server_sent_ms || 0);
+              const metricsMsg = {
+                ...(msg as MetricsMessage),
+                client_received_ms: receivedAt,
+                ws_latency_client_ms: Number.isFinite(serverSent) && serverSent > 0
+                  ? Math.max(0, receivedAt - serverSent)
+                  : undefined,
+              } as MetricsMessage;
               const symbol = normalizeSymbol(metricsMsg.symbol);
               if (!symbol) {
                 return;

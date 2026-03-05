@@ -187,6 +187,10 @@ export const StrategyPanel = memo<StrategyPanelProps>(({ className = '', maxSign
       .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
       .slice(0, maxSignals);
   }, [signals, maxSignals]);
+  const strategyConfidenceEntries = useMemo(() => {
+    return Object.entries(data?.strategyConfidence || {})
+      .sort((a, b) => b[1].confidence - a[1].confidence);
+  }, [data?.strategyConfidence]);
 
   const formattedLastUpdate = useMemo(() => {
     if (!lastUpdated) return 'Never';
@@ -276,6 +280,30 @@ export const StrategyPanel = memo<StrategyPanelProps>(({ className = '', maxSign
           </div>
         </div>
       )}
+
+      {/* Strategy Confidence Breakdown */}
+      <div className="mb-4">
+        <h4 className="text-sm font-medium text-zinc-400 mb-2">
+          Strategy Confidence
+        </h4>
+        <div className="space-y-2">
+          {strategyConfidenceEntries.length > 0 ? strategyConfidenceEntries.map(([strategyId, confidence]) => (
+            <div key={strategyId} className="bg-zinc-800/40 rounded p-2">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs text-zinc-300">{strategyId}</span>
+                <span className="text-xs text-zinc-500">
+                  {(confidence.confidence * 100).toFixed(1)}%
+                </span>
+              </div>
+              <ConfidenceBar confidence={confidence.confidence} showValue={false} />
+            </div>
+          )) : (
+            <div className="text-center text-zinc-600 py-3 text-xs">
+              No strategy confidence data yet
+            </div>
+          )}
+        </div>
+      </div>
 
       {/* Signal Summary */}
       <div className="mb-4">

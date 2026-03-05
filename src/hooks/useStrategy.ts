@@ -35,6 +35,11 @@ export interface StrategySnapshot {
   signals: StrategySignal[];
   activeStrategies: string[];
   strategyHealth: Record<string, { healthy: boolean; lastSignal: string }>;
+  strategyConfidence: Record<string, {
+    direction: SignalDirection;
+    confidence: number;
+    timestamp: string;
+  }>;
 }
 
 interface BackendStrategySnapshot {
@@ -48,6 +53,11 @@ interface BackendStrategySnapshot {
     totalStrategies: number;
     strategyIds: string[];
   } | null;
+  strategyConfidence?: Record<string, {
+    side: 'LONG' | 'SHORT' | 'FLAT';
+    confidence: number;
+    timestamp: number;
+  }>;
   signals: Array<{
     strategyId: string;
     side: 'LONG' | 'SHORT' | 'FLAT';
@@ -119,6 +129,25 @@ export function useStrategy(): {
       };
     }
 
+    const strategyConfidenceFromApi = raw?.strategyConfidence || {};
+    const strategyConfidence: StrategySnapshot['strategyConfidence'] = {};
+    for (const [strategyId, entry] of Object.entries(strategyConfidenceFromApi)) {
+      strategyConfidence[strategyId] = {
+        direction: toDirection(entry.side),
+        confidence: Number(entry.confidence || 0),
+        timestamp: new Date(entry.timestamp || Date.now()).toISOString(),
+      };
+    }
+    for (const signal of signals) {
+      if (!strategyConfidence[signal.strategy]) {
+        strategyConfidence[signal.strategy] = {
+          direction: signal.direction,
+          confidence: Number(signal.confidence || 0),
+          timestamp: signal.timestamp,
+        };
+      }
+    }
+
     return {
       timestamp: new Date(raw?.timestamp || Date.now()).toISOString(),
       consensus: {
@@ -134,6 +163,7 @@ export function useStrategy(): {
       signals,
       activeStrategies,
       strategyHealth,
+      strategyConfidence,
     };
   }, []);
 

@@ -209,7 +209,7 @@ export class ResiliencePatches {
     
     const result = this.latencyGuard.recordLatency(latencyMs, timestampMs, type);
     
-    if (result.shouldTriggerKillSwitch) {
+    if (result.shouldTriggerKillSwitch && this.config.autoKillSwitch) {
       this.triggerKillSwitch(RiskStateTrigger.LATENCY_SPIKE, `Latency violation: ${result.reason}`, timestampMs);
     }
   }

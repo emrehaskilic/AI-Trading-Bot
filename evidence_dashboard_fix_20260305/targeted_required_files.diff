@@ -1,0 +1,2177 @@
+﻿diff --git a/server/analytics/AnalyticsEngine.ts b/server/analytics/AnalyticsEngine.ts
+index fce4818..4322bf2 100644
+--- a/server/analytics/AnalyticsEngine.ts
++++ b/server/analytics/AnalyticsEngine.ts
+@@ -15,6 +15,7 @@ import {
+   SessionSummary,
+   AnalyticsEngineConfig,
+   DEFAULT_ANALYTICS_CONFIG,
++  DrawdownMetrics,
+ } from './types';
+ import { PnLCalculator } from './PnLCalculator';
+ import { ExecutionAnalytics } from './ExecutionAnalytics';
+@@ -32,6 +33,9 @@ export class AnalyticsEngine {
+   private sessionId: string;
+   private lastSnapshotTime = 0;
+   private snapshotIntervalMs: number;
++  private lastMarkPriceBySymbol = new Map<string, number>();
++  private equitySeries: Array<{ timestamp: number; equity: number }> = [];
++  private lastEquityPointTs = 0;
+ 
+   constructor(config: Partial<AnalyticsEngineConfig> = {}) {
+     this.config = { ...DEFAULT_ANALYTICS_CONFIG, ...config };
+@@ -43,6 +47,8 @@ export class AnalyticsEngine {
+     
+     this.sessionStartTime = Date.now();
+     this.sessionId = this.generateSessionId();
++    this.equitySeries = [{ timestamp: this.sessionStartTime, equity: 0 }];
++    this.lastEquityPointTs = this.sessionStartTime;
+ 
+     // Ensure output directory exists
+     if (this.config.persistToDisk) {
+@@ -58,36 +64,81 @@ export class AnalyticsEngine {
+    * Process a fill event
+    */
+   ingestFill(fill: FillEvent): void {
++    const fallbackExpectedPrice = this.lastMarkPriceBySymbol.get(fill.symbol);
++    if (
++      fill.orderId
++      && !this.executionAnalytics.hasExpectedPrice(fill.orderId)
++      && Number.isFinite(Number(fallbackExpectedPrice))
++      && Number(fallbackExpectedPrice) > 0
++    ) {
++      this.executionAnalytics.recordExpectedPrice(
++        fill.orderId,
++        fill.symbol,
++        Number(fallbackExpectedPrice),
++        fill.side,
++        fill.qty
++      );
++    }
++
+     // Update PnL
+     this.pnlCalculator.processFill(fill);
+ 
+     // Update execution analytics (slippage)
+     this.executionAnalytics.processFill(fill);
++    this.executionAnalytics.recordEntry(fill.symbol, fill.price, fill.timestamp);
++    this.recordEquityPoint(fill.timestamp);
+ 
+     // Check if we should generate a snapshot
+     this.checkSnapshot();
+   }
+ 
++  /**
++   * Record expected order price for accurate slippage calculations.
++   */
++  recordExpectedFill(
++    orderId: string,
++    symbol: string,
++    expectedPrice: number,
++    side: 'BUY' | 'SELL',
++    qty: number,
++  ): void {
++    if (!orderId || !(expectedPrice > 0) || !(qty > 0)) {
++      return;
++    }
++    this.executionAnalytics.recordExpectedPrice(orderId, symbol, expectedPrice, side, qty);
++  }
++
+   /**
+    * Process a position update
+    */
+   ingestPosition(update: PositionUpdateEvent): void {
++    if (Number.isFinite(Number(update.markPrice)) && Number(update.markPrice) > 0) {
++      this.lastMarkPriceBySymbol.set(update.symbol, Number(update.markPrice));
++    }
++
+     // Update PnL
+     this.pnlCalculator.processPositionUpdate(update);
+ 
+     // Update execution analytics (flip tracking)
+     this.executionAnalytics.processPositionUpdate(update);
++    this.recordEquityPoint(update.timestamp);
++    this.checkSnapshot();
+   }
+ 
+   /**
+    * Process a price tick
+    */
+   ingestPrice(tick: PriceTickEvent): void {
++    if (Number.isFinite(Number(tick.markPrice)) && Number(tick.markPrice) > 0) {
++      this.lastMarkPriceBySymbol.set(tick.symbol, Number(tick.markPrice));
++    }
++
+     // Update trade quality (MFE/MAE tracking)
+     this.tradeQuality.processPriceTick(tick);
+ 
+     // Update execution analytics (adverse selection)
+     this.executionAnalytics.processPriceTick(tick);
++    this.recordEquityPoint(tick.timestamp);
+   }
+ 
+   /**
+@@ -127,40 +178,79 @@ export class AnalyticsEngine {
+    */
+   getSnapshot(): SessionSummary {
+     const now = Date.now();
++    this.recordEquityPoint(now, true);
++
+     const allTrades = this.pnlCalculator.getAllTrades();
+-    const closedTrades = allTrades.filter(t => t.status === 'CLOSED');
+-    const openTrades = allTrades.filter(t => t.status === 'OPEN');
+-    const unrealizedPnL = this.pnlCalculator.getAllUnrealizedPnL();
++    const closedTrades = allTrades.filter((trade) => trade.status === 'CLOSED');
++    const unrealizedPnL = this.pnlCalculator.getAllUnrealizedPnL()
++      .filter((position) => position.side !== 'FLAT' && Number(position.qty || 0) > 0);
+ 
+     const realizedPnL = this.pnlCalculator.getAllRealizedPnL();
+-    const totalRealizedPnl = realizedPnL.reduce((sum, r) => sum + r.totalRealizedPnl, 0);
+-    const totalUnrealizedPnl = unrealizedPnL.reduce((sum, p) => sum + Number(p.unrealizedPnl || 0), 0);
+-    const openPositions = unrealizedPnL.filter((p) => p.side !== 'FLAT' && Number(p.qty || 0) > 0).length;
+-    const totalFees = realizedPnL.reduce((sum, r) => sum + r.totalFees, 0);
++    const feeBreakdowns = this.pnlCalculator.getAllFeeBreakdowns();
++
++    const totalRealizedPnl = realizedPnL.reduce((sum, item) => sum + Number(item.totalRealizedPnl || 0), 0);
++    const totalUnrealizedPnl = unrealizedPnL.reduce((sum, item) => sum + Number(item.unrealizedPnl || 0), 0);
++    const openPositions = unrealizedPnL.length;
++    const totalFees = feeBreakdowns.reduce((sum, fee) => sum + Number(fee.totalFees || 0), 0);
+     const netPnl = totalRealizedPnl - totalFees + totalUnrealizedPnl;
+ 
+-    const winningTrades = realizedPnL.reduce((sum, r) => sum + r.winningTrades, 0);
+-    const losingTrades = realizedPnL.reduce((sum, r) => sum + r.losingTrades, 0);
+-    const totalTrades = winningTrades + losingTrades;
++    const winningTrades = closedTrades.filter((trade) => Number(trade.netPnl || 0) > 0).length;
++    const losingTrades = closedTrades.filter((trade) => Number(trade.netPnl || 0) < 0).length;
++    const totalTrades = closedTrades.length;
+     const winRate = totalTrades > 0 ? (winningTrades / totalTrades) * 100 : 0;
+ 
+-    const avgWin = realizedPnL.length > 0 
+-      ? realizedPnL.reduce((sum, r) => sum + r.avgWin, 0) / realizedPnL.length 
++    const winningPnls = closedTrades
++      .map((trade) => Number(trade.netPnl || 0))
++      .filter((value) => value > 0);
++    const losingPnls = closedTrades
++      .map((trade) => Number(trade.netPnl || 0))
++      .filter((value) => value < 0);
++    const avgWin = winningPnls.length > 0
++      ? winningPnls.reduce((sum, value) => sum + value, 0) / winningPnls.length
+       : 0;
+-    const avgLoss = realizedPnL.length > 0 
+-      ? realizedPnL.reduce((sum, r) => sum + r.avgLoss, 0) / realizedPnL.length 
++    const avgLoss = losingPnls.length > 0
++      ? Math.abs(losingPnls.reduce((sum, value) => sum + value, 0) / losingPnls.length)
+       : 0;
+ 
+-    const grossProfit = realizedPnL.reduce((sum, r) => {
+-      return sum + (r.grossPnl > 0 ? r.grossPnl : 0);
+-    }, 0);
+-    const grossLoss = Math.abs(realizedPnL.reduce((sum, r) => {
+-      return sum + (r.grossPnl < 0 ? r.grossPnl : 0);
+-    }, 0));
++    const grossProfit = winningPnls.reduce((sum, value) => sum + value, 0);
++    const grossLoss = Math.abs(losingPnls.reduce((sum, value) => sum + value, 0));
+     const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? Infinity : 0;
+ 
++    const notionalReturns = closedTrades
++      .map((trade) => {
++        const notional = Math.abs(Number(trade.entryPrice || 0) * Number(trade.entryQty || 0));
++        if (!(notional > 0)) return null;
++        return Number(trade.netPnl || 0) / notional;
++      })
++      .filter((value): value is number => value != null && Number.isFinite(value));
++    const openPositionReturns = unrealizedPnL
++      .map((position) => {
++        const notional = Math.abs(Number(position.entryPrice || 0) * Number(position.qty || 0));
++        if (!(notional > 0)) return null;
++        return Number(position.unrealizedPnl || 0) / notional;
++      })
++      .filter((value): value is number => value != null && Number.isFinite(value));
++    const returnsForPerformance = notionalReturns.length > 0 ? notionalReturns : openPositionReturns;
++    const meanReturn = this.mean(returnsForPerformance);
++    const returnVolatility = this.stdDev(returnsForPerformance);
++    const downsideDeviation = this.stdDev(returnsForPerformance.filter((value) => value < 0));
++    const sharpeRatio = returnsForPerformance.length > 1 && returnVolatility > 0
++      ? (meanReturn / returnVolatility) * Math.sqrt(returnsForPerformance.length)
++      : 0;
++    const sortinoRatio = returnsForPerformance.length > 1 && downsideDeviation > 0
++      ? (meanReturn / downsideDeviation) * Math.sqrt(returnsForPerformance.length)
++      : 0;
++
++    const expectancy = totalTrades > 0
++      ? closedTrades.reduce((sum, trade) => sum + Number(trade.netPnl || 0), 0) / totalTrades
++      : openPositions > 0
++        ? totalUnrealizedPnl / openPositions
++        : 0;
++    const avgReturnPerTradePct = meanReturn * 100;
++
+     // Execution summary
+     const execSummary = this.executionAnalytics.getSummary();
++    const slippageStats = this.executionAnalytics.getSlippageStats();
+ 
+     // Quality summary
+     const avgMfeMaeRatio = this.tradeQuality.getAverageMfeMaeRatio();
+@@ -168,23 +258,41 @@ export class AnalyticsEngine {
+     const scoreDist = this.tradeQuality.getScoreDistribution();
+ 
+     // Drawdown
+-    const drawdown = this.tradeQuality.getDrawdownMetrics();
++    const drawdown = this.computeDrawdownMetrics();
+ 
+     // Symbol breakdown
+-    const bySymbol: Record<string, any> = {};
+-    for (const pnl of realizedPnL) {
+-      const fees = this.pnlCalculator.getFeeBreakdown(pnl.symbol);
+-      const flips = this.executionAnalytics.getFlipMetrics(pnl.symbol);
+-      
+-      bySymbol[pnl.symbol] = {
+-        trades: pnl.tradeCount,
+-        realizedPnl: pnl.totalRealizedPnl,
+-        fees: pnl.totalFees,
+-        volume: (fees?.makerVolume || 0) + (fees?.takerVolume || 0),
+-        flipRate: flips?.flipRate || 0,
++    const bySymbol: Record<string, SessionSummary['bySymbol'][string]> = {};
++    const symbols = new Set<string>();
++    for (const item of realizedPnL) symbols.add(item.symbol);
++    for (const item of feeBreakdowns) symbols.add(item.symbol);
++    for (const item of unrealizedPnL) symbols.add(item.symbol);
++    for (const item of closedTrades) symbols.add(item.symbol);
++
++    const unrealizedBySymbol = new Map(unrealizedPnL.map((position) => [position.symbol, position]));
++    for (const symbol of symbols) {
++      const symbolTrades = closedTrades.filter((trade) => trade.symbol === symbol);
++      const symbolRealized = symbolTrades.reduce((sum, trade) => sum + Number(trade.realizedPnl || 0), 0);
++      const symbolFees = feeBreakdowns.find((fee) => fee.symbol === symbol);
++      const symbolPosition = unrealizedBySymbol.get(symbol);
++      const flips = this.executionAnalytics.getFlipMetrics(symbol);
++
++      bySymbol[symbol] = {
++        trades: symbolTrades.length,
++        realizedPnl: symbolRealized,
++        unrealizedPnl: Number(symbolPosition?.unrealizedPnl || 0),
++        fees: Number(symbolFees?.totalFees || 0),
++        volume: Number(symbolFees?.makerVolume || 0) + Number(symbolFees?.takerVolume || 0),
++        flipRate: Number(flips?.flipRate || 0),
++        openPosition: Boolean(symbolPosition),
++        positionSide: symbolPosition?.side || 'FLAT',
++        positionQty: Number(symbolPosition?.qty || 0),
+       };
+     }
+ 
++    const makerVolume = feeBreakdowns.reduce((sum, fee) => sum + Number(fee.makerVolume || 0), 0);
++    const takerVolume = feeBreakdowns.reduce((sum, fee) => sum + Number(fee.takerVolume || 0), 0);
++    const totalVolume = makerVolume + takerVolume;
++
+     return {
+       metadata: {
+         sessionId: this.sessionId,
+@@ -204,21 +312,29 @@ export class AnalyticsEngine {
+         unrealizedPnl: totalUnrealizedPnl,
+         totalFees,
+         netPnl,
+-        avgTradePnl: totalTrades > 0 ? netPnl / totalTrades : 0,
++        avgTradePnl: totalTrades > 0
++          ? closedTrades.reduce((sum, trade) => sum + Number(trade.netPnl || 0), 0) / totalTrades
++          : openPositions > 0
++            ? totalUnrealizedPnl / openPositions
++            : 0,
++        avgReturnPerTradePct,
+         avgWin,
+         avgLoss,
+         profitFactor,
+         maxDrawdown: drawdown.maxDrawdown,
+         maxDrawdownPercent: drawdown.maxDrawdownPercent,
+-        totalVolume: realizedPnL.reduce((sum, r) => sum + r.tradeCount, 0), // Simplified
+-        makerVolume: 0, // Would calculate from fees
+-        takerVolume: 0,
++        totalVolume,
++        makerVolume,
++        takerVolume,
+       },
+       bySymbol,
+       execution: {
+-        avgSlippageBps: execSummary.avgSlippageBps,
+-        positiveSlippageCount: 0, // Would calculate from records
+-        negativeSlippageCount: 0,
++        avgSlippageBps: slippageStats.avg || execSummary.avgSlippageBps,
++        slippageP95Bps: slippageStats.p95,
++        slippageMaxBps: slippageStats.max,
++        slippageSamples: slippageStats.samples,
++        positiveSlippageCount: slippageStats.positive,
++        negativeSlippageCount: slippageStats.negative,
+         totalFlips: execSummary.totalFlips,
+         avgFlipRate: execSummary.avgFlipRate,
+         adverseSelectionCount: execSummary.adverseSelectionCount,
+@@ -230,6 +346,14 @@ export class AnalyticsEngine {
+         goodTrades: scoreDist.excellent + scoreDist.good,
+         badTrades: scoreDist.poor,
+       },
++      performance: {
++        sharpeRatio,
++        sortinoRatio,
++        returnVolatility,
++        downsideDeviation,
++        expectancy,
++      },
++      positions: unrealizedPnL.map((position) => ({ ...position })),
+       trades: closedTrades,
+       drawdown,
+     };
+@@ -341,6 +465,9 @@ export class AnalyticsEngine {
+     this.sessionStartTime = Date.now();
+     this.sessionId = this.generateSessionId();
+     this.lastSnapshotTime = 0;
++    this.lastMarkPriceBySymbol.clear();
++    this.equitySeries = [{ timestamp: this.sessionStartTime, equity: 0 }];
++    this.lastEquityPointTs = this.sessionStartTime;
+   }
+ 
+   /**
+@@ -380,6 +507,103 @@ export class AnalyticsEngine {
+     }
+   }
+ 
++  private recordEquityPoint(timestamp: number, force: boolean = false): void {
++    const ts = Number.isFinite(Number(timestamp)) && Number(timestamp) > 0
++      ? Number(timestamp)
++      : Date.now();
++    if (!force && (ts - this.lastEquityPointTs) < 1000) {
++      return;
++    }
++    const equity = this.getCurrentNetPnl();
++    const previous = this.equitySeries.length > 0 ? this.equitySeries[this.equitySeries.length - 1] : null;
++    if (!force && previous && previous.equity === equity) {
++      this.lastEquityPointTs = ts;
++      return;
++    }
++    this.equitySeries.push({ timestamp: ts, equity });
++    this.lastEquityPointTs = ts;
++    if (this.equitySeries.length > 10_000) {
++      this.equitySeries = this.equitySeries.slice(-10_000);
++    }
++  }
++
++  private getCurrentNetPnl(): number {
++    const realized = this.pnlCalculator.getAllRealizedPnL()
++      .reduce((sum, item) => sum + Number(item.totalRealizedPnl || 0), 0);
++    const fees = this.pnlCalculator.getAllFeeBreakdowns()
++      .reduce((sum, fee) => sum + Number(fee.totalFees || 0), 0);
++    const unrealized = this.pnlCalculator.getAllUnrealizedPnL()
++      .reduce((sum, position) => sum + Number(position.unrealizedPnl || 0), 0);
++    return realized - fees + unrealized;
++  }
++
++  private computeDrawdownMetrics(): DrawdownMetrics {
++    if (this.equitySeries.length === 0) {
++      return {
++        currentDrawdown: 0,
++        maxDrawdown: 0,
++        maxDrawdownPercent: 0,
++        peakEquity: 0,
++        troughEquity: 0,
++        drawdownStart: 0,
++        drawdownEnd: null,
++        recoveryTimeMs: null,
++      };
++    }
++
++    let peakEquity = this.equitySeries[0].equity;
++    let peakTimestamp = this.equitySeries[0].timestamp;
++    let maxDrawdown = 0;
++    let maxDrawdownPercent = 0;
++    let drawdownStart = peakTimestamp;
++    let troughEquity = peakEquity;
++
++    for (const point of this.equitySeries) {
++      if (point.equity > peakEquity) {
++        peakEquity = point.equity;
++        peakTimestamp = point.timestamp;
++      }
++      const drawdown = Math.max(0, peakEquity - point.equity);
++      const pctBase = Math.max(1, Math.abs(peakEquity));
++      const drawdownPercent = Math.min(100, Math.max(0, (drawdown / pctBase) * 100));
++      if (drawdown > maxDrawdown) {
++        maxDrawdown = drawdown;
++        maxDrawdownPercent = drawdownPercent;
++        drawdownStart = peakTimestamp;
++        troughEquity = point.equity;
++      }
++    }
++
++    const latestPoint = this.equitySeries[this.equitySeries.length - 1];
++    const currentDrawdown = Math.max(0, peakEquity - latestPoint.equity);
++    const drawdownRecovered = currentDrawdown === 0;
++
++    return {
++      currentDrawdown,
++      maxDrawdown,
++      maxDrawdownPercent,
++      peakEquity,
++      troughEquity,
++      drawdownStart,
++      drawdownEnd: drawdownRecovered ? latestPoint.timestamp : null,
++      recoveryTimeMs: drawdownRecovered && drawdownStart > 0
++        ? Math.max(0, latestPoint.timestamp - drawdownStart)
++        : null,
++    };
++  }
++
++  private mean(values: number[]): number {
++    if (values.length === 0) return 0;
++    return values.reduce((sum, value) => sum + value, 0) / values.length;
++  }
++
++  private stdDev(values: number[]): number {
++    if (values.length < 2) return 0;
++    const avg = this.mean(values);
++    const variance = values.reduce((sum, value) => sum + Math.pow(value - avg, 2), 0) / values.length;
++    return Math.sqrt(variance);
++  }
++
+   private ensureOutputDir(): void {
+     if (!fs.existsSync(this.config.outputDir)) {
+       fs.mkdirSync(this.config.outputDir, { recursive: true });
+diff --git a/server/api/analytics.ts b/server/api/analytics.ts
+index 340e581..40f0065 100644
+--- a/server/api/analytics.ts
++++ b/server/api/analytics.ts
+@@ -22,6 +22,12 @@ export interface AnalyticsSnapshotResponse {
+     unrealizedPnl: number;
+     totalReturn: number;
+   };
++  fees: {
++    makerFees: number;
++    takerFees: number;
++    totalFees: number;
++    effectiveRate: number;
++  };
+   trades: {
+     totalTrades: number;
+     openPositions: number;
+@@ -30,10 +36,15 @@ export interface AnalyticsSnapshotResponse {
+     winRate: number;
+     avgWin: number;
+     avgLoss: number;
++    avgTradePnl: number;
++    avgReturnPerTradePct: number;
+     profitFactor: number;
+   };
+   execution: {
+     avgSlippageBps: number;
++    p95SlippageBps: number;
++    maxSlippageBps: number;
++    slippageSamples: number;
+     avgFillTimeMs: number;
+     flipRate: number;
+     adverseSelectionBps: number;
+@@ -47,19 +58,42 @@ export interface AnalyticsSnapshotResponse {
+     maxDrawdown: number;
+     maxDrawdownPercent: number;
+     currentDrawdown: number;
++    currentDrawdownPercent: number;
+     recoveryFactor: number;
+   };
++  performance: {
++    sharpeRatio: number;
++    sortinoRatio: number;
++    returnVolatility: number;
++    downsideDeviation: number;
++    expectancy: number;
++  };
++  positions: Array<{
++    symbol: string;
++    side: 'LONG' | 'SHORT' | 'FLAT';
++    qty: number;
++    entryPrice: number;
++    markPrice: number;
++    unrealizedPnl: number;
++    unrealizedPnlPercent: number;
++    notionalValue: number;
++  }>;
+   bySymbol: Record<string, {
+     trades: number;
+     realizedPnl: number;
++    unrealizedPnl: number;
+     fees: number;
+     volume: number;
+     flipRate: number;
++    openPosition: boolean;
++    positionSide: 'LONG' | 'SHORT' | 'FLAT';
++    positionQty: number;
+   }>;
+ }
+ 
+ export interface AnalyticsRoutesOptions {
+   analyticsEngine: AnalyticsEngine;
++  getDryRunStatus?: () => any;
+ }
+ 
+ export interface EvidencePackResponse {
+@@ -67,17 +101,201 @@ export interface EvidencePackResponse {
+   metadata: Record<string, unknown>;
+ }
+ 
++interface DryRunAnalyticsFallback {
++  totalRealizedPnl: number;
++  totalFees: number;
++  unrealizedPnl: number;
++  netPnl: number;
++  totalTrades: number;
++  openPositions: number;
++  winningTrades: number;
++  losingTrades: number;
++  winRate: number;
++  avgWin: number;
++  avgLoss: number;
++  avgTradePnl: number;
++  avgReturnPerTradePct: number;
++  profitFactor: number;
++  maxDrawdown: number;
++  maxDrawdownPercent: number;
++  currentDrawdown: number;
++  currentDrawdownPercent: number;
++  recoveryFactor: number;
++  sharpeRatio: number;
++  sortinoRatio: number;
++  returnVolatility: number;
++  downsideDeviation: number;
++  expectancy: number;
++  positions: AnalyticsSnapshotResponse['positions'];
++  bySymbol: AnalyticsSnapshotResponse['bySymbol'];
++}
++
++function deriveDryRunFallback(status: any): DryRunAnalyticsFallback | null {
++  if (!status || typeof status !== 'object') return null;
++
++  const summary = status.summary || {};
++  const config = status.config || {};
++  const performance = summary.performance || {};
++  const perSymbol = status.perSymbol && typeof status.perSymbol === 'object'
++    ? status.perSymbol
++    : {};
++
++  const startBalance = Math.max(1e-9, Number(config.walletBalanceStartUsdt || 0));
++  const totalRealizedPnl = Number(summary.realizedPnl || 0);
++  const totalFees = Number(summary.feePaid || 0);
++  const unrealizedPnl = Number(summary.unrealizedPnl || 0);
++  const netPnl = totalRealizedPnl - totalFees + unrealizedPnl;
++  const totalTrades = Math.max(0, Number(performance.totalTrades || 0));
++  const winningTrades = Math.max(0, Number(performance.winCount || 0));
++  const losingTrades = Math.max(0, Number(performance.lossCount || 0));
++  const winRate = Number(performance.winRate || 0);
++  const maxDrawdown = Math.max(0, Number(performance.maxDrawdown || 0));
++  const maxDrawdownPercentRaw = startBalance > 0 ? (maxDrawdown / startBalance) * 100 : 0;
++  const maxDrawdownPercent = Math.min(100, Math.max(0, maxDrawdownPercentRaw));
++  const currentDrawdown = Math.max(0, -netPnl);
++  const currentDrawdownPercentRaw = startBalance > 0 ? (currentDrawdown / startBalance) * 100 : 0;
++  const currentDrawdownPercent = Math.min(100, Math.max(0, currentDrawdownPercentRaw));
++
++  const positions: AnalyticsSnapshotResponse['positions'] = [];
++  const bySymbol: AnalyticsSnapshotResponse['bySymbol'] = {};
++  for (const [symbol, symbolStatusRaw] of Object.entries(perSymbol)) {
++    const symbolStatus = (symbolStatusRaw || {}) as any;
++    const metrics = symbolStatus.metrics || {};
++    const symbolPerf = symbolStatus.performance || {};
++    const position = symbolStatus.position || null;
++    const qty = Math.max(0, Math.abs(Number(position?.qty || 0)));
++    const sideRaw = String(position?.side || 'FLAT').toUpperCase();
++    const side: 'LONG' | 'SHORT' | 'FLAT' = sideRaw === 'LONG' || sideRaw === 'SHORT'
++      ? sideRaw
++      : 'FLAT';
++    const entryPrice = Math.max(0, Number(position?.entryPrice || 0));
++    const markPrice = Math.max(0, Number(metrics.markPrice || entryPrice || 0));
++    const symbolUnrealized = Number(metrics.unrealizedPnl || 0);
++    const notionalValue = qty * markPrice;
++    const unrealizedPnlPercent = entryPrice > 0 && qty > 0
++      ? (symbolUnrealized / (entryPrice * qty)) * 100
++      : 0;
++
++    if (qty > 0 && side !== 'FLAT') {
++      positions.push({
++        symbol,
++        side,
++        qty,
++        entryPrice,
++        markPrice,
++        unrealizedPnl: symbolUnrealized,
++        unrealizedPnlPercent,
++        notionalValue,
++      });
++    }
++
++    bySymbol[symbol] = {
++      trades: Math.max(0, Number(symbolPerf.totalTrades || 0)),
++      realizedPnl: Number(metrics.realizedPnl || 0),
++      unrealizedPnl: symbolUnrealized,
++      fees: Number(metrics.feePaid || 0),
++      volume: 0,
++      flipRate: 0,
++      openPosition: qty > 0 && side !== 'FLAT',
++      positionSide: qty > 0 && side !== 'FLAT' ? side : 'FLAT',
++      positionQty: qty,
++    };
++  }
++
++  return {
++    totalRealizedPnl,
++    totalFees,
++    unrealizedPnl,
++    netPnl,
++    totalTrades,
++    openPositions: positions.length,
++    winningTrades,
++    losingTrades,
++    winRate,
++    avgWin: 0,
++    avgLoss: 0,
++    avgTradePnl: totalTrades > 0 ? netPnl / totalTrades : positions.length > 0 ? unrealizedPnl / positions.length : 0,
++    avgReturnPerTradePct: 0,
++    profitFactor: 0,
++    maxDrawdown,
++    maxDrawdownPercent,
++    currentDrawdown,
++    currentDrawdownPercent,
++    recoveryFactor: 0,
++    sharpeRatio: Number(performance.sharpeRatio || 0),
++    sortinoRatio: 0,
++    returnVolatility: 0,
++    downsideDeviation: 0,
++    expectancy: totalTrades > 0 ? netPnl / totalTrades : 0,
++    positions,
++    bySymbol,
++  };
++}
++
+ export function createAnalyticsRoutes(options: AnalyticsRoutesOptions): Router {
+   const router = Router();
+-  const { analyticsEngine } = options;
++  const { analyticsEngine, getDryRunStatus } = options;
+ 
+   router.get('/snapshot', (_req: Request, res: Response) => {
+     try {
+       const snapshot = analyticsEngine.getSnapshot();
++      const dryRunFallback = deriveDryRunFallback(getDryRunStatus ? getDryRunStatus() : null);
++      const useFallback = Boolean(
++        dryRunFallback
++        && snapshot.summary.totalTrades === 0
++        && (
++          dryRunFallback.totalTrades > 0
++          || dryRunFallback.openPositions > 0
++          || Math.abs(dryRunFallback.totalRealizedPnl) > 0
++          || Math.abs(dryRunFallback.unrealizedPnl) > 0
++          || dryRunFallback.totalFees > 0
++        ),
++      );
++
++      const totalRealizedPnl = useFallback ? dryRunFallback!.totalRealizedPnl : snapshot.summary.totalRealizedPnl;
++      const totalFees = useFallback ? dryRunFallback!.totalFees : snapshot.summary.totalFees;
++      const unrealizedPnl = useFallback ? dryRunFallback!.unrealizedPnl : snapshot.summary.unrealizedPnl;
++      const netPnl = useFallback ? dryRunFallback!.netPnl : snapshot.summary.netPnl;
++      const totalTrades = useFallback ? dryRunFallback!.totalTrades : snapshot.summary.totalTrades;
++      const openPositions = useFallback ? dryRunFallback!.openPositions : snapshot.summary.openPositions;
++      const winningTrades = useFallback ? dryRunFallback!.winningTrades : snapshot.summary.winningTrades;
++      const losingTrades = useFallback ? dryRunFallback!.losingTrades : snapshot.summary.losingTrades;
++      const winRate = useFallback ? dryRunFallback!.winRate : snapshot.summary.winRate;
++      const avgWin = useFallback ? dryRunFallback!.avgWin : snapshot.summary.avgWin;
++      const avgLoss = useFallback ? dryRunFallback!.avgLoss : snapshot.summary.avgLoss;
++      const avgTradePnl = useFallback ? dryRunFallback!.avgTradePnl : snapshot.summary.avgTradePnl;
++      const avgReturnPerTradePct = useFallback ? dryRunFallback!.avgReturnPerTradePct : snapshot.summary.avgReturnPerTradePct;
++      const profitFactor = useFallback ? dryRunFallback!.profitFactor : snapshot.summary.profitFactor;
++      const maxDrawdown = useFallback ? dryRunFallback!.maxDrawdown : snapshot.drawdown.maxDrawdown;
++      const maxDrawdownPercent = useFallback ? dryRunFallback!.maxDrawdownPercent : snapshot.drawdown.maxDrawdownPercent;
++      const currentDrawdown = useFallback ? dryRunFallback!.currentDrawdown : snapshot.drawdown.currentDrawdown;
++      const currentDrawdownPercentRaw = useFallback
++        ? dryRunFallback!.currentDrawdownPercent
++        : Number(snapshot.drawdown.peakEquity || 0) !== 0
++          ? (snapshot.drawdown.currentDrawdown / Math.max(1, Math.abs(Number(snapshot.drawdown.peakEquity || 0)))) * 100
++          : 0;
++      const currentDrawdownPercent = Math.min(100, Math.max(0, Number(currentDrawdownPercentRaw || 0)));
++      const recoveryFactor = useFallback
++        ? dryRunFallback!.recoveryFactor
++        : Number(snapshot.drawdown.recoveryTimeMs ?? 0);
++      const sharpeRatio = useFallback ? dryRunFallback!.sharpeRatio : Number(snapshot.performance?.sharpeRatio || 0);
++      const sortinoRatio = useFallback ? dryRunFallback!.sortinoRatio : Number(snapshot.performance?.sortinoRatio || 0);
++      const returnVolatility = useFallback ? dryRunFallback!.returnVolatility : Number(snapshot.performance?.returnVolatility || 0);
++      const downsideDeviation = useFallback ? dryRunFallback!.downsideDeviation : Number(snapshot.performance?.downsideDeviation || 0);
++      const expectancy = useFallback ? dryRunFallback!.expectancy : Number(snapshot.performance?.expectancy || 0);
++      const positions = useFallback ? dryRunFallback!.positions : (Array.isArray(snapshot.positions) ? snapshot.positions : []);
++      const bySymbol = useFallback ? dryRunFallback!.bySymbol : snapshot.bySymbol;
++
++      const evidencePack = analyticsEngine.generateEvidencePack();
++      const feeBreakdowns = evidencePack?.pnl?.fees || [];
++      const makerFees = feeBreakdowns.reduce((sum, fee) => sum + Number(fee?.makerFees || 0), 0);
++      const takerFees = feeBreakdowns.reduce((sum, fee) => sum + Number(fee?.takerFees || 0), 0);
+       const neutralTrades = Math.max(
+-        snapshot.summary.totalTrades - snapshot.quality.goodTrades - snapshot.quality.badTrades,
++        totalTrades - snapshot.quality.goodTrades - snapshot.quality.badTrades,
+         0,
+       );
++      const totalNotional = Object.values(bySymbol || {})
++        .reduce((sum, symbolStats) => sum + Number(symbolStats?.volume || 0), 0);
+ 
+       const response: AnalyticsSnapshotResponse = {
+         timestamp: Date.now(),
+@@ -87,24 +305,35 @@ export function createAnalyticsRoutes(options: AnalyticsRoutesOptions): Router {
+           durationMs: snapshot.metadata.durationMs,
+         },
+         pnl: {
+-          totalRealizedPnl: snapshot.summary.totalRealizedPnl,
+-          totalFees: snapshot.summary.totalFees,
+-          netPnl: snapshot.summary.netPnl,
+-          unrealizedPnl: snapshot.summary.unrealizedPnl,
++          totalRealizedPnl,
++          totalFees,
++          netPnl,
++          unrealizedPnl,
+           totalReturn: 0,
+         },
++        fees: {
++          makerFees: makerFees > 0 ? makerFees : (useFallback ? 0 : makerFees),
++          takerFees: takerFees > 0 ? takerFees : (useFallback ? totalFees : takerFees),
++          totalFees,
++          effectiveRate: totalNotional > 0 ? totalFees / totalNotional : 0,
++        },
+         trades: {
+-          totalTrades: snapshot.summary.totalTrades,
+-          openPositions: snapshot.summary.openPositions,
+-          winningTrades: snapshot.summary.winningTrades,
+-          losingTrades: snapshot.summary.losingTrades,
+-          winRate: snapshot.summary.winRate,
+-          avgWin: snapshot.summary.avgWin,
+-          avgLoss: snapshot.summary.avgLoss,
+-          profitFactor: snapshot.summary.profitFactor,
++          totalTrades,
++          openPositions,
++          winningTrades,
++          losingTrades,
++          winRate,
++          avgWin,
++          avgLoss,
++          avgTradePnl,
++          avgReturnPerTradePct,
++          profitFactor,
+         },
+         execution: {
+           avgSlippageBps: snapshot.execution.avgSlippageBps,
++          p95SlippageBps: snapshot.execution.slippageP95Bps,
++          maxSlippageBps: snapshot.execution.slippageMaxBps,
++          slippageSamples: snapshot.execution.slippageSamples,
+           avgFillTimeMs: 0,
+           flipRate: snapshot.execution.avgFlipRate,
+           adverseSelectionBps: snapshot.execution.adverseSelectionRate,
+@@ -119,12 +348,21 @@ export function createAnalyticsRoutes(options: AnalyticsRoutesOptions): Router {
+           },
+         },
+         drawdown: {
+-          maxDrawdown: snapshot.drawdown.maxDrawdown,
+-          maxDrawdownPercent: snapshot.drawdown.maxDrawdownPercent,
+-          currentDrawdown: snapshot.drawdown.currentDrawdown,
+-          recoveryFactor: Number(snapshot.drawdown.recoveryTimeMs ?? 0),
++          maxDrawdown,
++          maxDrawdownPercent,
++          currentDrawdown,
++          currentDrawdownPercent,
++          recoveryFactor,
+         },
+-        bySymbol: snapshot.bySymbol,
++        performance: {
++          sharpeRatio,
++          sortinoRatio,
++          returnVolatility,
++          downsideDeviation,
++          expectancy,
++        },
++        positions,
++        bySymbol,
+       };
+ 
+       res.status(200).json(response);
+@@ -155,6 +393,10 @@ export function createAnalyticsRoutes(options: AnalyticsRoutesOptions): Router {
+   router.get('/pnl', (_req: Request, res: Response) => {
+     try {
+       const snapshot = analyticsEngine.getSnapshot();
++      const evidencePack = analyticsEngine.generateEvidencePack();
++      const feeBreakdowns = evidencePack?.pnl?.fees || [];
++      const makerFees = feeBreakdowns.reduce((sum, fee) => sum + Number(fee?.makerFees || 0), 0);
++      const takerFees = feeBreakdowns.reduce((sum, fee) => sum + Number(fee?.takerFees || 0), 0);
+       res.status(200).json({
+         timestamp: Date.now(),
+         pnl: {
+@@ -162,8 +404,11 @@ export function createAnalyticsRoutes(options: AnalyticsRoutesOptions): Router {
+           totalFees: snapshot.summary.totalFees,
+           netPnl: snapshot.summary.netPnl,
+           unrealizedPnl: snapshot.summary.unrealizedPnl,
++          makerFees,
++          takerFees,
+           totalReturn: 0,
+         },
++        positions: snapshot.positions || [],
+         bySymbol: snapshot.bySymbol,
+       });
+     } catch (error: any) {
+@@ -187,8 +432,11 @@ export function createAnalyticsRoutes(options: AnalyticsRoutesOptions): Router {
+           winRate: snapshot.summary.winRate,
+           avgWin: snapshot.summary.avgWin,
+           avgLoss: snapshot.summary.avgLoss,
++          avgTradePnl: snapshot.summary.avgTradePnl,
++          avgReturnPerTradePct: snapshot.summary.avgReturnPerTradePct,
+           profitFactor: snapshot.summary.profitFactor,
+         },
++        positions: snapshot.positions || [],
+       });
+     } catch (error: any) {
+       res.status(500).json({
+@@ -207,6 +455,9 @@ export function createAnalyticsRoutes(options: AnalyticsRoutesOptions): Router {
+           maxDrawdown: snapshot.drawdown.maxDrawdown,
+           maxDrawdownPercent: snapshot.drawdown.maxDrawdownPercent,
+           currentDrawdown: snapshot.drawdown.currentDrawdown,
++          currentDrawdownPercent: Number(snapshot.drawdown.peakEquity || 0) !== 0
++            ? (snapshot.drawdown.currentDrawdown / Math.max(1e-9, Math.abs(Number(snapshot.drawdown.peakEquity || 0)))) * 100
++            : 0,
+           recoveryFactor: Number(snapshot.drawdown.recoveryTimeMs ?? 0),
+         },
+       });
+@@ -218,5 +469,26 @@ export function createAnalyticsRoutes(options: AnalyticsRoutesOptions): Router {
+     }
+   });
+ 
++  router.get('/performance', (_req: Request, res: Response) => {
++    try {
++      const snapshot = analyticsEngine.getSnapshot();
++      res.status(200).json({
++        timestamp: Date.now(),
++        performance: {
++          sharpeRatio: Number(snapshot.performance?.sharpeRatio || 0),
++          sortinoRatio: Number(snapshot.performance?.sortinoRatio || 0),
++          returnVolatility: Number(snapshot.performance?.returnVolatility || 0),
++          downsideDeviation: Number(snapshot.performance?.downsideDeviation || 0),
++          expectancy: Number(snapshot.performance?.expectancy || 0),
++        },
++      });
++    } catch (error: any) {
++      res.status(500).json({
++        error: 'analytics_performance_failed',
++        message: error?.message || 'Failed to get performance metrics',
++      });
++    }
++  });
++
+   return router;
+ }
+diff --git a/server/api/strategy.ts b/server/api/strategy.ts
+index e01c3a2..923cc7f 100644
+--- a/server/api/strategy.ts
++++ b/server/api/strategy.ts
+@@ -7,13 +7,15 @@
+ 
+ import { Request, Response } from 'express';
+ import { Router } from 'express';
+-import { ConsensusEngine, ConsensusDecision } from '../consensus/ConsensusEngine';
++import { ConsensusEngine } from '../consensus/ConsensusEngine';
+ import { StrategySignal, SignalSide } from '../strategies/StrategyInterface';
+ import { RiskState } from '../risk/RiskStateManager';
+ 
+ // Types for strategy snapshot response
+ export interface StrategySnapshotResponse {
+   timestamp: number;
++  symbol?: string | null;
++  riskState?: RiskState;
+   consensus: {
+     side: 'LONG' | 'SHORT' | 'FLAT';
+     confidence: number;
+@@ -29,6 +31,11 @@ export interface StrategySnapshotResponse {
+     };
+     strategyIds: string[];
+   } | null;
++  strategyConfidence?: Record<string, {
++    side: 'LONG' | 'SHORT' | 'FLAT';
++    confidence: number;
++    timestamp: number;
++  }>;
+   signals: Array<{
+     strategyId: string;
+     side: 'LONG' | 'SHORT' | 'FLAT';
+@@ -50,6 +57,23 @@ export interface StrategySnapshotResponse {
+ export interface StrategyRoutesOptions {
+   consensusEngine: ConsensusEngine;
+   getCurrentSignals: (symbol?: string) => StrategySignal[];
++  getCurrentConsensus?: (symbol?: string) => {
++    timestampMs: number;
++    side: 'LONG' | 'SHORT' | 'FLAT';
++    confidence: number;
++    quorumMet: boolean;
++    riskGatePassed: boolean;
++    contributingStrategies: number;
++    totalStrategies: number;
++    vetoApplied: boolean;
++    breakdown: {
++      long: { count: number; avgConfidence: number };
++      short: { count: number; avgConfidence: number };
++      flat: { count: number; avgConfidence: number };
++    };
++    strategyIds: string[];
++    shouldTrade: boolean;
++  } | null;
+   getCurrentRiskState: (symbol?: string) => RiskState;
+ }
+ 
+@@ -58,7 +82,12 @@ export interface StrategyRoutesOptions {
+  */
+ export function createStrategyRoutes(options: StrategyRoutesOptions): Router {
+   const router = Router();
+-  const { consensusEngine, getCurrentSignals, getCurrentRiskState } = options;
++  const {
++    consensusEngine,
++    getCurrentSignals,
++    getCurrentConsensus,
++    getCurrentRiskState,
++  } = options;
+ 
+   /**
+    * GET /api/strategy/snapshot
+@@ -73,9 +102,18 @@ export function createStrategyRoutes(options: StrategyRoutesOptions): Router {
+       
+       // Evaluate consensus
+       let consensus: StrategySnapshotResponse['consensus'] = null;
++      const latestSignalTs = signals.reduce((maxTs, signal) => {
++        const ts = Number(signal?.timestamp || 0);
++        return ts > maxTs ? ts : maxTs;
++      }, 0);
++      const runtimeConsensus = getCurrentConsensus ? getCurrentConsensus(symbol) : null;
+       
+       try {
+-        const decision = consensusEngine.evaluate(signals, riskState, now);
++        const decision = runtimeConsensus || consensusEngine.evaluate(
++          signals,
++          riskState,
++          latestSignalTs > 0 ? latestSignalTs : now
++        );
+         consensus = {
+           side: decision.side,
+           confidence: decision.confidence,
+@@ -100,8 +138,20 @@ export function createStrategyRoutes(options: StrategyRoutesOptions): Router {
+         metadata: signal.metadata,
+       }));
+ 
++      const strategyConfidence = formattedSignals.reduce((acc, signal) => {
++        const prev = acc[signal.strategyId];
++        if (!prev || signal.timestamp >= prev.timestamp) {
++          acc[signal.strategyId] = {
++            side: signal.side,
++            confidence: signal.confidence,
++            timestamp: signal.timestamp,
++          };
++        }
++        return acc;
++      }, {} as NonNullable<StrategySnapshotResponse['strategyConfidence']>);
++
+       // Get consensus config
+-      const config = (consensusEngine as any).config || {
++      const config = (consensusEngine as any).getConfig?.() || (consensusEngine as any).config || {
+         minQuorumSize: 2,
+         minConfidenceThreshold: 0.3,
+         maxSignalAgeMs: 5000,
+@@ -112,7 +162,10 @@ export function createStrategyRoutes(options: StrategyRoutesOptions): Router {
+ 
+       const response: StrategySnapshotResponse = {
+         timestamp: now,
++        symbol: symbol || null,
++        riskState,
+         consensus,
++        strategyConfidence,
+         signals: formattedSignals,
+         config: {
+           minQuorumSize: config.minQuorumSize,
+@@ -171,11 +224,22 @@ export function createStrategyRoutes(options: StrategyRoutesOptions): Router {
+       const symbol = typeof _req.query.symbol === 'string' ? String(_req.query.symbol).toUpperCase() : undefined;
+       const signals = getCurrentSignals(symbol);
+       const riskState = getCurrentRiskState(symbol);
++      const latestSignalTs = signals.reduce((maxTs, signal) => {
++        const ts = Number(signal?.timestamp || 0);
++        return ts > maxTs ? ts : maxTs;
++      }, 0);
++      const runtimeConsensus = getCurrentConsensus ? getCurrentConsensus(symbol) : null;
+       
+-      const decision = consensusEngine.evaluate(signals, riskState, now);
++      const decision = runtimeConsensus || consensusEngine.evaluate(
++        signals,
++        riskState,
++        latestSignalTs > 0 ? latestSignalTs : now
++      );
+       
+       res.status(200).json({
+         timestamp: now,
++        symbol: symbol || null,
++        riskState,
+         consensus: {
+           side: decision.side,
+           confidence: decision.confidence,
+diff --git a/server/index.ts b/server/index.ts
+index 79f8f5c..a8c2bc4 100644
+--- a/server/index.ts
++++ b/server/index.ts
+@@ -490,6 +490,14 @@ const strategyConsensusBySymbol = new Map<string, {
+     riskGatePassed: boolean;
+     contributingStrategies: number;
+     totalStrategies: number;
++    vetoApplied: boolean;
++    breakdown: {
++        long: { count: number; avgConfidence: number };
++        short: { count: number; avgConfidence: number };
++        flat: { count: number; avgConfidence: number };
++    };
++    strategyIds: string[];
++    shouldTrade: boolean;
+ }>();
+ const resilienceGuardActions: ResilienceGuardAction[] = [];
+ const resilienceActionDedupMap = new Map<string, number>();
+@@ -593,8 +601,8 @@ function logAnalyticsError(kind: string, symbol: string | null, error: unknown):
+ 
+ function trackResilience(reason: string, symbol: string, action: string, timestamp: number): void {
+     const normalized = String(reason || '').toLowerCase();
+-    let guardType: ResilienceGuardAction['guardType'] = 'latency';
+-    let counterKey: keyof typeof resilienceTriggerCounters = 'latencySpike';
++    let guardType: ResilienceGuardAction['guardType'] = 'general';
++    let counterKey: keyof typeof resilienceTriggerCounters | null = null;
+     let severity: ResilienceGuardAction['severity'] = 'low';
+ 
+     if (normalized.includes('spoof')) {
+@@ -607,9 +615,20 @@ function trackResilience(reason: string, symbol: string, action: string, timesta
+         guardType = 'flash_crash';
+         counterKey = 'flashCrash';
+         severity = 'high';
+-    } else {
++    } else if (
++        normalized.includes('latency')
++        || normalized.includes('event_loop')
++        || normalized.includes('p95')
++        || normalized.includes('p99')
++    ) {
+         guardType = 'latency';
+         counterKey = 'latencySpike';
++    } else if (normalized.includes('churn')) {
++        // Churn suppressions are informational and should not inflate latency/error counters.
++        guardType = 'general';
++        severity = normalized.includes('no_trade') ? 'medium' : 'low';
++    } else {
++        guardType = 'general';
+     }
+ 
+     if (normalized.includes('kill') || normalized.includes('halt') || normalized.includes('critical')) {
+@@ -637,7 +656,9 @@ function trackResilience(reason: string, symbol: string, action: string, timesta
+         }
+     }
+ 
+-    resilienceTriggerCounters[counterKey] += 1;
++    if (counterKey) {
++        resilienceTriggerCounters[counterKey] += 1;
++    }
+     resilienceGuardActions.push({
+         guardType,
+         timestamp: eventTimestamp,
+@@ -2603,8 +2624,10 @@ function applyOrchestratorOrders(symbol: string, decision: OrchestratorV1Decisio
+ 
+     const isPreTradeIntent = decision.intent === 'ENTRY' || decision.intent === 'ADD';
+     const riskMultiplier = RISK_ENGINE_ENABLED ? institutionalRiskEngine.getPositionMultiplier() : 1;
+-    if (RISK_ENGINE_ENABLED && isPreTradeIntent && decision.side) {
++    if (isPreTradeIntent && decision.side) {
+         observabilityMetrics.recordTradeAttempt();
++    }
++    if (RISK_ENGINE_ENABLED && isPreTradeIntent && decision.side) {
+         const currentPos = dryRunSession.getStrategyPosition(symbol);
+         const fallbackPrice = Number(currentPos?.entryPrice || decision.position?.entryVwap || 0) > 0
+             ? Number(currentPos?.entryPrice || decision.position?.entryVwap || 0)
+@@ -2673,8 +2696,23 @@ function applyOrchestratorOrders(symbol: string, decision: OrchestratorV1Decisio
+     if (!decision || !Array.isArray(decision.orders) || decision.orders.length === 0) {
+         return;
+     }
++    if (!isPreTradeIntent) {
++        observabilityMetrics.recordTradeAttempt();
++    }
+     for (const order of decision.orders) {
+         decisionRuntimeStats.ordersAttempted += 1;
++        const orderId = String(order.id || `${symbol}-${decision.timestampMs}-${decisionRuntimeStats.ordersAttempted}`);
++        const expectedPrice = Number(order.price || decision.position?.entryVwap || 0);
++        const expectedQty = Math.max(0, Math.abs(Number(order.qty || 0)));
++        if (expectedPrice > 0 && expectedQty > 0) {
++            analyticsEngine.recordExpectedFill(
++                orderId,
++                symbol,
++                expectedPrice,
++                order.side,
++                expectedQty
++            );
++        }
+         if (order.kind === 'MAKER') {
+             decisionRuntimeStats.makerOrdersPlaced += 1;
+         } else {
+@@ -2692,7 +2730,7 @@ function applyOrchestratorOrders(symbol: string, decision: OrchestratorV1Decisio
+             const requestedQty = Math.max(0, Math.abs(Number(order.qty || 0)));
+             if (requestedQty > 0) {
+                 institutionalRiskEngine.recordExecutionEvent(
+-                    String(order.id || `${symbol}-${decision.timestampMs}-${decisionRuntimeStats.ordersAttempted}`),
++                    orderId,
+                     symbol,
+                     'fill',
+                     requestedQty,
+@@ -3070,6 +3108,25 @@ function broadcastMetrics(
+                 riskGatePassed: Boolean(consensusDecision.riskGatePassed),
+                 contributingStrategies: Number(consensusDecision.contributingStrategies || 0),
+                 totalStrategies: Number(consensusDecision.totalStrategies || 0),
++                vetoApplied: Boolean(consensusDecision.vetoApplied),
++                breakdown: {
++                    long: {
++                        count: Number(consensusDecision.breakdown?.long?.count || 0),
++                        avgConfidence: Number(consensusDecision.breakdown?.long?.avgConfidence || 0),
++                    },
++                    short: {
++                        count: Number(consensusDecision.breakdown?.short?.count || 0),
++                        avgConfidence: Number(consensusDecision.breakdown?.short?.avgConfidence || 0),
++                    },
++                    flat: {
++                        count: Number(consensusDecision.breakdown?.flat?.count || 0),
++                        avgConfidence: Number(consensusDecision.breakdown?.flat?.avgConfidence || 0),
++                    },
++                },
++                strategyIds: Array.isArray(consensusDecision.strategyIds)
++                    ? [...consensusDecision.strategyIds]
++                    : [],
++                shouldTrade: consensusEngine.shouldTrade(consensusDecision),
+             });
+ 
+             const hardStop = resolvedRiskState === RiskState.HALTED || resolvedRiskState === RiskState.KILL_SWITCH;
+@@ -3235,6 +3292,7 @@ function broadcastMetrics(
+         symbol: s,
+         state: ob.uiState,
+         event_time_ms: eventTimeMs,
++        server_sent_ms: now,
+         riskEngine: riskSummary,
+         snapshot: meta.snapshotTracker.next({ s, mid }),
+         timeAndSales: tasMetrics,
+@@ -3415,6 +3473,22 @@ function getDashboardStrategySignals(symbol?: string): StrategySignal[] {
+     return (strategySignalsBySymbol.get(target) || []).map((signal) => ({ ...signal }));
+ }
+ 
++function getDashboardStrategyConsensus(symbol?: string) {
++    const target = resolveDashboardSymbol(symbol);
++    if (!target) return null;
++    const consensus = strategyConsensusBySymbol.get(target);
++    if (!consensus) return null;
++    return {
++        ...consensus,
++        strategyIds: [...consensus.strategyIds],
++        breakdown: {
++            long: { ...consensus.breakdown.long },
++            short: { ...consensus.breakdown.short },
++            flat: { ...consensus.breakdown.flat },
++        },
++    };
++}
++
+ function getDashboardRiskState(): RiskState {
+     if (!RISK_ENGINE_ENABLED) {
+         return RiskState.TRACKING;
+@@ -4018,12 +4092,14 @@ app.use('/api/telemetry', createTelemetryRoutes({
+     metricsCollector: observabilityMetrics.collector,
+     latencyTracker,
+     getUptimeMs: () => healthController.getUptime(),
++    getActiveSymbols: () => Array.from(activeSymbols),
+ }));
+ 
+ app.use('/api/strategy', createStrategyRoutes({
+     consensusEngine,
+     getCurrentSignals: (symbol?: string) => getDashboardStrategySignals(symbol),
+-    getCurrentRiskState: () => getDashboardRiskState(),
++    getCurrentConsensus: (symbol?: string) => getDashboardStrategyConsensus(symbol),
++    getCurrentRiskState: (_symbol?: string) => getDashboardRiskState(),
+ }));
+ 
+ app.use('/api/risk', createRiskRoutes({
+@@ -4070,6 +4146,7 @@ app.use('/api/resilience', createResilienceRoutes({
+ 
+ app.use('/api/analytics', createAnalyticsRoutes({
+     analyticsEngine,
++    getDryRunStatus: () => dryRunSession.getStatus(),
+ }));
+ 
+ app.post('/api/abtest/start', (req, res) => {
+diff --git a/server/risk/ResiliencePatches.ts b/server/risk/ResiliencePatches.ts
+index 14db768..795238d 100644
+--- a/server/risk/ResiliencePatches.ts
++++ b/server/risk/ResiliencePatches.ts
+@@ -209,7 +209,7 @@ export class ResiliencePatches {
+     
+     const result = this.latencyGuard.recordLatency(latencyMs, timestampMs, type);
+     
+-    if (result.shouldTriggerKillSwitch) {
++    if (result.shouldTriggerKillSwitch && this.config.autoKillSwitch) {
+       this.triggerKillSwitch(RiskStateTrigger.LATENCY_SPIKE, `Latency violation: ${result.reason}`, timestampMs);
+     }
+   }
+diff --git a/server/test/suites.ts b/server/test/suites.ts
+index f81bc69..dfd9e95 100644
+--- a/server/test/suites.ts
++++ b/server/test/suites.ts
+@@ -29,6 +29,11 @@ import * as OrderbookIntegrityMonitorTests from './OrderbookIntegrityMonitor.tes
+ import * as DryRunClockTests from './DryRunClock.test';
+ import * as FreezeControllerTests from './FreezeController.test';
+ import * as PositionSizerTests from './PositionSizer.test';
++import * as ResiliencePatchesTests from './ResiliencePatches.test';
++import * as StrategyApiConsensusTests from './StrategyApiConsensus.test';
++import * as AnalyticsEngineMetricsTests from './AnalyticsEngineMetrics.test';
++import * as TelemetryApiTests from './TelemetryApi.test';
++import * as AnalyticsApiFallbackTests from './AnalyticsApiFallback.test';
+ 
+ export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
+     { name: 'TimeAndSales', fn: TimeAndSalesTests.runTests },
+@@ -61,4 +66,9 @@ export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
+     { name: 'DryRunClock', fn: DryRunClockTests.runTests },
+     { name: 'FreezeController', fn: FreezeControllerTests.runTests },
+     { name: 'PositionSizer', fn: PositionSizerTests.runTests },
++    { name: 'ResiliencePatches', fn: ResiliencePatchesTests.runTests },
++    { name: 'StrategyApiConsensus', fn: StrategyApiConsensusTests.runTests },
++    { name: 'AnalyticsEngineMetrics', fn: AnalyticsEngineMetricsTests.runTests },
++    { name: 'TelemetryApi', fn: TelemetryApiTests.runTests },
++    { name: 'AnalyticsApiFallback', fn: AnalyticsApiFallbackTests.runTests },
+ ];
+diff --git a/src/hooks/useAnalytics.ts b/src/hooks/useAnalytics.ts
+index 66964e0..9056c5b 100644
+--- a/src/hooks/useAnalytics.ts
++++ b/src/hooks/useAnalytics.ts
+@@ -29,10 +29,23 @@ export interface SlippageMetrics {
+ export interface DrawdownMetrics {
+   current: number;
+   max: number;
++  currentPercent: number;
++  maxPercent: number;
+   recovery: number;
+   duration: number;
+ }
+ 
++export interface OpenPositionSummary {
++  symbol: string;
++  side: 'LONG' | 'SHORT' | 'FLAT';
++  qty: number;
++  entryPrice: number;
++  markPrice: number;
++  unrealizedPnl: number;
++  unrealizedPnlPercent: number;
++  notionalValue: number;
++}
++
+ export interface AnalyticsSnapshot {
+   timestamp: string;
+   pnl: PnLMetrics;
+@@ -41,10 +54,12 @@ export interface AnalyticsSnapshot {
+   drawdown: DrawdownMetrics;
+   totalTrades?: number;
+   openPositions?: number;
++  avgReturnPerTradePct?: number;
+   sharpeRatio?: number;
+   sortinoRatio?: number;
+   winRate?: number;
+   profitFactor?: number;
++  positions?: OpenPositionSummary[];
+   evidencePackUrl?: string;
+ }
+ 
+@@ -56,21 +71,39 @@ interface BackendAnalyticsSnapshot {
+     netPnl: number;
+     unrealizedPnl: number;
+   };
++  fees?: {
++    makerFees: number;
++    takerFees: number;
++    totalFees: number;
++    effectiveRate: number;
++  };
+   trades: {
+     totalTrades: number;
+     openPositions: number;
++    avgTradePnl: number;
++    avgReturnPerTradePct: number;
+     winRate: number;
+     profitFactor: number;
+   };
+   execution: {
+     avgSlippageBps: number;
++    p95SlippageBps: number;
++    maxSlippageBps: number;
++    slippageSamples: number;
+   };
+   drawdown: {
+     currentDrawdown: number;
++    currentDrawdownPercent: number;
+     maxDrawdown: number;
+     maxDrawdownPercent: number;
+     recoveryFactor: number;
+   };
++  performance?: {
++    sharpeRatio: number;
++    sortinoRatio: number;
++    expectancy: number;
++  };
++  positions?: OpenPositionSummary[];
+ }
+ 
+ export function useAnalytics(): {
+@@ -90,6 +123,8 @@ export function useAnalytics(): {
+     const totalRealized = Number(raw?.pnl?.totalRealizedPnl || 0);
+     const netPnl = Number(raw?.pnl?.netPnl || 0);
+     const avgSlippage = Number(raw?.execution?.avgSlippageBps || 0);
++    const makerFees = Number(raw?.fees?.makerFees ?? totalFees * 0.5);
++    const takerFees = Number(raw?.fees?.takerFees ?? totalFees * 0.5);
+ 
+     return {
+       timestamp: new Date(raw?.timestamp || Date.now()).toISOString(),
+@@ -102,27 +137,33 @@ export function useAnalytics(): {
+         monthly: netPnl,
+       },
+       fees: {
+-        maker: totalFees * 0.5,
+-        taker: totalFees * 0.5,
++        maker: makerFees,
++        taker: takerFees,
+         total: totalFees,
+-        effectiveRate: Math.abs(totalRealized) > 0 ? totalFees / Math.abs(totalRealized) : 0,
++        effectiveRate: Number(raw?.fees?.effectiveRate ?? (Math.abs(totalRealized) > 0 ? totalFees / Math.abs(totalRealized) : 0)),
+       },
+       slippage: {
+         average: avgSlippage,
+-        max: avgSlippage * 1.5,
+-        p95: avgSlippage * 1.2,
++        max: Number(raw?.execution?.maxSlippageBps || 0),
++        p95: Number(raw?.execution?.p95SlippageBps || 0),
+         bySize: {},
+       },
+       drawdown: {
+         current: Number(raw?.drawdown?.currentDrawdown || 0),
+-        max: Number(raw?.drawdown?.maxDrawdownPercent || raw?.drawdown?.maxDrawdown || 0),
++        max: Number(raw?.drawdown?.maxDrawdown || 0),
++        currentPercent: Number(raw?.drawdown?.currentDrawdownPercent || 0),
++        maxPercent: Number(raw?.drawdown?.maxDrawdownPercent || 0),
+         recovery: Number(raw?.drawdown?.recoveryFactor || 0),
+         duration: 0,
+       },
+       totalTrades: Number(raw?.trades?.totalTrades || 0),
+       openPositions: Number(raw?.trades?.openPositions || 0),
++      avgReturnPerTradePct: Number(raw?.trades?.avgReturnPerTradePct || 0),
+       winRate: Number(raw?.trades?.winRate || 0) / 100,
+       profitFactor: Number(raw?.trades?.profitFactor || 0),
++      sharpeRatio: Number(raw?.performance?.sharpeRatio || 0),
++      sortinoRatio: Number(raw?.performance?.sortinoRatio || 0),
++      positions: Array.isArray(raw?.positions) ? raw.positions : [],
+       evidencePackUrl: '/api/analytics/evidence-pack',
+     };
+   }, []);
+diff --git a/src/hooks/useMetrics.ts b/src/hooks/useMetrics.ts
+index 9eb23b0..406d4c6 100644
+--- a/src/hooks/useMetrics.ts
++++ b/src/hooks/useMetrics.ts
+@@ -1,11 +1,13 @@
+-import { useCallback, useMemo } from 'react';
++import { useCallback, useEffect, useMemo, useRef } from 'react';
+ import { usePolling } from './usePolling';
+ import { parsePrometheusMetrics, ParsedPrometheusMetrics, extractHistogramPercentiles } from '../utils/prometheusParser';
+ import { withProxyApiKey } from '../services/proxyAuth';
+ import { fetchApiJson, fetchApiText } from '../services/apiFetch';
++import { useTelemetrySocket } from '../services/useTelemetrySocket';
+ 
+ export interface TelemetrySnapshot {
+   timestamp: number;
++  activeSymbols: string[];
+   ws_latency_histogram?: {
+     p50: number;
+     p95: number;
+@@ -13,6 +15,13 @@ export interface TelemetrySnapshot {
+     count: number;
+     sum: number;
+   };
++  strategy_decision_confidence_histogram?: {
++    p50: number;
++    p95: number;
++    p99: number;
++    count: number;
++    sum: number;
++  };
+   trade_metrics?: {
+     attempts: number;
+     executed: number;
+@@ -29,22 +38,34 @@ export interface TelemetrySnapshot {
+ export interface MetricsData {
+   prometheus: ParsedPrometheusMetrics | null;
+   telemetry: TelemetrySnapshot | null;
++  activeSymbols: string[];
+   wsLatencyHistogram: {
+     p50: number | null;
+     p95: number | null;
+     p99: number | null;
+   };
++  wsLatencySource: 'client' | 'server' | 'prometheus' | 'none';
+   strategyConfidence: number | null;
+   tradeMetrics: {
+-    count1m: number | null;
+-    count5m: number | null;
+-    count1h: number | null;
+-    volume1m: number | null;
+-    volume5m: number | null;
+-    volume1h: number | null;
++    attempts: number;
++    executed: number;
++    rejected: number;
++    failed: number;
++    successRate: number;
++    rejectionRate: number;
+   };
+ }
+ 
++function percentile(values: number[], p: number): number | null {
++  if (values.length === 0) return null;
++  const sorted = [...values].sort((a, b) => a - b);
++  const index = Math.min(
++    sorted.length - 1,
++    Math.max(0, Math.ceil(sorted.length * p) - 1),
++  );
++  return sorted[index];
++}
++
+ export function useMetrics(): {
+   data: MetricsData | null;
+   isLoading: boolean;
+@@ -79,6 +100,34 @@ export function useMetrics(): {
+     maxRetries: 2,
+     retryDelay: 1000,
+   });
++  const activeSymbols = telemetryPolling.data?.activeSymbols || [];
++  const socketMetrics = useTelemetrySocket(activeSymbols);
++  const recentClientLatenciesRef = useRef<number[]>([]);
++  const lastSeenBySymbolRef = useRef<Record<string, number>>({});
++
++  useEffect(() => {
++    const lastSeen = { ...lastSeenBySymbolRef.current };
++    const nextSamples = [...recentClientLatenciesRef.current];
++
++    for (const [symbol, message] of Object.entries(socketMetrics || {})) {
++      const receivedAt = Number(message?.client_received_ms || 0);
++      const latency = Number(message?.ws_latency_client_ms);
++      const prevSeen = Number(lastSeen[symbol] || 0);
++      if (receivedAt > prevSeen) {
++        if (Number.isFinite(latency) && latency >= 0) {
++          nextSamples.push(latency);
++        }
++        lastSeen[symbol] = receivedAt;
++      }
++    }
++
++    if (nextSamples.length > 400) {
++      recentClientLatenciesRef.current = nextSamples.slice(-400);
++    } else {
++      recentClientLatenciesRef.current = nextSamples;
++    }
++    lastSeenBySymbolRef.current = lastSeen;
++  }, [socketMetrics]);
+ 
+   const parsedMetrics = useMemo((): MetricsData | null => {
+     if (!prometheusPolling.data && !telemetryPolling.data) return null;
+@@ -96,36 +145,60 @@ export function useMetrics(): {
+     const fromProm = prometheus
+       ? extractHistogramPercentiles(prometheus, 'ws_latency_histogram')
+       : { p50: null, p95: null, p99: null };
+-
+-    const wsLatencyHistogram = telemetry?.ws_latency_histogram
++    const clientSamples = recentClientLatenciesRef.current;
++    const clientLatencyHistogram = clientSamples.length > 0
++      ? {
++          p50: percentile(clientSamples, 0.50),
++          p95: percentile(clientSamples, 0.95),
++          p99: percentile(clientSamples, 0.99),
++        }
++      : null;
++    const serverLatencyHistogram = telemetry?.ws_latency_histogram && telemetry.ws_latency_histogram.count > 0
+       ? {
+           p50: telemetry.ws_latency_histogram.p50,
+           p95: telemetry.ws_latency_histogram.p95,
+           p99: telemetry.ws_latency_histogram.p99,
+         }
+-      : fromProm;
++      : null;
++    const hasPromLatency = fromProm.p50 !== null || fromProm.p95 !== null || fromProm.p99 !== null;
++    const wsLatencyHistogram = clientLatencyHistogram || serverLatencyHistogram || fromProm;
++    const wsLatencySource: MetricsData['wsLatencySource'] = clientLatencyHistogram
++      ? 'client'
++      : serverLatencyHistogram
++        ? 'server'
++        : hasPromLatency
++          ? 'prometheus'
++          : 'none';
+ 
+-    const strategyConfidence = prometheus?.getGauge('strategy_confidence')
+-      ?? prometheus?.getGauge('risk_state_current')
++    const strategyConfidence = telemetry?.strategy_decision_confidence_histogram
++      ? Number(telemetry.strategy_decision_confidence_histogram.p50 || 0)
++      : prometheus?.getGauge('strategy_confidence')
++        ?? prometheus?.getGauge('strategy_decision_confidence')
+       ?? null;
+ 
++    const attempts = Number(telemetry?.trade_metrics?.attempts || 0);
++    const executed = Number(telemetry?.trade_metrics?.executed || 0);
++    const rejected = Number(telemetry?.trade_metrics?.rejected || 0);
++    const failed = Number(telemetry?.trade_metrics?.failed || 0);
+     const tradeMetrics = {
+-      count1m: telemetry?.trade_metrics?.attempts ?? null,
+-      count5m: telemetry?.trade_metrics?.executed ?? null,
+-      count1h: telemetry?.trade_metrics?.rejected ?? null,
+-      volume1m: null,
+-      volume5m: null,
+-      volume1h: null,
++      attempts,
++      executed,
++      rejected,
++      failed,
++      successRate: attempts > 0 ? (executed / attempts) * 100 : 0,
++      rejectionRate: attempts > 0 ? ((rejected + failed) / attempts) * 100 : 0,
+     };
+ 
+     return {
+       prometheus,
+       telemetry,
++      activeSymbols,
+       wsLatencyHistogram,
++      wsLatencySource,
+       strategyConfidence,
+       tradeMetrics,
+     };
+-  }, [prometheusPolling.data, telemetryPolling.data]);
++  }, [prometheusPolling.data, telemetryPolling.data, activeSymbols, socketMetrics]);
+ 
+   const refresh = useCallback(async () => {
+     await Promise.all([prometheusPolling.refresh(), telemetryPolling.refresh()]);
+diff --git a/src/hooks/useStrategy.ts b/src/hooks/useStrategy.ts
+index 2ff4720..d4cf1cb 100644
+--- a/src/hooks/useStrategy.ts
++++ b/src/hooks/useStrategy.ts
+@@ -35,6 +35,11 @@ export interface StrategySnapshot {
+   signals: StrategySignal[];
+   activeStrategies: string[];
+   strategyHealth: Record<string, { healthy: boolean; lastSignal: string }>;
++  strategyConfidence: Record<string, {
++    direction: SignalDirection;
++    confidence: number;
++    timestamp: string;
++  }>;
+ }
+ 
+ interface BackendStrategySnapshot {
+@@ -48,6 +53,11 @@ interface BackendStrategySnapshot {
+     totalStrategies: number;
+     strategyIds: string[];
+   } | null;
++  strategyConfidence?: Record<string, {
++    side: 'LONG' | 'SHORT' | 'FLAT';
++    confidence: number;
++    timestamp: number;
++  }>;
+   signals: Array<{
+     strategyId: string;
+     side: 'LONG' | 'SHORT' | 'FLAT';
+@@ -119,6 +129,25 @@ export function useStrategy(): {
+       };
+     }
+ 
++    const strategyConfidenceFromApi = raw?.strategyConfidence || {};
++    const strategyConfidence: StrategySnapshot['strategyConfidence'] = {};
++    for (const [strategyId, entry] of Object.entries(strategyConfidenceFromApi)) {
++      strategyConfidence[strategyId] = {
++        direction: toDirection(entry.side),
++        confidence: Number(entry.confidence || 0),
++        timestamp: new Date(entry.timestamp || Date.now()).toISOString(),
++      };
++    }
++    for (const signal of signals) {
++      if (!strategyConfidence[signal.strategy]) {
++        strategyConfidence[signal.strategy] = {
++          direction: signal.direction,
++          confidence: Number(signal.confidence || 0),
++          timestamp: signal.timestamp,
++        };
++      }
++    }
++
+     return {
+       timestamp: new Date(raw?.timestamp || Date.now()).toISOString(),
+       consensus: {
+@@ -134,6 +163,7 @@ export function useStrategy(): {
+       signals,
+       activeStrategies,
+       strategyHealth,
++      strategyConfidence,
+     };
+   }, []);
+ 
+diff --git a/src/services/proxyBase.ts b/src/services/proxyBase.ts
+index 58c91fc..2ff85d5 100644
+--- a/src/services/proxyBase.ts
++++ b/src/services/proxyBase.ts
+@@ -50,12 +50,12 @@ export function getProxyApiCandidates(): string[] {
+ 
+   // In local development, prefer direct backend first to avoid proxy/host resolution stalls.
+   if (isDev && isLoopbackHost(hostname)) {
+-    candidates.push('http://127.0.0.1:8787');
+-    candidates.push('http://localhost:8787');
+-    candidates.push(origin);
+     if (envIsUsable) {
+       candidates.push(envBase);
+     }
++    candidates.push('http://127.0.0.1:8787');
++    candidates.push('http://localhost:8787');
++    candidates.push(origin);
+     return unique(candidates);
+   }
+ 
+diff --git a/src/services/useTelemetrySocket.ts b/src/services/useTelemetrySocket.ts
+index 7176859..eefb0ef 100644
+--- a/src/services/useTelemetrySocket.ts
++++ b/src/services/useTelemetrySocket.ts
+@@ -144,7 +144,15 @@ export function useTelemetrySocket(
+           try {
+             const msg = JSON.parse(event.data);
+             if (msg.type === 'metrics' && msg.symbol) {
+-              const metricsMsg = msg as MetricsMessage;
++              const receivedAt = Date.now();
++              const serverSent = Number(msg?.server_sent_ms || 0);
++              const metricsMsg = {
++                ...(msg as MetricsMessage),
++                client_received_ms: receivedAt,
++                ws_latency_client_ms: Number.isFinite(serverSent) && serverSent > 0
++                  ? Math.max(0, receivedAt - serverSent)
++                  : undefined,
++              } as MetricsMessage;
+               const symbol = normalizeSymbol(metricsMsg.symbol);
+               if (!symbol) {
+                 return;
+diff --git a/server/test/ResiliencePatches.test.ts b/server/test/ResiliencePatches.test.ts
+new file mode 100644
+index 0000000..da6a5b5
+--- /dev/null
++++ b/server/test/ResiliencePatches.test.ts
+@@ -0,0 +1,54 @@
++﻿import assert from 'node:assert/strict';
++import { ResiliencePatches } from '../risk/ResiliencePatches';
++
++class FakeRiskEngine {
++  public killSwitchReasons: string[] = [];
++
++  activateKillSwitch(reason: string): void {
++    this.killSwitchReasons.push(reason);
++  }
++
++  getStateManager(): { transition: () => void } {
++    return {
++      transition: () => {
++        // No-op in test.
++      },
++    };
++  }
++}
++
++function createPatches(autoKillSwitch: boolean): ResiliencePatches {
++  return new ResiliencePatches({
++    enableAll: true,
++    autoKillSwitch,
++    autoHalt: false,
++    latency: {
++      p95ThresholdMs: 1,
++      p99ThresholdMs: 1,
++      eventLoopLagThresholdMs: 1,
++      sampleWindowSize: 32,
++      consecutiveViolations: 1,
++      cooldownMs: 250,
++      enableKillSwitch: true,
++      killSwitchAfterViolations: 1,
++    },
++  });
++}
++
++export function runTests(): void {
++  const now = Date.now();
++
++  const riskOff = new FakeRiskEngine();
++  const patchesOff = createPatches(false);
++  patchesOff.initialize(riskOff as any);
++  patchesOff.recordLatency(25, now, 'processing');
++  patchesOff.stop();
++  assert.equal(riskOff.killSwitchReasons.length, 0, 'kill-switch must remain inactive when autoKillSwitch=false');
++
++  const riskOn = new FakeRiskEngine();
++  const patchesOn = createPatches(true);
++  patchesOn.initialize(riskOn as any);
++  patchesOn.recordLatency(25, now + 1, 'processing');
++  patchesOn.stop();
++  assert.ok(riskOn.killSwitchReasons.length >= 1, 'kill-switch should trigger when autoKillSwitch=true and threshold is violated');
++}
+diff --git a/server/test/StrategyApiConsensus.test.ts b/server/test/StrategyApiConsensus.test.ts
+new file mode 100644
+index 0000000..cf4f888
+--- /dev/null
++++ b/server/test/StrategyApiConsensus.test.ts
+@@ -0,0 +1,152 @@
++﻿import assert from 'node:assert/strict';
++import { Router } from 'express';
++import { createStrategyRoutes } from '../api/strategy';
++import { RiskState } from '../risk/RiskStateManager';
++import { SignalSide, StrategySignal } from '../strategies/StrategyInterface';
++
++function callRoute(router: Router, path: string, query: Record<string, unknown> = {}): { status: number; body: any } {
++  const layer = (router as any).stack.find((item: any) => item?.route?.path === path);
++  assert.ok(layer, `route not found: ${path}`);
++  const handler = layer.route.stack[0].handle;
++
++  let statusCode = 200;
++  let payload: any;
++  const req: any = { query };
++  const res: any = {
++    status(code: number) {
++      statusCode = code;
++      return this;
++    },
++    json(body: any) {
++      payload = body;
++      return this;
++    },
++  };
++
++  handler(req, res);
++  return { status: statusCode, body: payload };
++}
++
++export function runTests(): void {
++  const now = Date.now();
++  const signals: StrategySignal[] = [
++    {
++      strategyId: 'trend-follow-v1',
++      strategyName: 'Trend Follow',
++      side: SignalSide.LONG,
++      confidence: 0.72,
++      timestamp: now - 200,
++      validityDurationMs: 5_000,
++      metadata: { symbol: 'BTCUSDT' },
++    },
++    {
++      strategyId: 'trend-follow-v1',
++      strategyName: 'Trend Follow',
++      side: SignalSide.SHORT,
++      confidence: 0.34,
++      timestamp: now - 50,
++      validityDurationMs: 5_000,
++      metadata: { symbol: 'BTCUSDT' },
++    },
++    {
++      strategyId: 'mean-revert-v1',
++      strategyName: 'Mean Revert',
++      side: SignalSide.FLAT,
++      confidence: 0.21,
++      timestamp: now - 100,
++      validityDurationMs: 5_000,
++      metadata: { symbol: 'BTCUSDT' },
++    },
++  ];
++
++  let evaluateCallCount = 0;
++  const fallbackConsensus = {
++    side: 'LONG' as const,
++    confidence: 0.51,
++    quorumMet: true,
++    vetoApplied: false,
++    riskGatePassed: true,
++    contributingStrategies: 2,
++    totalStrategies: 3,
++    breakdown: {
++      long: { count: 1, avgConfidence: 0.72 },
++      short: { count: 1, avgConfidence: 0.34 },
++      flat: { count: 1, avgConfidence: 0.21 },
++    },
++    strategyIds: ['trend-follow-v1', 'mean-revert-v1'],
++  };
++
++  const runtimeConsensus = {
++    timestampMs: now,
++    side: 'SHORT' as const,
++    confidence: 0.66,
++    quorumMet: true,
++    riskGatePassed: true,
++    contributingStrategies: 2,
++    totalStrategies: 3,
++    vetoApplied: false,
++    breakdown: {
++      long: { count: 1, avgConfidence: 0.72 },
++      short: { count: 1, avgConfidence: 0.34 },
++      flat: { count: 1, avgConfidence: 0.21 },
++    },
++    strategyIds: ['trend-follow-v1', 'mean-revert-v1'],
++    shouldTrade: true,
++  };
++
++  const routerWithRuntime = createStrategyRoutes({
++    consensusEngine: {
++      evaluate: () => {
++        evaluateCallCount += 1;
++        return fallbackConsensus;
++      },
++      getConfig: () => ({
++        minQuorumSize: 2,
++        minConfidenceThreshold: 0.3,
++        maxSignalAgeMs: 5_000,
++        minActionConfidence: 0.5,
++        longWeight: 1,
++        shortWeight: 1,
++      }),
++    } as any,
++    getCurrentSignals: () => signals,
++    getCurrentConsensus: () => runtimeConsensus,
++    getCurrentRiskState: () => RiskState.TRACKING,
++  });
++
++  const snapshotWithRuntime = callRoute(routerWithRuntime, '/snapshot');
++  assert.equal(snapshotWithRuntime.status, 200);
++  assert.equal(snapshotWithRuntime.body.consensus.side, 'SHORT', 'runtime consensus should be used when available');
++  assert.equal(evaluateCallCount, 0, 'consensusEngine.evaluate should not run when runtime consensus exists');
++  assert.equal(snapshotWithRuntime.body.strategyConfidence['trend-follow-v1'].side, 'SHORT');
++  assert.equal(snapshotWithRuntime.body.strategyConfidence['trend-follow-v1'].confidence, 0.34);
++
++  let evaluateTimestamp = 0;
++  const routerWithoutRuntime = createStrategyRoutes({
++    consensusEngine: {
++      evaluate: (_signals: StrategySignal[], _riskState: RiskState, timestamp: number) => {
++        evaluateTimestamp = timestamp;
++        return fallbackConsensus;
++      },
++      getConfig: () => ({
++        minQuorumSize: 2,
++        minConfidenceThreshold: 0.3,
++        maxSignalAgeMs: 5_000,
++        minActionConfidence: 0.5,
++        longWeight: 1,
++        shortWeight: 1,
++      }),
++    } as any,
++    getCurrentSignals: () => signals,
++    getCurrentRiskState: () => RiskState.TRACKING,
++  });
++
++  const snapshotWithoutRuntime = callRoute(routerWithoutRuntime, '/snapshot');
++  assert.equal(snapshotWithoutRuntime.status, 200);
++  const latestSignalTimestamp = Math.max(...signals.map((signal) => signal.timestamp));
++  assert.equal(
++    evaluateTimestamp,
++    latestSignalTimestamp,
++    'fallback consensus should evaluate at latest signal timestamp to avoid stale decisions',
++  );
++}
+diff --git a/server/test/AnalyticsEngineMetrics.test.ts b/server/test/AnalyticsEngineMetrics.test.ts
+new file mode 100644
+index 0000000..7ab0b0e
+--- /dev/null
++++ b/server/test/AnalyticsEngineMetrics.test.ts
+@@ -0,0 +1,136 @@
++﻿import assert from 'node:assert/strict';
++import { AnalyticsEngine } from '../analytics/AnalyticsEngine';
++
++function approx(actual: number, expected: number, tolerance: number = 1e-6): void {
++  assert.ok(
++    Math.abs(actual - expected) <= tolerance,
++    `expected ${actual} to be within ${tolerance} of ${expected}`,
++  );
++}
++
++export function runTests(): void {
++  const engine = new AnalyticsEngine({
++    persistToDisk: false,
++    snapshotIntervalMs: 60_000,
++  });
++
++  const t0 = Date.now();
++
++  engine.recordExpectedFill('o1', 'BTCUSDT', 100, 'BUY', 1);
++  engine.ingestFill({
++    type: 'FILL',
++    symbol: 'BTCUSDT',
++    side: 'BUY',
++    qty: 1,
++    price: 101,
++    fee: 0.1,
++    feeType: 'taker',
++    timestamp: t0,
++    orderId: 'o1',
++    tradeId: 't1',
++    isReduceOnly: false,
++  });
++  engine.ingestPosition({
++    type: 'POSITION_UPDATE',
++    symbol: 'BTCUSDT',
++    side: 'LONG',
++    qty: 1,
++    entryPrice: 101,
++    markPrice: 110,
++    unrealizedPnl: 9,
++    timestamp: t0 + 200,
++  });
++
++  engine.recordExpectedFill('o2', 'BTCUSDT', 109, 'SELL', 1);
++  engine.ingestFill({
++    type: 'FILL',
++    symbol: 'BTCUSDT',
++    side: 'SELL',
++    qty: 1,
++    price: 108,
++    fee: 0.1,
++    feeType: 'taker',
++    timestamp: t0 + 1_000,
++    orderId: 'o2',
++    tradeId: 't2',
++    isReduceOnly: true,
++  });
++  engine.ingestPosition({
++    type: 'POSITION_UPDATE',
++    symbol: 'BTCUSDT',
++    side: 'FLAT',
++    qty: 0,
++    entryPrice: 0,
++    markPrice: 108,
++    unrealizedPnl: 0,
++    timestamp: t0 + 1_200,
++  });
++
++  engine.recordExpectedFill('o3', 'ETHUSDT', 200, 'BUY', 2);
++  engine.ingestFill({
++    type: 'FILL',
++    symbol: 'ETHUSDT',
++    side: 'BUY',
++    qty: 2,
++    price: 200,
++    fee: 0.2,
++    feeType: 'maker',
++    timestamp: t0 + 2_000,
++    orderId: 'o3',
++    tradeId: 't3',
++    isReduceOnly: false,
++  });
++  engine.ingestPosition({
++    type: 'POSITION_UPDATE',
++    symbol: 'ETHUSDT',
++    side: 'LONG',
++    qty: 2,
++    entryPrice: 200,
++    markPrice: 210,
++    unrealizedPnl: 20,
++    timestamp: t0 + 2_200,
++  });
++  engine.ingestPosition({
++    type: 'POSITION_UPDATE',
++    symbol: 'ETHUSDT',
++    side: 'LONG',
++    qty: 2,
++    entryPrice: 200,
++    markPrice: 205,
++    unrealizedPnl: 10,
++    timestamp: t0 + 3_200,
++  });
++
++  const snapshot = engine.getSnapshot();
++
++  assert.equal(snapshot.summary.totalTrades, 1, 'closed trades should count correctly');
++  assert.equal(snapshot.summary.openPositions, 1, 'open positions should be exposed');
++  assert.equal(snapshot.summary.winningTrades, 1);
++  assert.equal(snapshot.summary.losingTrades, 0);
++  approx(snapshot.summary.totalRealizedPnl, 7);
++  approx(snapshot.summary.unrealizedPnl, 10);
++  approx(snapshot.summary.totalFees, 0.4);
++  approx(snapshot.summary.netPnl, 16.6, 1e-9);
++  approx(snapshot.summary.avgTradePnl, 6.8, 1e-9);
++
++  assert.ok(snapshot.execution.slippageSamples >= 3, 'slippage samples should be recorded');
++  assert.ok(snapshot.execution.slippageMaxBps >= snapshot.execution.avgSlippageBps);
++
++  assert.ok(snapshot.drawdown.maxDrawdown > 0, 'drawdown should reflect equity pullback');
++  assert.ok(snapshot.drawdown.maxDrawdownPercent >= 0);
++  assert.ok(snapshot.drawdown.maxDrawdownPercent <= 100, 'drawdown percent must be clamped to 0..100');
++  assert.ok(Number.isFinite(snapshot.drawdown.maxDrawdownPercent), 'drawdown percent must be finite');
++
++  assert.ok(Number.isFinite(snapshot.performance.sharpeRatio));
++  assert.ok(Number.isFinite(snapshot.performance.sortinoRatio));
++  assert.ok(Number.isFinite(snapshot.performance.expectancy));
++
++  assert.equal(snapshot.bySymbol.BTCUSDT.trades, 1);
++  assert.equal(snapshot.bySymbol.BTCUSDT.openPosition, false);
++  approx(snapshot.bySymbol.BTCUSDT.realizedPnl, 7);
++
++  assert.equal(snapshot.bySymbol.ETHUSDT.openPosition, true);
++  approx(snapshot.bySymbol.ETHUSDT.unrealizedPnl, 10);
++  assert.equal(snapshot.positions.length, 1, 'open positions list should include active symbols');
++  assert.equal(snapshot.positions[0].symbol, 'ETHUSDT');
++}
+diff --git a/server/test/AnalyticsApiFallback.test.ts b/server/test/AnalyticsApiFallback.test.ts
+new file mode 100644
+index 0000000..aa50719
+--- /dev/null
++++ b/server/test/AnalyticsApiFallback.test.ts
+@@ -0,0 +1,84 @@
++﻿import assert from 'node:assert/strict';
++import { Router } from 'express';
++import { createAnalyticsRoutes } from '../api/analytics';
++import { AnalyticsEngine } from '../analytics/AnalyticsEngine';
++
++function callRoute(router: Router, path: string): { status: number; body: any } {
++  const layer = (router as any).stack.find((item: any) => item?.route?.path === path);
++  assert.ok(layer, `route not found: ${path}`);
++  const handler = layer.route.stack[0].handle;
++
++  let statusCode = 200;
++  let payload: any;
++  const req: any = { query: {} };
++  const res: any = {
++    status(code: number) {
++      statusCode = code;
++      return this;
++    },
++    json(body: any) {
++      payload = body;
++      return this;
++    },
++    setHeader: () => undefined,
++  };
++
++  handler(req, res);
++  return { status: statusCode, body: payload };
++}
++
++export function runTests(): void {
++  const analyticsEngine = new AnalyticsEngine({ persistToDisk: false });
++
++  const dryRunStatus = {
++    config: {
++      walletBalanceStartUsdt: 5000,
++    },
++    summary: {
++      realizedPnl: 12.5,
++      feePaid: 1.5,
++      unrealizedPnl: 3.25,
++      performance: {
++        totalTrades: 4,
++        winCount: 3,
++        lossCount: 1,
++        winRate: 75,
++        maxDrawdown: 8,
++        sharpeRatio: 1.4,
++      },
++    },
++    perSymbol: {
++      BTCUSDT: {
++        metrics: {
++          markPrice: 72000,
++          realizedPnl: 12.5,
++          feePaid: 1.5,
++          unrealizedPnl: 3.25,
++        },
++        performance: {
++          totalTrades: 4,
++        },
++        position: {
++          side: 'LONG',
++          qty: 0.01,
++          entryPrice: 71900,
++        },
++      },
++    },
++  };
++
++  const router = createAnalyticsRoutes({
++    analyticsEngine,
++    getDryRunStatus: () => dryRunStatus,
++  });
++
++  const response = callRoute(router, '/snapshot');
++  assert.equal(response.status, 200);
++  assert.equal(response.body.trades.totalTrades, 4, 'should use dry-run fallback when analytics engine has no trades yet');
++  assert.equal(response.body.trades.openPositions, 1);
++  assert.equal(response.body.pnl.totalRealizedPnl, 12.5);
++  assert.equal(response.body.pnl.totalFees, 1.5);
++  assert.equal(response.body.pnl.unrealizedPnl, 3.25);
++  assert.equal(response.body.positions.length, 1);
++  assert.equal(response.body.bySymbol.BTCUSDT.openPosition, true);
++}
+diff --git a/server/test/TelemetryApi.test.ts b/server/test/TelemetryApi.test.ts
+new file mode 100644
+index 0000000..aa03c74
+--- /dev/null
++++ b/server/test/TelemetryApi.test.ts
+@@ -0,0 +1,70 @@
++﻿import assert from 'node:assert/strict';
++import { Router } from 'express';
++import { createTelemetryRoutes } from '../api/telemetry';
++import { MetricsCollector } from '../telemetry/MetricsCollector';
++import { LatencyTracker } from '../metrics/LatencyTracker';
++
++function callRoute(router: Router, path: string): { status: number; body: any } {
++  const layer = (router as any).stack.find((item: any) => item?.route?.path === path);
++  assert.ok(layer, `route not found: ${path}`);
++  const handler = layer.route.stack[0].handle;
++
++  let statusCode = 200;
++  let payload: any;
++  const req: any = { query: {} };
++  const res: any = {
++    status(code: number) {
++      statusCode = code;
++      return this;
++    },
++    json(body: any) {
++      payload = body;
++      return this;
++    },
++  };
++
++  handler(req, res);
++  return { status: statusCode, body: payload };
++}
++
++export function runTests(): void {
++  const collector = new MetricsCollector();
++  collector.registerHistogram('ws_latency_histogram', [1, 10, 100, 1000]);
++  collector.registerHistogram('strategy_decision_confidence_histogram', [0.1, 0.25, 0.5, 0.75, 1]);
++
++  collector.incrementCounter('trade_attempt_total', 10);
++  collector.incrementCounter('trade_executed_total', 7);
++  collector.incrementCounter('trade_rejected_total', 2);
++  collector.incrementCounter('trade_failed_total', 1);
++
++  collector.setGauge('risk_state_current', 1);
++  collector.setGauge('position_count', 3);
++  collector.setGauge('open_order_count', 4);
++
++  collector.observeHistogram('ws_latency_histogram', 22);
++  collector.observeHistogram('ws_latency_histogram', 40);
++  collector.observeHistogram('strategy_decision_confidence_histogram', 0.45);
++  collector.observeHistogram('strategy_decision_confidence_histogram', 0.8);
++
++  const latencyTracker = new LatencyTracker();
++  latencyTracker.record('ingest', 12);
++  latencyTracker.record('ingest', 18);
++
++  const router = createTelemetryRoutes({
++    metricsCollector: collector,
++    latencyTracker,
++    getUptimeMs: () => 5_000,
++    getActiveSymbols: () => ['BTCUSDT', 'ETHUSDT'],
++  });
++
++  const response = callRoute(router, '/snapshot');
++  assert.equal(response.status, 200);
++  assert.deepEqual(response.body.activeSymbols, ['BTCUSDT', 'ETHUSDT']);
++  assert.equal(response.body.trade_metrics.attempts, 10);
++  assert.equal(response.body.trade_metrics.executed, 7);
++  assert.equal(response.body.trade_metrics.rejected, 2);
++  assert.equal(response.body.trade_metrics.failed, 1);
++  assert.ok(response.body.ws_latency_histogram.p95 > 0);
++  assert.ok(response.body.strategy_decision_confidence_histogram.p50 > 0);
++  assert.ok(response.body.latency_stages.ingest.samples >= 2);
++}

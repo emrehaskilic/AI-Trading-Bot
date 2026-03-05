@@ -276,6 +276,7 @@ export interface SessionSummary {
     netPnl: number;
     
     avgTradePnl: number;
+    avgReturnPerTradePct: number;
     avgWin: number;
     avgLoss: number;
     profitFactor: number;
@@ -291,13 +292,20 @@ export interface SessionSummary {
   bySymbol: Record<string, {
     trades: number;
     realizedPnl: number;
+    unrealizedPnl: number;
     fees: number;
     volume: number;
     flipRate: number;
+    openPosition: boolean;
+    positionSide: 'LONG' | 'SHORT' | 'FLAT';
+    positionQty: number;
   }>;
   
   execution: {
     avgSlippageBps: number;
+    slippageP95Bps: number;
+    slippageMaxBps: number;
+    slippageSamples: number;
     positiveSlippageCount: number;
     negativeSlippageCount: number;
     totalFlips: number;
@@ -312,6 +320,16 @@ export interface SessionSummary {
     goodTrades: number; // Score >= 70
     badTrades: number;  // Score < 40
   };
+
+  performance: {
+    sharpeRatio: number;
+    sortinoRatio: number;
+    returnVolatility: number;
+    downsideDeviation: number;
+    expectancy: number;
+  };
+
+  positions: UnrealizedPnL[];
   
   trades: TradeLifecycle[];
   drawdown: DrawdownMetrics;

@@ -98,6 +98,13 @@ export class ExecutionAnalytics {
   }
 
   /**
+   * Returns whether an expected price exists for the order.
+   */
+  hasExpectedPrice(orderId: string): boolean {
+    return this.expectedPrices.has(orderId);
+  }
+
+  /**
    * Process position update for flip tracking
    */
   processPositionUpdate(update: PositionUpdateEvent): FlipMetrics | undefined {
@@ -248,6 +255,43 @@ export class ExecutionAnalytics {
 
     const total = records.reduce((sum, s) => sum + s.slippageBps, 0);
     return total / records.length;
+  }
+
+  /**
+   * Get slippage statistics (avg/p95/max and distribution counts).
+   */
+  getSlippageStats(symbol?: string): {
+    avg: number;
+    p95: number;
+    max: number;
+    samples: number;
+    positive: number;
+    negative: number;
+    neutral: number;
+  } {
+    const records = symbol
+      ? this.slippageRecords.filter(s => s.symbol === symbol)
+      : this.slippageRecords;
+    if (records.length === 0) {
+      return { avg: 0, p95: 0, max: 0, samples: 0, positive: 0, negative: 0, neutral: 0 };
+    }
+    const values = records.map((record) => Number(record.slippageBps || 0)).sort((a, b) => a - b);
+    const percentile = (p: number): number => {
+      if (values.length === 0) return 0;
+      const idx = Math.min(values.length - 1, Math.max(0, Math.ceil(values.length * p) - 1));
+      return values[idx];
+    };
+    const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
+    const distribution = this.getSlippageDistribution(symbol);
+    return {
+      avg,
+      p95: percentile(0.95),
+      max: values[values.length - 1],
+      samples: values.length,
+      positive: distribution.positive,
+      negative: distribution.negative,
+      neutral: distribution.neutral,
+    };
   }
 
   /**

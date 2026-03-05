@@ -1,0 +1,44 @@
+DryRunClock.now() called before set(), returning 1. This indicates an uninitialized state.
+DryRunClock.now() called before set(), returning 1. This indicates an uninitialized state.
+DryRunClock.now() called before set(), returning 1. This indicates an uninitialized state.
+DryRunClock.now() called before set(), returning 1. This indicates an uninitialized state.
+[ResiliencePatches] Event loop monitoring started
+[ResiliencePatches] Initialized with risk engine
+[ResiliencePatches] Event loop monitoring started
+[ResiliencePatches] Initialized with risk engine
+[ResiliencePatches] KILL SWITCH TRIGGERED: LATENCY_SPIKE - Latency violation: latency_violation_p95_25ms,p99_25ms
+✔ TimeAndSales (3.9166ms)
+✔ CvdCalculator (1.2129ms)
+✔ AbsorptionDetector (0.9093ms)
+✔ OrderbookManager (1.8859ms)
+✔ OrderbookDeterminismP0 (1.4089ms)
+✔ OpenInterestMonitor (0.6524ms)
+✔ FundingMonitor (0.6615ms)
+✔ SessionVwapTracker (1.8909ms)
+✔ BackfillCoordinator (44.1195ms)
+✔ HtfStructureMonitor (1.0353ms)
+✔ OrchestratorV1 (9.5121ms)
+✔ LatencyClamp (0.3366ms)
+✔ SequenceRule (0.4369ms)
+✖ ReconnectContinuity (0.7158ms)
+✔ LegacyCalculator (1.6809ms)
+✔ Gate (0.5822ms)
+✔ FreezeEmergencyPolicy (5.7383ms)
+✔ ProfitLock (2.7303ms)
+✔ OrderPlan (12.9777ms)
+✔ DryRunEngine (9.56ms)
+✔ DryRunSessionService (14.5009ms)
+✔ Normalization (0.6774ms)
+✔ RegimeSelector (0.7014ms)
+✔ MarketImpactSimulator (0.3796ms)
+✔ OrderbookIntegrityMonitor (9.3667ms)
+✔ StrategyHysteresis (5.3661ms)
+✔ HardReversal (2.0752ms)
+✔ DryRunClock (0.6016ms)
+✔ FreezeController (0.5753ms)
+✔ PositionSizer (0.3979ms)
+✔ ResiliencePatches (2.3671ms)
+✔ StrategyApiConsensus (3.4699ms)
+✔ AnalyticsEngineMetrics (7.1391ms)
+✔ TelemetryApi (4.06ms)
+✔ AnalyticsApiFallback (3.5456ms)

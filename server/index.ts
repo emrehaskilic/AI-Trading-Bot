@@ -490,6 +490,14 @@ const strategyConsensusBySymbol = new Map<string, {
     riskGatePassed: boolean;
     contributingStrategies: number;
     totalStrategies: number;
+    vetoApplied: boolean;
+    breakdown: {
+        long: { count: number; avgConfidence: number };
+        short: { count: number; avgConfidence: number };
+        flat: { count: number; avgConfidence: number };
+    };
+    strategyIds: string[];
+    shouldTrade: boolean;
 }>();
 const resilienceGuardActions: ResilienceGuardAction[] = [];
 const resilienceActionDedupMap = new Map<string, number>();
@@ -593,8 +601,8 @@ function logAnalyticsError(kind: string, symbol: string | null, error: unknown):
 
 function trackResilience(reason: string, symbol: string, action: string, timestamp: number): void {
     const normalized = String(reason || '').toLowerCase();
-    let guardType: ResilienceGuardAction['guardType'] = 'latency';
-    let counterKey: keyof typeof resilienceTriggerCounters = 'latencySpike';
+    let guardType: ResilienceGuardAction['guardType'] = 'general';
+    let counterKey: keyof typeof resilienceTriggerCounters | null = null;
     let severity: ResilienceGuardAction['severity'] = 'low';
 
     if (normalized.includes('spoof')) {
@@ -607,9 +615,20 @@ function trackResilience(reason: string, symbol: string, action: string, timesta
         guardType = 'flash_crash';
         counterKey = 'flashCrash';
         severity = 'high';
-    } else {
+    } else if (
+        normalized.includes('latency')
+        || normalized.includes('event_loop')
+        || normalized.includes('p95')
+        || normalized.includes('p99')
+    ) {
         guardType = 'latency';
         counterKey = 'latencySpike';
+    } else if (normalized.includes('churn')) {
+        // Churn suppressions are informational and should not inflate latency/error counters.
+        guardType = 'general';
+        severity = normalized.includes('no_trade') ? 'medium' : 'low';
+    } else {
+        guardType = 'general';
     }
 
     if (normalized.includes('kill') || normalized.includes('halt') || normalized.includes('critical')) {
@@ -637,7 +656,9 @@ function trackResilience(reason: string, symbol: string, action: string, timesta
         }
     }
 
-    resilienceTriggerCounters[counterKey] += 1;
+    if (counterKey) {
+        resilienceTriggerCounters[counterKey] += 1;
+    }
     resilienceGuardActions.push({
         guardType,
         timestamp: eventTimestamp,
@@ -2603,8 +2624,10 @@ function applyOrchestratorOrders(symbol: string, decision: OrchestratorV1Decisio
 
     const isPreTradeIntent = decision.intent === 'ENTRY' || decision.intent === 'ADD';
     const riskMultiplier = RISK_ENGINE_ENABLED ? institutionalRiskEngine.getPositionMultiplier() : 1;
-    if (RISK_ENGINE_ENABLED && isPreTradeIntent && decision.side) {
+    if (isPreTradeIntent && decision.side) {
         observabilityMetrics.recordTradeAttempt();
+    }
+    if (RISK_ENGINE_ENABLED && isPreTradeIntent && decision.side) {
         const currentPos = dryRunSession.getStrategyPosition(symbol);
         const fallbackPrice = Number(currentPos?.entryPrice || decision.position?.entryVwap || 0) > 0
             ? Number(currentPos?.entryPrice || decision.position?.entryVwap || 0)
@@ -2673,8 +2696,23 @@ function applyOrchestratorOrders(symbol: string, decision: OrchestratorV1Decisio
     if (!decision || !Array.isArray(decision.orders) || decision.orders.length === 0) {
         return;
     }
+    if (!isPreTradeIntent) {
+        observabilityMetrics.recordTradeAttempt();
+    }
     for (const order of decision.orders) {
         decisionRuntimeStats.ordersAttempted += 1;
+        const orderId = String(order.id || `${symbol}-${decision.timestampMs}-${decisionRuntimeStats.ordersAttempted}`);
+        const expectedPrice = Number(order.price || decision.position?.entryVwap || 0);
+        const expectedQty = Math.max(0, Math.abs(Number(order.qty || 0)));
+        if (expectedPrice > 0 && expectedQty > 0) {
+            analyticsEngine.recordExpectedFill(
+                orderId,
+                symbol,
+                expectedPrice,
+                order.side,
+                expectedQty
+            );
+        }
         if (order.kind === 'MAKER') {
             decisionRuntimeStats.makerOrdersPlaced += 1;
         } else {
@@ -2692,7 +2730,7 @@ function applyOrchestratorOrders(symbol: string, decision: OrchestratorV1Decisio
             const requestedQty = Math.max(0, Math.abs(Number(order.qty || 0)));
             if (requestedQty > 0) {
                 institutionalRiskEngine.recordExecutionEvent(
-                    String(order.id || `${symbol}-${decision.timestampMs}-${decisionRuntimeStats.ordersAttempted}`),
+                    orderId,
                     symbol,
                     'fill',
                     requestedQty,
@@ -3070,6 +3108,25 @@ function broadcastMetrics(
                 riskGatePassed: Boolean(consensusDecision.riskGatePassed),
                 contributingStrategies: Number(consensusDecision.contributingStrategies || 0),
                 totalStrategies: Number(consensusDecision.totalStrategies || 0),
+                vetoApplied: Boolean(consensusDecision.vetoApplied),
+                breakdown: {
+                    long: {
+                        count: Number(consensusDecision.breakdown?.long?.count || 0),
+                        avgConfidence: Number(consensusDecision.breakdown?.long?.avgConfidence || 0),
+                    },
+                    short: {
+                        count: Number(consensusDecision.breakdown?.short?.count || 0),
+                        avgConfidence: Number(consensusDecision.breakdown?.short?.avgConfidence || 0),
+                    },
+                    flat: {
+                        count: Number(consensusDecision.breakdown?.flat?.count || 0),
+                        avgConfidence: Number(consensusDecision.breakdown?.flat?.avgConfidence || 0),
+                    },
+                },
+                strategyIds: Array.isArray(consensusDecision.strategyIds)
+                    ? [...consensusDecision.strategyIds]
+                    : [],
+                shouldTrade: consensusEngine.shouldTrade(consensusDecision),
             });
 
             const hardStop = resolvedRiskState === RiskState.HALTED || resolvedRiskState === RiskState.KILL_SWITCH;
@@ -3235,6 +3292,7 @@ function broadcastMetrics(
         symbol: s,
         state: ob.uiState,
         event_time_ms: eventTimeMs,
+        server_sent_ms: now,
         riskEngine: riskSummary,
         snapshot: meta.snapshotTracker.next({ s, mid }),
         timeAndSales: tasMetrics,
@@ -3413,6 +3471,22 @@ function getDashboardStrategySignals(symbol?: string): StrategySignal[] {
     const target = resolveDashboardSymbol(symbol);
     if (!target) return [];
     return (strategySignalsBySymbol.get(target) || []).map((signal) => ({ ...signal }));
+}
+
+function getDashboardStrategyConsensus(symbol?: string) {
+    const target = resolveDashboardSymbol(symbol);
+    if (!target) return null;
+    const consensus = strategyConsensusBySymbol.get(target);
+    if (!consensus) return null;
+    return {
+        ...consensus,
+        strategyIds: [...consensus.strategyIds],
+        breakdown: {
+            long: { ...consensus.breakdown.long },
+            short: { ...consensus.breakdown.short },
+            flat: { ...consensus.breakdown.flat },
+        },
+    };
 }
 
 function getDashboardRiskState(): RiskState {
@@ -4018,12 +4092,14 @@ app.use('/api/telemetry', createTelemetryRoutes({
     metricsCollector: observabilityMetrics.collector,
     latencyTracker,
     getUptimeMs: () => healthController.getUptime(),
+    getActiveSymbols: () => Array.from(activeSymbols),
 }));
 
 app.use('/api/strategy', createStrategyRoutes({
     consensusEngine,
     getCurrentSignals: (symbol?: string) => getDashboardStrategySignals(symbol),
-    getCurrentRiskState: () => getDashboardRiskState(),
+    getCurrentConsensus: (symbol?: string) => getDashboardStrategyConsensus(symbol),
+    getCurrentRiskState: (_symbol?: string) => getDashboardRiskState(),
 }));
 
 app.use('/api/risk', createRiskRoutes({
@@ -4070,6 +4146,7 @@ app.use('/api/resilience', createResilienceRoutes({
 
 app.use('/api/analytics', createAnalyticsRoutes({
     analyticsEngine,
+    getDryRunStatus: () => dryRunSession.getStatus(),
 }));
 
 app.post('/api/abtest/start', (req, res) => {

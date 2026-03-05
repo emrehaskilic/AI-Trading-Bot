@@ -14,7 +14,15 @@ import os from 'os';
 // Types for telemetry snapshot response
 export interface TelemetrySnapshotResponse {
   timestamp: number;
+  activeSymbols: string[];
   ws_latency_histogram: {
+    p50: number;
+    p95: number;
+    p99: number;
+    count: number;
+    sum: number;
+  };
+  strategy_decision_confidence_histogram: {
     p50: number;
     p95: number;
     p99: number;
@@ -50,6 +58,7 @@ export interface TelemetryRoutesOptions {
   metricsCollector: MetricsCollector;
   latencyTracker: LatencyTracker;
   getUptimeMs: () => number;
+  getActiveSymbols?: () => string[];
 }
 
 /**
@@ -57,7 +66,12 @@ export interface TelemetryRoutesOptions {
  */
 export function createTelemetryRoutes(options: TelemetryRoutesOptions): Router {
   const router = Router();
-  const { metricsCollector, latencyTracker, getUptimeMs } = options;
+  const {
+    metricsCollector,
+    latencyTracker,
+    getUptimeMs,
+    getActiveSymbols,
+  } = options;
 
   /**
    * GET /api/telemetry/snapshot
@@ -69,6 +83,7 @@ export function createTelemetryRoutes(options: TelemetryRoutesOptions): Router {
       
       // Get histogram data for ws_latency
       const wsLatencyPercentiles = metricsCollector.getHistogramPercentiles('ws_latency_histogram') || { p50: 0, p95: 0, p99: 0, count: 0, sum: 0, min: 0, max: 0 };
+      const strategyConfidencePercentiles = metricsCollector.getHistogramPercentiles('strategy_decision_confidence_histogram') || { p50: 0, p95: 0, p99: 0, count: 0, sum: 0, min: 0, max: 0 };
       
       // Get counter values
       const tradeAttempts = metricsCollector.getCounterValue('trade_attempt_total') || 0;
@@ -92,12 +107,20 @@ export function createTelemetryRoutes(options: TelemetryRoutesOptions): Router {
 
       const response: TelemetrySnapshotResponse = {
         timestamp: now,
+        activeSymbols: getActiveSymbols ? getActiveSymbols() : [],
         ws_latency_histogram: {
           p50: wsLatencyPercentiles.p50 || 0,
           p95: wsLatencyPercentiles.p95 || 0,
           p99: wsLatencyPercentiles.p99 || 0,
           count: wsLatencyPercentiles.count || 0,
           sum: wsLatencyPercentiles.sum || 0,
+        },
+        strategy_decision_confidence_histogram: {
+          p50: strategyConfidencePercentiles.p50 || 0,
+          p95: strategyConfidencePercentiles.p95 || 0,
+          p99: strategyConfidencePercentiles.p99 || 0,
+          count: strategyConfidencePercentiles.count || 0,
+          sum: strategyConfidencePercentiles.sum || 0,
         },
         trade_metrics: {
           attempts: tradeAttempts,

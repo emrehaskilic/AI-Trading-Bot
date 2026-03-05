@@ -347,6 +347,9 @@ export interface MetricsMessage {
   symbol: string;
   state: 'LIVE' | 'STALE' | 'RESYNCING' | 'UNKNOWN';
   event_time_ms?: number;
+  server_sent_ms?: number;
+  client_received_ms?: number;
+  ws_latency_client_ms?: number;
   snapshot: SnapshotMetadata;
   timeAndSales: TimeAndSalesMetrics;
   cvd: {

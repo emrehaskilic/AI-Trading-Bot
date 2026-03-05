@@ -50,12 +50,12 @@ export function getProxyApiCandidates(): string[] {
 
   // In local development, prefer direct backend first to avoid proxy/host resolution stalls.
   if (isDev && isLoopbackHost(hostname)) {
-    candidates.push('http://127.0.0.1:8787');
-    candidates.push('http://localhost:8787');
-    candidates.push(origin);
     if (envIsUsable) {
       candidates.push(envBase);
     }
+    candidates.push('http://127.0.0.1:8787');
+    candidates.push('http://localhost:8787');
+    candidates.push(origin);
     return unique(candidates);
   }
 

@@ -7,13 +7,15 @@
 
 import { Request, Response } from 'express';
 import { Router } from 'express';
-import { ConsensusEngine, ConsensusDecision } from '../consensus/ConsensusEngine';
+import { ConsensusEngine } from '../consensus/ConsensusEngine';
 import { StrategySignal, SignalSide } from '../strategies/StrategyInterface';
 import { RiskState } from '../risk/RiskStateManager';
 
 // Types for strategy snapshot response
 export interface StrategySnapshotResponse {
   timestamp: number;
+  symbol?: string | null;
+  riskState?: RiskState;
   consensus: {
     side: 'LONG' | 'SHORT' | 'FLAT';
     confidence: number;
@@ -29,6 +31,11 @@ export interface StrategySnapshotResponse {
     };
     strategyIds: string[];
   } | null;
+  strategyConfidence?: Record<string, {
+    side: 'LONG' | 'SHORT' | 'FLAT';
+    confidence: number;
+    timestamp: number;
+  }>;
   signals: Array<{
     strategyId: string;
     side: 'LONG' | 'SHORT' | 'FLAT';
@@ -50,6 +57,23 @@ export interface StrategySnapshotResponse {
 export interface StrategyRoutesOptions {
   consensusEngine: ConsensusEngine;
   getCurrentSignals: (symbol?: string) => StrategySignal[];
+  getCurrentConsensus?: (symbol?: string) => {
+    timestampMs: number;
+    side: 'LONG' | 'SHORT' | 'FLAT';
+    confidence: number;
+    quorumMet: boolean;
+    riskGatePassed: boolean;
+    contributingStrategies: number;
+    totalStrategies: number;
+    vetoApplied: boolean;
+    breakdown: {
+      long: { count: number; avgConfidence: number };
+      short: { count: number; avgConfidence: number };
+      flat: { count: number; avgConfidence: number };
+    };
+    strategyIds: string[];
+    shouldTrade: boolean;
+  } | null;
   getCurrentRiskState: (symbol?: string) => RiskState;
 }
 
@@ -58,7 +82,12 @@ export interface StrategyRoutesOptions {
  */
 export function createStrategyRoutes(options: StrategyRoutesOptions): Router {
   const router = Router();
-  const { consensusEngine, getCurrentSignals, getCurrentRiskState } = options;
+  const {
+    consensusEngine,
+    getCurrentSignals,
+    getCurrentConsensus,
+    getCurrentRiskState,
+  } = options;
 
   /**
    * GET /api/strategy/snapshot
@@ -73,9 +102,18 @@ export function createStrategyRoutes(options: StrategyRoutesOptions): Router {
       
       // Evaluate consensus
       let consensus: StrategySnapshotResponse['consensus'] = null;
+      const latestSignalTs = signals.reduce((maxTs, signal) => {
+        const ts = Number(signal?.timestamp || 0);
+        return ts > maxTs ? ts : maxTs;
+      }, 0);
+      const runtimeConsensus = getCurrentConsensus ? getCurrentConsensus(symbol) : null;
       
       try {
-        const decision = consensusEngine.evaluate(signals, riskState, now);
+        const decision = runtimeConsensus || consensusEngine.evaluate(
+          signals,
+          riskState,
+          latestSignalTs > 0 ? latestSignalTs : now
+        );
         consensus = {
           side: decision.side,
           confidence: decision.confidence,
@@ -100,8 +138,20 @@ export function createStrategyRoutes(options: StrategyRoutesOptions): Router {
         metadata: signal.metadata,
       }));
 
+      const strategyConfidence = formattedSignals.reduce((acc, signal) => {
+        const prev = acc[signal.strategyId];
+        if (!prev || signal.timestamp >= prev.timestamp) {
+          acc[signal.strategyId] = {
+            side: signal.side,
+            confidence: signal.confidence,
+            timestamp: signal.timestamp,
+          };
+        }
+        return acc;
+      }, {} as NonNullable<StrategySnapshotResponse['strategyConfidence']>);
+
       // Get consensus config
-      const config = (consensusEngine as any).config || {
+      const config = (consensusEngine as any).getConfig?.() || (consensusEngine as any).config || {
         minQuorumSize: 2,
         minConfidenceThreshold: 0.3,
         maxSignalAgeMs: 5000,
@@ -112,7 +162,10 @@ export function createStrategyRoutes(options: StrategyRoutesOptions): Router {
 
       const response: StrategySnapshotResponse = {
         timestamp: now,
+        symbol: symbol || null,
+        riskState,
         consensus,
+        strategyConfidence,
         signals: formattedSignals,
         config: {
           minQuorumSize: config.minQuorumSize,
@@ -171,11 +224,22 @@ export function createStrategyRoutes(options: StrategyRoutesOptions): Router {
       const symbol = typeof _req.query.symbol === 'string' ? String(_req.query.symbol).toUpperCase() : undefined;
       const signals = getCurrentSignals(symbol);
       const riskState = getCurrentRiskState(symbol);
+      const latestSignalTs = signals.reduce((maxTs, signal) => {
+        const ts = Number(signal?.timestamp || 0);
+        return ts > maxTs ? ts : maxTs;
+      }, 0);
+      const runtimeConsensus = getCurrentConsensus ? getCurrentConsensus(symbol) : null;
       
-      const decision = consensusEngine.evaluate(signals, riskState, now);
+      const decision = runtimeConsensus || consensusEngine.evaluate(
+        signals,
+        riskState,
+        latestSignalTs > 0 ? latestSignalTs : now
+      );
       
       res.status(200).json({
         timestamp: now,
+        symbol: symbol || null,
+        riskState,
         consensus: {
           side: decision.side,
           confidence: decision.confidence,

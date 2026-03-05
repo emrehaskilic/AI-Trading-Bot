@@ -1,0 +1,92 @@
+﻿{
+    "timestamp":  1772696926463,
+    "symbol":  null,
+    "riskState":  "TRACKING",
+    "consensus":  {
+                      "side":  "FLAT",
+                      "confidence":  0,
+                      "quorumMet":  false,
+                      "vetoApplied":  false,
+                      "riskGatePassed":  true,
+                      "contributingStrategies":  0,
+                      "totalStrategies":  3,
+                      "breakdown":  {
+                                        "long":  {
+                                                     "count":  0,
+                                                     "avgConfidence":  0
+                                                 },
+                                        "short":  {
+                                                      "count":  0,
+                                                      "avgConfidence":  0
+                                                  },
+                                        "flat":  {
+                                                     "count":  0,
+                                                     "avgConfidence":  0
+                                                 }
+                                    },
+                      "strategyIds":  [
+
+                                      ]
+                  },
+    "strategyConfidence":  {
+                               "trend-follow-v1":  {
+                                                       "side":  "FLAT",
+                                                       "confidence":  0,
+                                                       "timestamp":  1772696926072
+                                                   },
+                               "mean-revert-v1":  {
+                                                      "side":  "FLAT",
+                                                      "confidence":  0,
+                                                      "timestamp":  1772696926072
+                                                  },
+                               "chop-filter-v1":  {
+                                                      "side":  "FLAT",
+                                                      "confidence":  1,
+                                                      "timestamp":  1772696926072
+                                                  }
+                           },
+    "signals":  [
+                    {
+                        "strategyId":  "trend-follow-v1",
+                        "side":  "FLAT",
+                        "confidence":  0,
+                        "timestamp":  1772696926072,
+                        "metadata":  {
+                                         "reason":  "No clear trend direction"
+                                     }
+                    },
+                    {
+                        "strategyId":  "mean-revert-v1",
+                        "side":  "FLAT",
+                        "confidence":  0,
+                        "timestamp":  1772696926072,
+                        "metadata":  {
+                                         "reason":  "No significant deviation from mean"
+                                     }
+                    },
+                    {
+                        "strategyId":  "chop-filter-v1",
+                        "side":  "FLAT",
+                        "confidence":  1,
+                        "timestamp":  1772696926072,
+                        "metadata":  {
+                                         "volatilityIndex":  0,
+                                         "chopThreshold":  0.15,
+                                         "isChoppy":  true,
+                                         "isTooLow":  true,
+                                         "inCooldown":  true,
+                                         "canVeto":  true,
+                                         "chopState":  true,
+                                         "reason":  "Volatility too low (0.000 \u003c 0.1)"
+                                     }
+                    }
+                ],
+    "config":  {
+                   "minQuorumSize":  2,
+                   "minConfidenceThreshold":  0.3,
+                   "maxSignalAgeMs":  5000,
+                   "minActionConfidence":  0.5,
+                   "longWeight":  1,
+                   "shortWeight":  1
+               }
+}

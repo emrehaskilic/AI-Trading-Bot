@@ -1,4 +1,4 @@
-import React, { memo, useMemo } from 'react';
+﻿import React, { memo, useMemo } from 'react';
 import { useMetrics } from '../../hooks/useMetrics';
 import { formatDuration, formatNumber } from '../../utils/prometheusParser';
 
@@ -45,8 +45,8 @@ interface MetricCardProps {
 
 const MetricCard = memo<MetricCardProps>(({ label, value, unit = '', decimals = 0, trend }) => {
   const trendIcon = useMemo(() => {
-    if (trend === 'up') return <span className="text-green-400">↑</span>;
-    if (trend === 'down') return <span className="text-red-400">↓</span>;
+    if (trend === 'up') return <span className="text-green-400">^</span>;
+    if (trend === 'down') return <span className="text-red-400">v</span>;
     return null;
   }, [trend]);
 
@@ -71,8 +71,7 @@ export interface TelemetryPanelProps {
 }
 
 /**
- * Telemetry Panel - Displays Prometheus metrics, WebSocket latency histogram, strategy confidence, and trade metrics
- * Optimized with React.memo and useMemo for performance
+ * Telemetry Panel - Displays latency histograms, strategy confidence, and trade counters.
  */
 export const TelemetryPanel = memo<TelemetryPanelProps>(({ className = '' }) => {
   const { data, isLoading, error, lastUpdated } = useMetrics();
@@ -109,7 +108,7 @@ export const TelemetryPanel = memo<TelemetryPanelProps>(({ className = '' }) => 
     <div className={`bg-zinc-900/60 border border-zinc-800 rounded-lg p-4 ${className}`}>
       <div className="flex items-center justify-between mb-4">
         <h3 className="text-lg font-semibold text-white flex items-center space-x-2">
-          <svg className="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <svg className="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
           </svg>
           <span>Telemetry</span>
@@ -121,9 +120,13 @@ export const TelemetryPanel = memo<TelemetryPanelProps>(({ className = '' }) => 
         )}
       </div>
 
-      {/* WebSocket Latency Histogram */}
       <div className="mb-4">
-        <h4 className="text-sm font-medium text-zinc-400 mb-3">WebSocket Latency</h4>
+        <div className="flex items-center justify-between mb-3">
+          <h4 className="text-sm font-medium text-zinc-400">WebSocket Latency</h4>
+          <span className="text-[10px] uppercase tracking-wide text-zinc-500">
+            Source: {data?.wsLatencySource ?? 'none'}
+          </span>
+        </div>
         <div className="space-y-3">
           <LatencyBar
             label="p50"
@@ -146,7 +149,6 @@ export const TelemetryPanel = memo<TelemetryPanelProps>(({ className = '' }) => 
         </div>
       </div>
 
-      {/* Strategy Confidence */}
       <div className="mb-4 p-3 bg-zinc-800/30 rounded-lg">
         <div className="flex items-center justify-between">
           <span className="text-sm text-zinc-400">Strategy Confidence</span>
@@ -156,48 +158,47 @@ export const TelemetryPanel = memo<TelemetryPanelProps>(({ className = '' }) => 
               : '-'}
           </span>
         </div>
+        <div className="mt-2 text-[10px] uppercase tracking-wide text-zinc-500">
+          Active Symbols: {data?.activeSymbols.length ?? 0}
+        </div>
         <div className="mt-2 h-2 bg-zinc-800 rounded-full overflow-hidden">
           <div
             className={`h-full rounded-full transition-all duration-500 ${
               data?.strategyConfidence && data.strategyConfidence >= 0.6
                 ? 'bg-green-500'
                 : data?.strategyConfidence && data.strategyConfidence >= 0.4
-                ? 'bg-yellow-500'
-                : 'bg-red-500'
+                  ? 'bg-yellow-500'
+                  : 'bg-red-500'
             }`}
             style={{ width: `${(data?.strategyConfidence ?? 0) * 100}%` }}
           />
         </div>
       </div>
 
-      {/* Trade Metrics */}
       <div>
         <h4 className="text-sm font-medium text-zinc-400 mb-3">Trade Metrics</h4>
         <div className="grid grid-cols-2 gap-2">
+          <MetricCard label="Attempts" value={data?.tradeMetrics.attempts ?? null} />
+          <MetricCard label="Executed" value={data?.tradeMetrics.executed ?? null} trend="up" />
+          <MetricCard label="Rejected" value={data?.tradeMetrics.rejected ?? null} trend="down" />
+          <MetricCard label="Failed" value={data?.tradeMetrics.failed ?? null} trend="down" />
+        </div>
+        <div className="grid grid-cols-2 gap-2 mt-2">
           <MetricCard
-            label="Count (1m)"
-            value={data?.tradeMetrics.count1m ?? null}
+            label="Success Rate"
+            value={data?.tradeMetrics.successRate ?? null}
+            unit="%"
+            decimals={1}
           />
           <MetricCard
-            label="Count (5m)"
-            value={data?.tradeMetrics.count5m ?? null}
-          />
-          <MetricCard
-            label="Volume (1m)"
-            value={data?.tradeMetrics.volume1m ?? null}
-            unit="K"
-            decimals={2}
-          />
-          <MetricCard
-            label="Volume (5m)"
-            value={data?.tradeMetrics.volume5m ?? null}
-            unit="K"
-            decimals={2}
+            label="Reject+Fail Rate"
+            value={data?.tradeMetrics.rejectionRate ?? null}
+            unit="%"
+            decimals={1}
           />
         </div>
       </div>
 
-      {/* Raw Prometheus Metrics (optional display) */}
       {data?.prometheus && (
         <div className="mt-4 pt-3 border-t border-zinc-800">
           <details className="text-xs">

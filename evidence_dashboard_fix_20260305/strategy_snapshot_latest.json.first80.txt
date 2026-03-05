@@ -1,0 +1,80 @@
+﻿   1: {
+   2:     "timestamp":  1772697558284,
+   3:     "symbol":  null,
+   4:     "riskState":  "TRACKING",
+   5:     "consensus":  {
+   6:                       "side":  "SHORT",
+   7:                       "confidence":  0.6911758784736936,
+   8:                       "quorumMet":  false,
+   9:                       "vetoApplied":  false,
+  10:                       "riskGatePassed":  true,
+  11:                       "contributingStrategies":  1,
+  12:                       "totalStrategies":  3,
+  13:                       "breakdown":  {
+  14:                                         "long":  {
+  15:                                                      "count":  0,
+  16:                                                      "avgConfidence":  0
+  17:                                                  },
+  18:                                         "short":  {
+  19:                                                       "count":  1,
+  20:                                                       "avgConfidence":  0.6911758784736936
+  21:                                                   },
+  22:                                         "flat":  {
+  23:                                                      "count":  0,
+  24:                                                      "avgConfidence":  0
+  25:                                                  }
+  26:                                     },
+  27:                       "strategyIds":  [
+  28:                                           "trend-follow-v1"
+  29:                                       ]
+  30:                   },
+  31:     "strategyConfidence":  {
+  32:                                "trend-follow-v1":  {
+  33:                                                        "side":  "SHORT",
+  34:                                                        "confidence":  0.6911758784736936,
+  35:                                                        "timestamp":  1772697557042
+  36:                                                    },
+  37:                                "mean-revert-v1":  {
+  38:                                                       "side":  "FLAT",
+  39:                                                       "confidence":  0,
+  40:                                                       "timestamp":  1772697557042
+  41:                                                   },
+  42:                                "chop-filter-v1":  {
+  43:                                                       "side":  "FLAT",
+  44:                                                       "confidence":  0.9964714328007673,
+  45:                                                       "timestamp":  1772697557042
+  46:                                                   }
+  47:                            },
+  48:     "signals":  [
+  49:                     {
+  50:                         "strategyId":  "trend-follow-v1",
+  51:                         "side":  "SHORT",
+  52:                         "confidence":  0.6911758784736936,
+  53:                         "timestamp":  1772697557042,
+  54:                         "metadata":  {
+  55:                                          "weightedTrendScore":  -0.7212663306639777,
+  56:                                          "m3TrendScore":  -0.49247513073284993,
+  57:                                          "m5TrendScore":  -0.8737937972847297,
+  58:                                          "threshold":  -0.3
+  59:                                      }
+  60:                     },
+  61:                     {
+  62:                         "strategyId":  "mean-revert-v1",
+  63:                         "side":  "FLAT",
+  64:                         "confidence":  0,
+  65:                         "timestamp":  1772697557042,
+  66:                         "metadata":  {
+  67:                                          "reason":  "No significant deviation from mean"
+  68:                                      }
+  69:                     },
+  70:                     {
+  71:                         "strategyId":  "chop-filter-v1",
+  72:                         "side":  "FLAT",
+  73:                         "confidence":  0.9964714328007673,
+  74:                         "timestamp":  1772697557042,
+  75:                         "metadata":  {
+  76:                                          "volatilityIndex":  0.0005292850798848815,
+  77:                                          "chopThreshold":  0.15,
+  78:                                          "isChoppy":  true,
+  79:                                          "isTooLow":  true,
+  80:                                          "inCooldown":  true,

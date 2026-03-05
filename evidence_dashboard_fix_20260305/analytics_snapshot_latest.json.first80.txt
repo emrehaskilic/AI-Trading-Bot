@@ -1,0 +1,80 @@
+﻿   1: {
+   2:     "timestamp":  1772697558259,
+   3:     "session":  {
+   4:                     "sessionId":  "session-1772697535044-xra8qmp1b",
+   5:                     "startTime":  1772697535044,
+   6:                     "durationMs":  23213
+   7:                 },
+   8:     "pnl":  {
+   9:                 "totalRealizedPnl":  -0.04002464,
+  10:                 "totalFees":  0.39999937,
+  11:                 "netPnl":  -0.44002401,
+  12:                 "unrealizedPnl":  0,
+  13:                 "totalReturn":  0
+  14:             },
+  15:     "fees":  {
+  16:                  "makerFees":  0,
+  17:                  "takerFees":  0.39999937,
+  18:                  "totalFees":  0.39999937,
+  19:                  "effectiveRate":  0
+  20:              },
+  21:     "trades":  {
+  22:                    "totalTrades":  1,
+  23:                    "openPositions":  0,
+  24:                    "winningTrades":  0,
+  25:                    "losingTrades":  1,
+  26:                    "winRate":  0,
+  27:                    "avgWin":  0,
+  28:                    "avgLoss":  0,
+  29:                    "avgTradePnl":  -0.44002401,
+  30:                    "avgReturnPerTradePct":  0,
+  31:                    "profitFactor":  0
+  32:                },
+  33:     "execution":  {
+  34:                       "avgSlippageBps":  0,
+  35:                       "p95SlippageBps":  0,
+  36:                       "maxSlippageBps":  0,
+  37:                       "slippageSamples":  0,
+  38:                       "avgFillTimeMs":  0,
+  39:                       "flipRate":  0,
+  40:                       "adverseSelectionBps":  0
+  41:                   },
+  42:     "quality":  {
+  43:                     "avgMfeMaeRatio":  0,
+  44:                     "avgTradeScore":  0,
+  45:                     "scoreDistribution":  {
+  46:                                               "good":  0,
+  47:                                               "bad":  0,
+  48:                                               "neutral":  1
+  49:                                           }
+  50:                 },
+  51:     "drawdown":  {
+  52:                      "maxDrawdown":  0.44002401000034297,
+  53:                      "maxDrawdownPercent":  0.00880048020000686,
+  54:                      "currentDrawdown":  0.44002401,
+  55:                      "currentDrawdownPercent":  0.0088004802,
+  56:                      "recoveryFactor":  0
+  57:                  },
+  58:     "performance":  {
+  59:                         "sharpeRatio":  -22.336437781819658,
+  60:                         "sortinoRatio":  0,
+  61:                         "returnVolatility":  0,
+  62:                         "downsideDeviation":  0,
+  63:                         "expectancy":  -0.44002401
+  64:                     },
+  65:     "positions":  [
+  66: 
+  67:                   ],
+  68:     "bySymbol":  {
+  69:                      "BTCUSDT":  {
+  70:                                      "trades":  1,
+  71:                                      "realizedPnl":  -0.04002464,
+  72:                                      "unrealizedPnl":  0,
+  73:                                      "fees":  0.39999937,
+  74:                                      "volume":  0,
+  75:                                      "flipRate":  0,
+  76:                                      "openPosition":  false,
+  77:                                      "positionSide":  "FLAT",
+  78:                                      "positionQty":  0
+  79:                                  }
+  80:                  }

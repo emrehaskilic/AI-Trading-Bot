@@ -1,4 +1,4 @@
-import { useCallback, useMemo } from 'react';
+﻿import { useCallback, useMemo } from 'react';
 import { usePolling } from './usePolling';
 import { withProxyApiKey } from '../services/proxyAuth';
 import { fetchApiJson } from '../services/apiFetch';
@@ -61,7 +61,7 @@ interface BackendResilienceSnapshot {
     total: number;
   };
   recentActions: Array<{
-    guardType: 'anti_spoof' | 'delta_burst' | 'latency' | 'flash_crash';
+    guardType: 'anti_spoof' | 'delta_burst' | 'latency' | 'flash_crash' | 'general';
     timestamp: number;
     symbol?: string;
     action: string;
@@ -71,11 +71,26 @@ interface BackendResilienceSnapshot {
   }>;
 }
 
-function mapActionType(guardType: BackendResilienceSnapshot['recentActions'][number]['guardType']): GuardActionType {
-  if (guardType === 'anti_spoof') return 'throttle_applied';
-  if (guardType === 'delta_burst') return 'rate_limit_triggered';
-  if (guardType === 'flash_crash') return 'circuit_breaker_opened';
-  return 'error_spike_detected';
+function mapActionType(
+  action: BackendResilienceSnapshot['recentActions'][number],
+): GuardActionType {
+  if (action.guardType === 'anti_spoof') return 'throttle_applied';
+  if (action.guardType === 'delta_burst') return 'rate_limit_triggered';
+  if (action.guardType === 'flash_crash') {
+    return String(action.action || '').toUpperCase().includes('ALLOW')
+      ? 'circuit_breaker_closed'
+      : 'circuit_breaker_opened';
+  }
+  if (action.guardType === 'latency') return 'error_spike_detected';
+
+  const reason = String(action.reason || '').toLowerCase();
+  if (reason.includes('recover') || reason.includes('healthy') || reason.includes('allow')) {
+    return 'recovery_initiated';
+  }
+  if (reason.includes('drop') || reason.includes('block') || reason.includes('no_trade')) {
+    return 'request_dropped';
+  }
+  return 'recovery_initiated';
 }
 
 export function useResilience(): {
@@ -93,8 +108,9 @@ export function useResilience(): {
       '/api/resilience/snapshot',
       withProxyApiKey({ cache: 'no-store' }),
     );
+
     const snapshotTs = Number(raw?.timestamp || Date.now());
-    const recentWindowMs = 60_000;
+    const recentWindowMs = 45_000;
     const recentActionsRaw = ((raw?.recentActions) || []).filter((action) => {
       const actionTs = Number(action?.timestamp || 0);
       if (!Number.isFinite(actionTs) || actionTs <= 0) return false;
@@ -102,49 +118,43 @@ export function useResilience(): {
       return ageMs >= 0 && ageMs <= recentWindowMs;
     });
 
-    const recentByGuard = recentActionsRaw.reduce((acc, action) => {
-      acc[action.guardType] = (acc[action.guardType] || 0) + 1;
-      return acc;
-    }, {
-      anti_spoof: 0,
-      delta_burst: 0,
-      latency: 0,
-      flash_crash: 0,
-    } as Record<BackendResilienceSnapshot['recentActions'][number]['guardType'], number>);
-
-    const triggerCounters: TriggerCounters = {
-      rateLimit: recentByGuard.anti_spoof,
-      circuitBreaker: recentByGuard.flash_crash,
-      throttle: recentByGuard.delta_burst,
-      requestDrop: 0,
-      errorSpike: recentByGuard.latency,
-      recovery: 0,
-    };
-
     const guardActions: GuardAction[] = recentActionsRaw.map((action, index) => ({
       id: `${action.guardType}-${action.timestamp}-${index}`,
       timestamp: new Date(action.timestamp).toISOString(),
-      type: mapActionType(action.guardType),
+      type: mapActionType(action),
       source: action.symbol || action.guardType,
       reason: action.reason,
       duration: undefined,
       metadata: action.metadata,
     }));
 
+    const triggerCounters: TriggerCounters = {
+      rateLimit: guardActions.filter((a) => a.type === 'rate_limit_triggered').length,
+      circuitBreaker: guardActions.filter((a) => a.type === 'circuit_breaker_opened').length,
+      throttle: guardActions.filter((a) => a.type === 'throttle_applied').length,
+      requestDrop: guardActions.filter((a) => a.type === 'request_dropped').length,
+      errorSpike: guardActions.filter((a) => a.type === 'error_spike_detected').length,
+      recovery: guardActions.filter((a) => a.type === 'recovery_initiated' || a.type === 'circuit_breaker_closed').length,
+    };
+
     const activeGuards: string[] = [];
     if (raw?.guards?.deltaBurst?.currentCooldownActive) activeGuards.push('delta_burst');
     if (raw?.guards?.flashCrash?.activeProtections) activeGuards.push('flash_crash');
 
-    const hasActiveProtection = raw?.guards?.deltaBurst?.currentCooldownActive || raw?.guards?.flashCrash?.activeProtections;
-    const hasRecentCritical = recentActionsRaw.some((action) => action.severity === 'high');
+    const highSeverityRecent = recentActionsRaw.some((action) => action.severity === 'high');
+    const mediumOrHighNonGeneral = recentActionsRaw.filter((action) => (
+      action.guardType !== 'general' && action.severity !== 'low'
+    )).length;
+    const hasActiveProtection = Boolean(raw?.guards?.deltaBurst?.currentCooldownActive || raw?.guards?.flashCrash?.activeProtections);
+
     const status = raw?.guards?.flashCrash?.activeProtections
       ? 'unhealthy'
-      : (hasActiveProtection || hasRecentCritical || recentActionsRaw.length > 0)
+      : (hasActiveProtection || highSeverityRecent || mediumOrHighNonGeneral >= 3)
         ? 'degraded'
         : 'healthy';
 
     return {
-      timestamp: new Date(raw?.timestamp || Date.now()).toISOString(),
+      timestamp: new Date(snapshotTs).toISOString(),
       guardActions,
       triggerCounters,
       activeGuards,
@@ -156,10 +166,14 @@ export function useResilience(): {
             ? 'Critical resilience protections active'
             : 'Recent resilience suppressions detected',
       },
-      recentEvents: guardActions.slice(-10).map((action) => ({
-        timestamp: action.timestamp,
+      recentEvents: recentActionsRaw.slice(-10).map((action) => ({
+        timestamp: new Date(action.timestamp).toISOString(),
         event: action.reason,
-        severity: action.type === 'circuit_breaker_opened' ? 'error' : 'warning',
+        severity: action.severity === 'high'
+          ? 'error'
+          : action.severity === 'medium'
+            ? 'warning'
+            : 'info',
       })),
     };
   }, []);

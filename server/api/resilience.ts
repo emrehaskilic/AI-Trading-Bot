@@ -13,7 +13,7 @@ import { LatencyTracker } from '../metrics/LatencyTracker';
 
 // Types for guard action
 export interface GuardAction {
-  guardType: 'anti_spoof' | 'delta_burst' | 'latency' | 'flash_crash';
+  guardType: 'anti_spoof' | 'delta_burst' | 'latency' | 'flash_crash' | 'general';
   timestamp: number;
   symbol?: string;
   action: string;

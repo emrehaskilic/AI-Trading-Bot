@@ -1,0 +1,64 @@
+﻿{
+    "timestamp":  1772697558292,
+    "guards":  {
+                   "antiSpoof":  {
+                                     "totalDetections":  0,
+                                     "activeSuspectedLevels":  0,
+                                     "totalLevelsTracked":  0,
+                                     "avgSpoofScore":  0,
+                                     "lastDetectionAt":  null
+                                 },
+                   "deltaBurst":  {
+                                      "totalBurstsDetected":  0,
+                                      "currentCooldownActive":  false,
+                                      "cooldownRemainingMs":  0,
+                                      "meanDelta":  0,
+                                      "stdDelta":  0,
+                                      "lastBurstAt":  null
+                                  },
+                   "latency":  {
+                                   "stages":  {
+                                                  "trade_ingest_ms":  {
+                                                                          "avgMs":  0.09,
+                                                                          "p95Ms":  1,
+                                                                          "maxMs":  2,
+                                                                          "samples":  250
+                                                                      },
+                                                  "strategy_calc_ms":  {
+                                                                           "avgMs":  3.21,
+                                                                           "p95Ms":  8,
+                                                                           "maxMs":  10,
+                                                                           "samples":  14
+                                                                       },
+                                                  "depth_ingest_ms":  {
+                                                                          "avgMs":  521.1,
+                                                                          "p95Ms":  869,
+                                                                          "maxMs":  932,
+                                                                          "samples":  147
+                                                                      },
+                                                  "dry_run_ingest_ms":  {
+                                                                            "avgMs":  6,
+                                                                            "p95Ms":  2,
+                                                                            "maxMs":  10,
+                                                                            "samples":  2
+                                                                        }
+                                              },
+                                   "totalSamples":  413
+                               },
+                   "flashCrash":  {
+                                      "totalDetections":  0,
+                                      "lastDetectionAt":  null,
+                                      "activeProtections":  false
+                                  }
+               },
+    "triggerCounters":  {
+                            "antiSpoof":  0,
+                            "deltaBurst":  0,
+                            "latencySpike":  0,
+                            "flashCrash":  0,
+                            "total":  0
+                        },
+    "recentActions":  [
+
+                      ]
+}

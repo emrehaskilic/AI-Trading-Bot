@@ -1,0 +1,209 @@
+﻿{
+    "ok":  true,
+    "status":  {
+                   "running":  true,
+                   "runId":  "dryrun-1",
+                   "symbols":  [
+                                   "BTCUSDT"
+                               ],
+                   "config":  {
+                                  "walletBalanceStartUsdt":  5000,
+                                  "initialMarginUsdt":  200,
+                                  "leverage":  5,
+                                  "makerFeeRate":  0.0002,
+                                  "takerFeeRate":  0.0004,
+                                  "maintenanceMarginRate":  0.005,
+                                  "fundingIntervalMs":  28800000,
+                                  "heartbeatIntervalMs":  10000,
+                                  "debugAggressiveEntry":  true,
+                                  "superScalpEnabled":  false
+                              },
+                   "summary":  {
+                                   "totalEquity":  4999.43335502,
+                                   "walletBalance":  4999.43335502,
+                                   "unrealizedPnl":  0,
+                                   "realizedPnl":  -0.16659995,
+                                   "feePaid":  0.40004503,
+                                   "fundingPnl":  0,
+                                   "marginHealth":  1,
+                                   "performance":  {
+                                                       "totalPnL":  -0.56664498,
+                                                       "winCount":  0,
+                                                       "lossCount":  1,
+                                                       "totalTrades":  1,
+                                                       "winRate":  0,
+                                                       "maxDrawdown":  0.5666449800000919,
+                                                       "sharpeRatio":  -17.91443949309502,
+                                                       "pnlCurve":  [
+
+                                                                    ]
+                                                   }
+                               },
+                   "perSymbol":  {
+                                     "BTCUSDT":  {
+                                                     "symbol":  "BTCUSDT",
+                                                     "metrics":  {
+                                                                     "markPrice":  72182.15,
+                                                                     "totalEquity":  4999.43335502,
+                                                                     "walletBalance":  4999.43335502,
+                                                                     "unrealizedPnl":  0,
+                                                                     "realizedPnl":  -0.16659995,
+                                                                     "feePaid":  0.40004503,
+                                                                     "fundingPnl":  0,
+                                                                     "marginHealth":  1
+                                                                 },
+                                                     "performance":  {
+                                                                         "totalPnL":  -0.5666449800000919,
+                                                                         "winCount":  0,
+                                                                         "lossCount":  1,
+                                                                         "totalTrades":  1,
+                                                                         "winRate":  0,
+                                                                         "maxDrawdown":  0.5666449800000919,
+                                                                         "sharpeRatio":  -17.91443949309502,
+                                                                         "pnlCurve":  [
+                                                                                          {
+                                                                                              "timestamp":  1772696923861,
+                                                                                              "pnl":  0
+                                                                                          },
+                                                                                          {
+                                                                                              "timestamp":  1772696924790,
+                                                                                              "pnl":  -0.3335630340370699
+                                                                                          },
+                                                                                          {
+                                                                                              "timestamp":  1772696925087,
+                                                                                              "pnl":  -0.40071268317205977
+                                                                                          },
+                                                                                          {
+                                                                                              "timestamp":  1772696925590,
+                                                                                              "pnl":  -0.5666449800000919
+                                                                                          },
+                                                                                          {
+                                                                                              "timestamp":  1772696925590,
+                                                                                              "pnl":  -0.5666449800000919
+                                                                                          }
+                                                                                      ]
+                                                                     },
+                                                     "risk":  {
+                                                                  "winStreak":  0,
+                                                                  "lossStreak":  2,
+                                                                  "dynamicLeverage":  5,
+                                                                  "stopLossPrice":  null,
+                                                                  "liquidationRisk":  {
+                                                                                          "score":  "GREEN",
+                                                                                          "timeToLiquidationMs":  1000000,
+                                                                                          "fundingRateImpact":  0
+                                                                                      }
+                                                              },
+                                                     "position":  null,
+                                                     "openLimitOrders":  [
+
+                                                                         ],
+                                                     "lastEventTimestampMs":  1772696925453,
+                                                     "eventCount":  3
+                                                 }
+                                 },
+                   "logTail":  [
+                                   {
+                                       "seq":  1,
+                                       "timestampMs":  1,
+                                       "symbol":  null,
+                                       "level":  "INFO",
+                                       "message":  "Dry Run Initialized with pairs: [BTCUSDT]"
+                                   },
+                                   {
+                                       "seq":  2,
+                                       "timestampMs":  1,
+                                       "symbol":  "BTCUSDT",
+                                       "level":  "INFO",
+                                       "message":  "Session ready. Funding rate=0"
+                                   },
+                                   {
+                                       "seq":  3,
+                                       "timestampMs":  1772696924646,
+                                       "symbol":  "BTCUSDT",
+                                       "level":  "INFO",
+                                       "message":  "Market Data Received: BTCUSDT @ 72182.2"
+                                   },
+                                   {
+                                       "seq":  4,
+                                       "timestampMs":  1772696924646,
+                                       "symbol":  "BTCUSDT",
+                                       "level":  "INFO",
+                                       "message":  "Running... Scanning BTCUSDT. Current Price: 72182.2. Last Check: 1772696924s ago."
+                                   },
+                                   {
+                                       "seq":  5,
+                                       "timestampMs":  1772696924646,
+                                       "symbol":  "BTCUSDT",
+                                       "level":  "INFO",
+                                       "message":  "Order MARKET/BUY FILLED fill=0.006927/0.006927 avg=72201.4735"
+                                   },
+                                   {
+                                       "seq":  6,
+                                       "timestampMs":  1772696924646,
+                                       "symbol":  "BTCUSDT",
+                                       "level":  "INFO",
+                                       "message":  "AI reduce LONG -0.002078 (30%)"
+                                   },
+                                   {
+                                       "seq":  7,
+                                       "timestampMs":  1772696924646,
+                                       "symbol":  "BTCUSDT",
+                                       "level":  "INFO",
+                                       "message":  "AI reversal: closing LONG before SHORT"
+                                   },
+                                   {
+                                       "seq":  8,
+                                       "timestampMs":  1772696924646,
+                                       "symbol":  "BTCUSDT",
+                                       "level":  "INFO",
+                                       "message":  "AI entry SHORT 0.006927 @ ~72182.2"
+                                   },
+                                   {
+                                       "seq":  9,
+                                       "timestampMs":  1772696924646,
+                                       "symbol":  "BTCUSDT",
+                                       "level":  "INFO",
+                                       "message":  "AI reversal: closing LONG before SHORT"
+                                   },
+                                   {
+                                       "seq":  10,
+                                       "timestampMs":  1772696924646,
+                                       "symbol":  "BTCUSDT",
+                                       "level":  "INFO",
+                                       "message":  "AI entry SHORT 0.006927 @ ~72182.2"
+                                   },
+                                   {
+                                       "seq":  11,
+                                       "timestampMs":  1772696924949,
+                                       "symbol":  "BTCUSDT",
+                                       "level":  "INFO",
+                                       "message":  "Order LIMIT/SELL FILLED fill=0.002078/0.002078 avg=72178.8737"
+                                   },
+                                   {
+                                       "seq":  12,
+                                       "timestampMs":  1772696924949,
+                                       "symbol":  "BTCUSDT",
+                                       "level":  "INFO",
+                                       "message":  "AI reversal: closing LONG before SHORT"
+                                   },
+                                   {
+                                       "seq":  13,
+                                       "timestampMs":  1772696924949,
+                                       "symbol":  "BTCUSDT",
+                                       "level":  "INFO",
+                                       "message":  "AI entry SHORT 0.006927 @ ~72182.15"
+                                   },
+                                   {
+                                       "seq":  14,
+                                       "timestampMs":  1772696925453,
+                                       "symbol":  "BTCUSDT",
+                                       "level":  "INFO",
+                                       "message":  "Order LIMIT/SELL FILLED fill=0.004849/0.006927 avg=72176.8008"
+                                   }
+                               ],
+                   "alphaDecay":  [
+
+                                  ]
+               }
+}

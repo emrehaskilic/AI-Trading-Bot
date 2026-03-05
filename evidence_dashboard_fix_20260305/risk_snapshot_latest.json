@@ -1,0 +1,37 @@
+﻿{
+    "timestamp":  1772697558296,
+    "state":  {
+                  "current":  "TRACKING",
+                  "canTrade":  true,
+                  "canOpenPosition":  true,
+                  "isReducedRisk":  false,
+                  "positionSizeMultiplier":  1
+              },
+    "limits":  {
+                   "maxPositionNotional":  10000,
+                   "maxLeverage":  100,
+                   "maxPositionQty":  10,
+                   "dailyLossLimit":  500,
+                   "reducedRiskPositionMultiplier":  0.5
+               },
+    "triggers":  {
+                     "lastTrigger":  null,
+                     "recentTriggers":  [
+
+                                        ],
+                     "triggerCounts":  {
+
+                                       }
+                 },
+    "killSwitch":  {
+                       "active":  false,
+                       "triggeredAt":  null,
+                       "reason":  null
+                   },
+    "exposure":  {
+                     "totalPositionNotional":  0,
+                     "totalMarginUsed":  0,
+                     "availableMargin":  4999.55997599,
+                     "marginUtilizationPercent":  0
+                 }
+}

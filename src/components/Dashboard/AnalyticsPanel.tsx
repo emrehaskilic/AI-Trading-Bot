@@ -126,11 +126,11 @@ export const AnalyticsPanel = memo<AnalyticsPanelProps>(({ className = '' }) => 
   }, [lastUpdated]);
 
   const drawdownColor = useMemo(() => {
-    const dd = data?.drawdown.current ?? 0;
-    if (dd < 0.05) return 'text-green-400';
-    if (dd < 0.1) return 'text-yellow-400';
+    const ddPct = Math.abs(data?.drawdown.currentPercent ?? 0);
+    if (ddPct < 2) return 'text-green-400';
+    if (ddPct < 5) return 'text-yellow-400';
     return 'text-red-400';
-  }, [data?.drawdown.current]);
+  }, [data?.drawdown.currentPercent]);
 
   const totalTrades = data?.totalTrades ?? 0;
   const openPositions = data?.openPositions ?? 0;
@@ -251,21 +251,26 @@ export const AnalyticsPanel = memo<AnalyticsPanelProps>(({ className = '' }) => 
           <div className="flex justify-between items-center mb-2">
             <span className="text-xs text-zinc-500">Current Drawdown</span>
             <span className={`text-lg font-bold ${drawdownColor}`}>
-              {data?.drawdown.current !== undefined 
-                ? `${(data.drawdown.current * 100).toFixed(2)}%` 
+              {data?.drawdown.currentPercent !== undefined 
+                ? `${Math.abs(data.drawdown.currentPercent).toFixed(2)}%` 
                 : '-'}
             </span>
           </div>
+          <div className="text-xs text-zinc-500 mb-2 text-right">
+            {data?.drawdown.current !== undefined
+              ? `${formatNumber(Math.abs(data.drawdown.current), 2)} USDT`
+              : '-'}
+          </div>
           <ProgressBar
             label="vs Max Drawdown"
-            current={data?.drawdown.current ?? 0}
-            max={data?.drawdown.max ?? 1}
+            current={Math.abs(data?.drawdown.currentPercent ?? 0)}
+            max={Math.max(0.0001, Math.abs(data?.drawdown.maxPercent ?? 0))}
             unit="%"
             decimals={2}
           />
           {data?.drawdown.recovery !== undefined && (
             <div className="mt-2 text-xs text-zinc-500 text-right">
-              Recovery: {(data.drawdown.recovery * 100).toFixed(1)}%
+              Recovery Time: {formatNumber(data.drawdown.recovery, 0)} ms
             </div>
           )}
         </div>
@@ -300,6 +305,33 @@ export const AnalyticsPanel = memo<AnalyticsPanelProps>(({ className = '' }) => 
             decimals={2}
             threshold={{ warning: 1.2, critical: 1 }}
           />
+        </div>
+      </div>
+
+      {/* Open Positions */}
+      <div className="mb-4">
+        <h4 className="text-sm font-medium text-zinc-400 mb-2">
+          Open Positions ({data?.positions?.length || 0})
+        </h4>
+        <div className="space-y-2 max-h-40 overflow-auto pr-1">
+          {(data?.positions && data.positions.length > 0) ? data.positions.map((position) => (
+            <div key={position.symbol} className="bg-zinc-800/40 rounded p-2 text-xs">
+              <div className="flex items-center justify-between">
+                <span className="text-zinc-300 font-medium">{position.symbol}</span>
+                <span className={position.unrealizedPnl >= 0 ? 'text-green-400' : 'text-red-400'}>
+                  {position.unrealizedPnl >= 0 ? '+' : ''}{formatNumber(position.unrealizedPnl, 2)} USDT
+                </span>
+              </div>
+              <div className="mt-1 flex items-center justify-between text-zinc-500">
+                <span>{position.side} | Qty {formatNumber(position.qty, 4)}</span>
+                <span>{formatNumber(position.unrealizedPnlPercent, 2)}%</span>
+              </div>
+            </div>
+          )) : (
+            <div className="text-center text-zinc-600 py-3 text-xs">
+              No open positions
+            </div>
+          )}
         </div>
       </div>
 

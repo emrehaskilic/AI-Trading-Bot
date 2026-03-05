@@ -29,8 +29,21 @@ export interface SlippageMetrics {
 export interface DrawdownMetrics {
   current: number;
   max: number;
+  currentPercent: number;
+  maxPercent: number;
   recovery: number;
   duration: number;
+}
+
+export interface OpenPositionSummary {
+  symbol: string;
+  side: 'LONG' | 'SHORT' | 'FLAT';
+  qty: number;
+  entryPrice: number;
+  markPrice: number;
+  unrealizedPnl: number;
+  unrealizedPnlPercent: number;
+  notionalValue: number;
 }
 
 export interface AnalyticsSnapshot {
@@ -41,10 +54,12 @@ export interface AnalyticsSnapshot {
   drawdown: DrawdownMetrics;
   totalTrades?: number;
   openPositions?: number;
+  avgReturnPerTradePct?: number;
   sharpeRatio?: number;
   sortinoRatio?: number;
   winRate?: number;
   profitFactor?: number;
+  positions?: OpenPositionSummary[];
   evidencePackUrl?: string;
 }
 
@@ -56,21 +71,39 @@ interface BackendAnalyticsSnapshot {
     netPnl: number;
     unrealizedPnl: number;
   };
+  fees?: {
+    makerFees: number;
+    takerFees: number;
+    totalFees: number;
+    effectiveRate: number;
+  };
   trades: {
     totalTrades: number;
     openPositions: number;
+    avgTradePnl: number;
+    avgReturnPerTradePct: number;
     winRate: number;
     profitFactor: number;
   };
   execution: {
     avgSlippageBps: number;
+    p95SlippageBps: number;
+    maxSlippageBps: number;
+    slippageSamples: number;
   };
   drawdown: {
     currentDrawdown: number;
+    currentDrawdownPercent: number;
     maxDrawdown: number;
     maxDrawdownPercent: number;
     recoveryFactor: number;
   };
+  performance?: {
+    sharpeRatio: number;
+    sortinoRatio: number;
+    expectancy: number;
+  };
+  positions?: OpenPositionSummary[];
 }
 
 export function useAnalytics(): {
@@ -90,6 +123,8 @@ export function useAnalytics(): {
     const totalRealized = Number(raw?.pnl?.totalRealizedPnl || 0);
     const netPnl = Number(raw?.pnl?.netPnl || 0);
     const avgSlippage = Number(raw?.execution?.avgSlippageBps || 0);
+    const makerFees = Number(raw?.fees?.makerFees ?? totalFees * 0.5);
+    const takerFees = Number(raw?.fees?.takerFees ?? totalFees * 0.5);
 
     return {
       timestamp: new Date(raw?.timestamp || Date.now()).toISOString(),
@@ -102,27 +137,33 @@ export function useAnalytics(): {
         monthly: netPnl,
       },
       fees: {
-        maker: totalFees * 0.5,
-        taker: totalFees * 0.5,
+        maker: makerFees,
+        taker: takerFees,
         total: totalFees,
-        effectiveRate: Math.abs(totalRealized) > 0 ? totalFees / Math.abs(totalRealized) : 0,
+        effectiveRate: Number(raw?.fees?.effectiveRate ?? (Math.abs(totalRealized) > 0 ? totalFees / Math.abs(totalRealized) : 0)),
       },
       slippage: {
         average: avgSlippage,
-        max: avgSlippage * 1.5,
-        p95: avgSlippage * 1.2,
+        max: Number(raw?.execution?.maxSlippageBps || 0),
+        p95: Number(raw?.execution?.p95SlippageBps || 0),
         bySize: {},
       },
       drawdown: {
         current: Number(raw?.drawdown?.currentDrawdown || 0),
-        max: Number(raw?.drawdown?.maxDrawdownPercent || raw?.drawdown?.maxDrawdown || 0),
+        max: Number(raw?.drawdown?.maxDrawdown || 0),
+        currentPercent: Number(raw?.drawdown?.currentDrawdownPercent || 0),
+        maxPercent: Number(raw?.drawdown?.maxDrawdownPercent || 0),
         recovery: Number(raw?.drawdown?.recoveryFactor || 0),
         duration: 0,
       },
       totalTrades: Number(raw?.trades?.totalTrades || 0),
       openPositions: Number(raw?.trades?.openPositions || 0),
+      avgReturnPerTradePct: Number(raw?.trades?.avgReturnPerTradePct || 0),
       winRate: Number(raw?.trades?.winRate || 0) / 100,
       profitFactor: Number(raw?.trades?.profitFactor || 0),
+      sharpeRatio: Number(raw?.performance?.sharpeRatio || 0),
+      sortinoRatio: Number(raw?.performance?.sortinoRatio || 0),
+      positions: Array.isArray(raw?.positions) ? raw.positions : [],
       evidencePackUrl: '/api/analytics/evidence-pack',
     };
   }, []);

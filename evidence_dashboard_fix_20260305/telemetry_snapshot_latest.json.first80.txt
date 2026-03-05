@@ -1,0 +1,62 @@
+﻿   1: {
+   2:     "timestamp":  1772697558275,
+   3:     "activeSymbols":  [
+   4:                           "BTCUSDT"
+   5:                       ],
+   6:     "ws_latency_histogram":  {
+   7:                                  "p50":  4,
+   8:                                  "p95":  36,
+   9:                                  "p99":  57.60000000000002,
+  10:                                  "count":  11,
+  11:                                  "sum":  113
+  12:                              },
+  13:     "strategy_decision_confidence_histogram":  {
+  14:                                                    "p50":  0.6876055017673459,
+  15:                                                    "p95":  0.8668692560002165,
+  16:                                                    "p99":  0.8731941159883798,
+  17:                                                    "count":  11,
+  18:                                                    "sum":  5.911539619496709
+  19:                                                },
+  20:     "trade_metrics":  {
+  21:                           "attempts":  2,
+  22:                           "executed":  2,
+  23:                           "rejected":  0,
+  24:                           "failed":  0
+  25:                       },
+  26:     "risk_state_current":  0,
+  27:     "position_metrics":  {
+  28:                              "positionCount":  0,
+  29:                              "openOrderCount":  0
+  30:                          },
+  31:     "system_metrics":  {
+  32:                            "uptimeMs":  23215,
+  33:                            "memoryUsageMB":  27,
+  34:                            "memoryUsagePercent":  0
+  35:                        },
+  36:     "latency_stages":  {
+  37:                            "trade_ingest_ms":  {
+  38:                                                    "avgMs":  0.09,
+  39:                                                    "p95Ms":  1,
+  40:                                                    "maxMs":  2,
+  41:                                                    "samples":  250
+  42:                                                },
+  43:                            "strategy_calc_ms":  {
+  44:                                                     "avgMs":  3.21,
+  45:                                                     "p95Ms":  8,
+  46:                                                     "maxMs":  10,
+  47:                                                     "samples":  14
+  48:                                                 },
+  49:                            "depth_ingest_ms":  {
+  50:                                                    "avgMs":  515.45,
+  51:                                                    "p95Ms":  864,
+  52:                                                    "maxMs":  906,
+  53:                                                    "samples":  145
+  54:                                                },
+  55:                            "dry_run_ingest_ms":  {
+  56:                                                      "avgMs":  6,
+  57:                                                      "p95Ms":  2,
+  58:                                                      "maxMs":  10,
+  59:                                                      "samples":  2
+  60:                                                  }
+  61:                        }
+  62: }
