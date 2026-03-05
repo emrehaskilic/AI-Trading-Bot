@@ -243,6 +243,20 @@ const RISK_ENGINE_CONFIG = {
             ? true
             : parseEnvFlag(process.env.RISK_AUTO_CLOSE_POSITIONS),
     },
+    autoRecovery: {
+        enabled: process.env.RISK_AUTO_RECOVERY_ENABLED == null
+            ? true
+            : parseEnvFlag(process.env.RISK_AUTO_RECOVERY_ENABLED),
+        haltedStableMs: Math.max(1000, parseEnvNumber(process.env.RISK_AUTO_RECOVERY_HALTED_STABLE_MS, 30000)),
+        reducedStableMs: Math.max(1000, parseEnvNumber(process.env.RISK_AUTO_RECOVERY_REDUCED_STABLE_MS, 60000)),
+        haltedExecutionHeadroom: Math.max(0.1, Math.min(1, parseEnvNumber(process.env.RISK_AUTO_RECOVERY_HALTED_EXECUTION_HEADROOM, 0.9))),
+        reducedExecutionHeadroom: Math.max(0.1, Math.min(1, parseEnvNumber(process.env.RISK_AUTO_RECOVERY_REDUCED_EXECUTION_HEADROOM, 0.75))),
+        haltedNotionalUtilization: Math.max(0.05, Math.min(1, parseEnvNumber(process.env.RISK_AUTO_RECOVERY_HALTED_NOTIONAL_UTILIZATION, 0.95))),
+        haltedLeverageUtilization: Math.max(0.05, Math.min(1, parseEnvNumber(process.env.RISK_AUTO_RECOVERY_HALTED_LEVERAGE_UTILIZATION, 0.95))),
+        reducedNotionalUtilization: Math.max(0.05, Math.min(1, parseEnvNumber(process.env.RISK_AUTO_RECOVERY_REDUCED_NOTIONAL_UTILIZATION, 0.8))),
+        reducedLeverageUtilization: Math.max(0.05, Math.min(1, parseEnvNumber(process.env.RISK_AUTO_RECOVERY_REDUCED_LEVERAGE_UTILIZATION, 0.8))),
+        maxHeartbeatAgeMs: Math.max(1000, parseEnvNumber(process.env.RISK_AUTO_RECOVERY_MAX_HEARTBEAT_AGE_MS, 15000)),
+    },
 };
 const RESILIENCE_PATCHES_ENABLED = process.env.RESILIENCE_PATCHES_ENABLED == null
     ? true
@@ -727,6 +741,7 @@ log('EXECUTION_CONFIG', {
     superScalpEnabled: SUPER_SCALP_ENABLED,
     riskEngineEnabled: RISK_ENGINE_ENABLED,
     riskEngineDefaultEquityUsdt: RISK_ENGINE_DEFAULT_EQUITY_USDT,
+    riskAutoRecoveryEnabled: Boolean(RISK_ENGINE_CONFIG.autoRecovery?.enabled),
     hasApiKey: hasEnvApiKey,
     hasApiSecret: hasEnvApiSecret,
     executionAllowed: initialGate.executionAllowed,
@@ -1119,6 +1134,16 @@ function syncRiskEngineRuntime(
                 logAnalyticsError('position_sync', symbol, error);
             }
         }
+    }
+
+    const autoRecovery = institutionalRiskEngine.evaluateAutoRecovery(now);
+    if (autoRecovery.transitioned) {
+        log('RISK_ENGINE_AUTO_RECOVERY', {
+            from: autoRecovery.fromState,
+            to: autoRecovery.targetState,
+            stableForMs: autoRecovery.stableForMs,
+            requiredStableMs: autoRecovery.requiredStableMs,
+        });
     }
 
     const currentState = institutionalRiskEngine.getRiskState();

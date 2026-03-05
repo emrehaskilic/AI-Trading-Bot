@@ -186,6 +186,67 @@ function testStateMachineTransitions(): boolean {
   return engine.getRiskState() === RiskState.KILL_SWITCH;
 }
 
+function testAutoRecovery(): boolean {
+  const baseTs = Date.now();
+  const engine = new InstitutionalRiskEngine({
+    consecutiveLoss: {
+      maxConsecutiveLosses: 3,
+      lossWindowMs: 200,
+      minLossAmount: 1,
+      resetAfterWin: true,
+      reducedRiskThreshold: 2,
+      reducedRiskMultiplier: 0.5,
+    },
+    autoRecovery: {
+      enabled: true,
+      haltedStableMs: 1000,
+      reducedStableMs: 1000,
+      haltedExecutionHeadroom: 1,
+      reducedExecutionHeadroom: 1,
+      haltedNotionalUtilization: 1,
+      haltedLeverageUtilization: 1,
+      reducedNotionalUtilization: 1,
+      reducedLeverageUtilization: 1,
+      maxHeartbeatAgeMs: 60_000,
+    },
+  });
+  engine.initialize(10_000);
+
+  engine.recordHeartbeat(baseTs);
+  engine.recordTradeResult('BTCUSDT', -100, 1, baseTs + 1);
+  engine.recordTradeResult('BTCUSDT', -120, 1, baseTs + 2);
+  engine.recordTradeResult('BTCUSDT', -140, 1, baseTs + 3);
+  if (engine.getRiskState() !== RiskState.HALTED) return false;
+
+  // Before loss-window expiry there should be no recovery.
+  let recovery = engine.evaluateAutoRecovery(baseTs + 150);
+  if (recovery.transitioned) return false;
+  if (engine.getRiskState() !== RiskState.HALTED) return false;
+
+  // Once the loss window expires, recovery can start and then step down via hysteresis windows.
+  engine.recordHeartbeat(baseTs + 210);
+  recovery = engine.evaluateAutoRecovery(baseTs + 210);
+  if (recovery.transitioned) return false;
+  if (engine.getRiskState() !== RiskState.HALTED) return false;
+
+  engine.recordHeartbeat(baseTs + 1_250);
+  recovery = engine.evaluateAutoRecovery(baseTs + 1_250);
+  if (!recovery.transitioned) return false;
+  if (engine.getRiskState() !== RiskState.REDUCED_RISK) return false;
+
+  engine.recordHeartbeat(baseTs + 1_300);
+  recovery = engine.evaluateAutoRecovery(baseTs + 1_300);
+  if (recovery.transitioned) return false;
+  if (engine.getRiskState() !== RiskState.REDUCED_RISK) return false;
+
+  engine.recordHeartbeat(baseTs + 2_350);
+  recovery = engine.evaluateAutoRecovery(baseTs + 2_350);
+  if (!recovery.transitioned) return false;
+
+  engine.stop();
+  return engine.getRiskState() === RiskState.TRACKING;
+}
+
 async function main(): Promise<void> {
   const tests: Array<{ name: string; run: () => boolean }> = [
     { name: 'Position Limits (R1-R4)', run: testPositionLimits },
@@ -195,6 +256,7 @@ async function main(): Promise<void> {
     { name: 'Execution Failures (R16-R18)', run: testExecutionFailures },
     { name: 'Kill Switch (R19-R20)', run: testKillSwitch },
     { name: 'State Machine', run: testStateMachineTransitions },
+    { name: 'Auto Recovery (HALTED -> REDUCED -> TRACKING)', run: testAutoRecovery },
   ];
 
   let passed = 0;

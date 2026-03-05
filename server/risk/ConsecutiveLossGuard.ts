@@ -175,6 +175,7 @@ export class ConsecutiveLossGuard {
    * Get position size multiplier
    */
   getPositionSizeMultiplier(): number {
+    this.refresh();
     if (this.reducedRiskActive) {
       return this.config.reducedRiskMultiplier;
     }
@@ -198,6 +199,7 @@ export class ConsecutiveLossGuard {
     lossRate: number;
     totalLossAmount: number;
   } {
+    this.refresh();
     const losses = this.tradeHistory.filter(t => t.pnl < -this.config.minLossAmount);
     const totalLossAmount = losses.reduce((sum, t) => sum + Math.abs(t.pnl), 0);
     
@@ -224,6 +226,30 @@ export class ConsecutiveLossGuard {
    * Check if trading should be halted
    */
   shouldHalt(): boolean {
+    this.refresh();
     return this.consecutiveLosses >= this.config.maxConsecutiveLosses;
+  }
+
+  /**
+   * Refresh rolling window state even when no new trade is recorded.
+   * This allows automatic recovery once stale losses fall out of the window.
+   */
+  refresh(currentTime?: number): void {
+    const now = currentTime || Date.now();
+    this.cleanOldTrades(now);
+    if (this.consecutiveLosses < this.config.reducedRiskThreshold) {
+      this.reducedRiskActive = false;
+    }
+  }
+
+  /**
+   * Expose active thresholds for recovery coordinators.
+   */
+  getThresholds(): Pick<ConsecutiveLossConfig, 'maxConsecutiveLosses' | 'reducedRiskThreshold' | 'lossWindowMs'> {
+    return {
+      maxConsecutiveLosses: this.config.maxConsecutiveLosses,
+      reducedRiskThreshold: this.config.reducedRiskThreshold,
+      lossWindowMs: this.config.lossWindowMs,
+    };
   }
 }

@@ -12,7 +12,7 @@
  * State Machine: TRACKING -> REDUCED_RISK -> HALTED -> KILL_SWITCH
  */
 
-import { RiskStateManager, RiskState, RiskStateConfig } from './RiskStateManager';
+import { RiskStateManager, RiskState, RiskStateConfig, RiskStateTrigger } from './RiskStateManager';
 import { PositionRiskGuard, PositionRiskConfig } from './PositionRiskGuard';
 import { DrawdownRiskGuard, DrawdownRiskConfig } from './DrawdownRiskGuard';
 import { ConsecutiveLossGuard, ConsecutiveLossConfig } from './ConsecutiveLossGuard';
@@ -28,7 +28,44 @@ export interface InstitutionalRiskConfig {
   multiSymbol?: Partial<MultiSymbolExposureConfig>;
   execution?: Partial<ExecutionRiskConfig>;
   killSwitch?: Partial<KillSwitchConfig>;
+  autoRecovery?: Partial<RiskAutoRecoveryConfig>;
 }
+
+export interface RiskAutoRecoveryConfig {
+  enabled: boolean;
+  haltedStableMs: number;
+  reducedStableMs: number;
+  haltedExecutionHeadroom: number;
+  reducedExecutionHeadroom: number;
+  haltedNotionalUtilization: number;
+  haltedLeverageUtilization: number;
+  reducedNotionalUtilization: number;
+  reducedLeverageUtilization: number;
+  maxHeartbeatAgeMs: number;
+}
+
+export interface AutoRecoveryResult {
+  enabled: boolean;
+  fromState: RiskState;
+  targetState: RiskState | null;
+  transitioned: boolean;
+  blockedReasons: string[];
+  stableForMs: number;
+  requiredStableMs: number;
+}
+
+const DEFAULT_AUTO_RECOVERY_CONFIG: RiskAutoRecoveryConfig = {
+  enabled: true,
+  haltedStableMs: 30_000,
+  reducedStableMs: 60_000,
+  haltedExecutionHeadroom: 0.9,
+  reducedExecutionHeadroom: 0.75,
+  haltedNotionalUtilization: 0.95,
+  haltedLeverageUtilization: 0.95,
+  reducedNotionalUtilization: 0.8,
+  reducedLeverageUtilization: 0.8,
+  maxHeartbeatAgeMs: 15_000,
+};
 
 export interface RiskCheckResult {
   allowed: boolean;
@@ -68,6 +105,7 @@ export class InstitutionalRiskEngine {
   // Core state manager
   private stateManager: RiskStateManager;
   private readonly config: InstitutionalRiskConfig;
+  private readonly autoRecoveryConfig: RiskAutoRecoveryConfig;
   
   // Risk guards
   private positionGuard: PositionRiskGuard;
@@ -80,9 +118,24 @@ export class InstitutionalRiskEngine {
   // Account state
   private accountEquity: number = 0;
   private isInitialized: boolean = false;
+  private autoRecoveryStableSinceMs: number | null = null;
+  private autoRecoveryTargetState: RiskState | null = null;
 
   constructor(config: InstitutionalRiskConfig = {}) {
     this.config = { ...config };
+    const rawAutoRecovery = { ...DEFAULT_AUTO_RECOVERY_CONFIG, ...(this.config.autoRecovery || {}) };
+    this.autoRecoveryConfig = {
+      enabled: Boolean(rawAutoRecovery.enabled),
+      haltedStableMs: Math.max(1_000, Number(rawAutoRecovery.haltedStableMs || DEFAULT_AUTO_RECOVERY_CONFIG.haltedStableMs)),
+      reducedStableMs: Math.max(1_000, Number(rawAutoRecovery.reducedStableMs || DEFAULT_AUTO_RECOVERY_CONFIG.reducedStableMs)),
+      haltedExecutionHeadroom: Math.max(0.1, Math.min(1, Number(rawAutoRecovery.haltedExecutionHeadroom || DEFAULT_AUTO_RECOVERY_CONFIG.haltedExecutionHeadroom))),
+      reducedExecutionHeadroom: Math.max(0.1, Math.min(1, Number(rawAutoRecovery.reducedExecutionHeadroom || DEFAULT_AUTO_RECOVERY_CONFIG.reducedExecutionHeadroom))),
+      haltedNotionalUtilization: Math.max(0.05, Math.min(1, Number(rawAutoRecovery.haltedNotionalUtilization || DEFAULT_AUTO_RECOVERY_CONFIG.haltedNotionalUtilization))),
+      haltedLeverageUtilization: Math.max(0.05, Math.min(1, Number(rawAutoRecovery.haltedLeverageUtilization || DEFAULT_AUTO_RECOVERY_CONFIG.haltedLeverageUtilization))),
+      reducedNotionalUtilization: Math.max(0.05, Math.min(1, Number(rawAutoRecovery.reducedNotionalUtilization || DEFAULT_AUTO_RECOVERY_CONFIG.reducedNotionalUtilization))),
+      reducedLeverageUtilization: Math.max(0.05, Math.min(1, Number(rawAutoRecovery.reducedLeverageUtilization || DEFAULT_AUTO_RECOVERY_CONFIG.reducedLeverageUtilization))),
+      maxHeartbeatAgeMs: Math.max(1_000, Number(rawAutoRecovery.maxHeartbeatAgeMs || DEFAULT_AUTO_RECOVERY_CONFIG.maxHeartbeatAgeMs)),
+    };
 
     // Initialize state manager first
     this.stateManager = new RiskStateManager(this.config.state);
@@ -335,6 +388,144 @@ export class InstitutionalRiskEngine {
   }
 
   /**
+   * Evaluate auto-recovery from HALTED/REDUCED states.
+   * Uses hysteresis and strict safety checks to avoid flip-flopping.
+   */
+  evaluateAutoRecovery(timestamp?: number): AutoRecoveryResult {
+    const state = this.stateManager.getCurrentState();
+    const result: AutoRecoveryResult = {
+      enabled: this.autoRecoveryConfig.enabled,
+      fromState: state,
+      targetState: null,
+      transitioned: false,
+      blockedReasons: [],
+      stableForMs: 0,
+      requiredStableMs: 0,
+    };
+
+    if (!this.autoRecoveryConfig.enabled || !this.isInitialized) {
+      return result;
+    }
+
+    if (state === RiskState.KILL_SWITCH || state === RiskState.TRACKING) {
+      this.autoRecoveryStableSinceMs = null;
+      this.autoRecoveryTargetState = null;
+      return result;
+    }
+
+    const now = timestamp || Date.now();
+    this.consecutiveLossGuard.refresh(now);
+
+    const drawdown = this.drawdownGuard.getDrawdownStatus();
+    const lossStats = this.consecutiveLossGuard.getLossStatistics();
+    const lossThresholds = this.consecutiveLossGuard.getThresholds();
+    const executionStats = this.executionGuard.getExecutionStats();
+    const executionThresholds = this.executionGuard.getThresholds();
+    const positionSummary = this.positionGuard.getPositionSummary(this.accountEquity);
+    const killSwitchHealth = this.killSwitchManager.getSystemHealth();
+
+    const isHalted = state === RiskState.HALTED;
+    const targetState = isHalted ? RiskState.REDUCED_RISK : RiskState.TRACKING;
+    const requiredStableMs = isHalted
+      ? this.autoRecoveryConfig.haltedStableMs
+      : this.autoRecoveryConfig.reducedStableMs;
+    const executionHeadroom = isHalted
+      ? this.autoRecoveryConfig.haltedExecutionHeadroom
+      : this.autoRecoveryConfig.reducedExecutionHeadroom;
+    const notionalUtilizationLimit = isHalted
+      ? this.autoRecoveryConfig.haltedNotionalUtilization
+      : this.autoRecoveryConfig.reducedNotionalUtilization;
+    const leverageUtilizationLimit = isHalted
+      ? this.autoRecoveryConfig.haltedLeverageUtilization
+      : this.autoRecoveryConfig.reducedLeverageUtilization;
+    const maxConsecutiveLosses = isHalted
+      ? Math.max(0, lossThresholds.maxConsecutiveLosses - 1)
+      : Math.max(0, lossThresholds.reducedRiskThreshold - 1);
+
+    result.targetState = targetState;
+    result.requiredStableMs = requiredStableMs;
+
+    if (this.autoRecoveryTargetState !== targetState) {
+      this.autoRecoveryTargetState = targetState;
+      this.autoRecoveryStableSinceMs = null;
+    }
+
+    const maxPartialFillForRecovery = executionThresholds.maxPartialFillRate * executionHeadroom;
+    const maxRejectForRecovery = executionThresholds.maxRejectRate * executionHeadroom;
+
+    if (drawdown.isLimit) {
+      result.blockedReasons.push('drawdown_limit_active');
+    }
+    if (!isHalted && drawdown.isWarning) {
+      result.blockedReasons.push('drawdown_warning_active');
+    }
+    if (lossStats.consecutiveLosses > maxConsecutiveLosses) {
+      result.blockedReasons.push('consecutive_losses_not_cleared');
+    }
+    if (executionStats.partialFillRate > maxPartialFillForRecovery) {
+      result.blockedReasons.push('partial_fill_rate_high');
+    }
+    if (executionStats.rejectRate > maxRejectForRecovery) {
+      result.blockedReasons.push('reject_rate_high');
+    }
+    if (positionSummary.utilization.notional > notionalUtilizationLimit) {
+      result.blockedReasons.push('notional_utilization_high');
+    }
+    if (positionSummary.utilization.leverage > leverageUtilizationLimit) {
+      result.blockedReasons.push('leverage_utilization_high');
+    }
+    if (!killSwitchHealth.isConnected) {
+      result.blockedReasons.push('heartbeat_disconnected');
+    }
+    if (killSwitchHealth.timeSinceLastHeartbeat > this.autoRecoveryConfig.maxHeartbeatAgeMs) {
+      result.blockedReasons.push('heartbeat_stale');
+    }
+
+    if (result.blockedReasons.length > 0) {
+      this.autoRecoveryStableSinceMs = null;
+      return result;
+    }
+
+    if (this.autoRecoveryStableSinceMs == null) {
+      this.autoRecoveryStableSinceMs = now;
+      return result;
+    }
+
+    result.stableForMs = Math.max(0, now - this.autoRecoveryStableSinceMs);
+    if (result.stableForMs < requiredStableMs) {
+      return result;
+    }
+
+    const trigger = isHalted ? RiskStateTrigger.RISK_REDUCED : RiskStateTrigger.SYSTEM_STABLE;
+    const transitioned = this.stateManager.transition(
+      trigger,
+      `auto_recovery_${state.toLowerCase()}_to_${targetState.toLowerCase()}`,
+      {
+        stableForMs: result.stableForMs,
+        requiredStableMs,
+        execution: {
+          partialFillRate: executionStats.partialFillRate,
+          rejectRate: executionStats.rejectRate,
+        },
+        drawdown: {
+          isWarning: drawdown.isWarning,
+          isLimit: drawdown.isLimit,
+          lossRatio: drawdown.lossRatio,
+        },
+        positionUtilization: positionSummary.utilization,
+        consecutiveLosses: lossStats.consecutiveLosses,
+      }
+    );
+
+    result.transitioned = transitioned;
+    if (transitioned) {
+      this.autoRecoveryStableSinceMs = null;
+      this.autoRecoveryTargetState = null;
+    }
+    return result;
+  }
+
+  /**
    * Get state manager (for advanced operations)
    */
   getStateManager(): RiskStateManager {
@@ -389,6 +580,8 @@ export class InstitutionalRiskEngine {
     this.killSwitchManager.reset();
     this.accountEquity = 0;
     this.isInitialized = false;
+    this.autoRecoveryStableSinceMs = null;
+    this.autoRecoveryTargetState = null;
   }
 
   /**
