@@ -13,6 +13,7 @@ import {
 import { NormalizationStore } from './Normalization';
 import { DirectionalFlowScore } from './DirectionalFlowScore';
 import { RegimeSelector } from './RegimeSelector';
+import { deriveBias15m, deriveVeto1h } from './HtfBias';
 
 const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
 const WINNER_ADD_MIN_UPNL_PCT = 0.0025;
@@ -22,6 +23,13 @@ const DEFAULT_FRESH_REVERSAL_PROTECT_MS = 180_000;
 const DEFAULT_FRESH_SOFT_REDUCE_PROTECT_MS = 180_000;
 const DEFAULT_SOFT_REDUCE_COOLDOWN_MS = 180_000;
 const DEFAULT_FRESH_EXIT_OVERRIDE_LOSS_PCT = -0.004;
+const DEFAULT_TREND_CARRY_PROTECT_MS = 12 * 60_000;
+const DEFAULT_ORDERBOOK_STALE_SOFT_MS = 8_000;
+const DEFAULT_ORDERBOOK_STALE_HARD_MS = 15_000;
+const DEFAULT_ORDERBOOK_STALE_MIN_PRINTS = 1;
+const DEFAULT_HARD_EXIT_DEBOUNCE_MS = 15_000;
+const DEFAULT_HARD_REVERSAL_DEBOUNCE_MS = 20_000;
+const INCLUDE_REPLAY_INPUT = String(process.env.DECISION_LOG_INCLUDE_REPLAY_INPUT ?? 'true').toLowerCase() !== 'false';
 
 export class NewStrategyV11 {
   private readonly config: StrategyConfig;
@@ -39,6 +47,10 @@ export class NewStrategyV11 {
   private lastAddTs = 0;
   private lastSoftReduceTs = 0;
   private lastSoftReduceSide: StrategySide | null = null;
+  private lastHardExitTs = 0;
+  private lastHardExitSide: StrategySide | null = null;
+  private lastHardReversalTs = 0;
+  private lastHardReversalSide: StrategySide | null = null;
   private lastDfsPercentile = 0.5;
   private lastDeltaZ = 0;
   private prevPrice: number | null = null;
@@ -97,6 +109,7 @@ export class NewStrategyV11 {
       volatility: input.volatility,
     });
 
+    const activeRegime = this.resolveActiveRegime(input, regimeOut.regime, dfsOut.dfsPercentile);
     const thresholds = this.computeThresholds(regimeOut.volLevel);
     const actions: StrategyAction[] = [];
 
@@ -111,7 +124,8 @@ export class NewStrategyV11 {
         this.lastSoftReduceTs = 0;
         this.lastSoftReduceSide = null;
       }
-      if (input.position) {
+      const canManageDuringGateFailure = gate.reason !== 'GATE_STALE_ORDERBOOK';
+      if (input.position && canManageDuringGateFailure) {
         const reduceAction = this.maybeSoftReduce(input, dfsOut.dfsPercentile, thresholds);
         if (reduceAction) {
           actions.push(reduceAction);
@@ -121,18 +135,18 @@ export class NewStrategyV11 {
       if (actions.length === 0) {
         actions.push({ type: StrategyActionType.NOOP, reason: 'GATE_PAUSED' });
       }
-      return this.buildDecision(input, regimeOut.regime, dfsOut, thresholds, gate, actions, reasons);
+      return this.buildDecision(input, activeRegime, dfsOut, thresholds, gate, actions, reasons);
     }
 
     if (!input.position) {
       this.lastSoftReduceTs = 0;
       this.lastSoftReduceSide = null;
-      const entryAction = this.evaluateEntry(input, dfsOut.dfsPercentile, dfsOut.dfs, regimeOut.regime, regimeOut.volLevel, thresholds, reasons);
+      const entryAction = this.evaluateEntry(input, dfsOut.dfsPercentile, dfsOut.dfs, activeRegime, regimeOut.volLevel, thresholds, reasons);
       if (entryAction) {
         actions.push(entryAction);
         reasons.push(entryAction.reason);
         this.lastEntrySide = entryAction.side || null;
-        this.lastEntryRegime = regimeOut.regime;
+        this.lastEntryRegime = activeRegime;
       } else {
         reasons.push('NO_SIGNAL');
         actions.push({ type: StrategyActionType.NOOP, reason: 'NO_SIGNAL' });
@@ -141,21 +155,29 @@ export class NewStrategyV11 {
       const hardRev = this.checkHardReversal(input, dfsOut.dfsPercentile);
       if (hardRev.valid) {
         const hardRevSize = this.config.hardRevSizeMultiplier ?? 0.75;
-        actions.push({ type: StrategyActionType.EXIT, side: input.position.side, reason: 'EXIT_HARD_REVERSAL' });
-        actions.push({ type: StrategyActionType.ENTRY, side: this.flipSide(input.position.side), reason: 'HARD_REVERSAL_ENTRY', sizeMultiplier: hardRevSize });
-        reasons.push('EXIT_HARD_REVERSAL', 'HARD_REVERSAL_ENTRY');
-        this.lastExitTs = nowMs;
-        this.lastExitSide = input.position.side;
-        this.lastEntryTs = nowMs;
-        this.lastEntrySide = this.flipSide(input.position.side);
-        this.lastEntryRegime = regimeOut.regime;
+        if (!this.isHardReversalDebounced(input.position.side, nowMs)) {
+          actions.push({ type: StrategyActionType.EXIT, side: input.position.side, reason: 'EXIT_HARD_REVERSAL' });
+          actions.push({ type: StrategyActionType.ENTRY, side: this.flipSide(input.position.side), reason: 'HARD_REVERSAL_ENTRY', sizeMultiplier: hardRevSize });
+          reasons.push('EXIT_HARD_REVERSAL', 'HARD_REVERSAL_ENTRY');
+          this.lastExitTs = nowMs;
+          this.lastExitSide = input.position.side;
+          this.lastEntryTs = nowMs;
+          this.lastEntrySide = this.flipSide(input.position.side);
+          this.lastEntryRegime = activeRegime;
+          this.lastHardReversalTs = nowMs;
+          this.lastHardReversalSide = input.position.side;
+        }
       } else {
         const hardExit = this.maybeHardExit(input, dfsOut.dfsPercentile, thresholds);
         if (hardExit) {
-          actions.push(hardExit);
-          reasons.push(hardExit.reason);
-          this.lastExitTs = nowMs;
-          this.lastExitSide = input.position.side;
+          if (!this.isHardExitDebounced(input.position.side, nowMs)) {
+            actions.push(hardExit);
+            reasons.push(hardExit.reason);
+            this.lastExitTs = nowMs;
+            this.lastExitSide = input.position.side;
+            this.lastHardExitTs = nowMs;
+            this.lastHardExitSide = input.position.side;
+          }
         } else {
           const reduceAction = this.maybeSoftReduce(input, dfsOut.dfsPercentile, thresholds);
           if (reduceAction) {
@@ -175,6 +197,10 @@ export class NewStrategyV11 {
           }
         }
       }
+      if (actions.length === 0) {
+        actions.push({ type: StrategyActionType.NOOP, reason: 'NOOP' });
+        reasons.push('NOOP');
+      }
     }
 
     this.lastDfsPercentile = dfsOut.dfsPercentile;
@@ -182,7 +208,7 @@ export class NewStrategyV11 {
     this.prevPrice = input.market.price;
     this.prevCvdSlope = input.market.cvdSlope;
 
-    return this.buildDecision(input, regimeOut.regime, dfsOut, thresholds, gate, actions, reasons);
+    return this.buildDecision(input, activeRegime, dfsOut, thresholds, gate, actions, reasons);
   }
 
   private computeThresholds(volLevel: number) {
@@ -217,14 +243,30 @@ export class NewStrategyV11 {
     if (input.source !== 'real' || (input.openInterest?.source && input.openInterest.source !== 'real')) {
       return { passed: false, reason: 'GATE_SOURCE_NOT_REAL', details: { source: input.source } };
     }
+    if (input.execution?.orderbookTrusted === false || (input.execution?.integrityLevel && input.execution.integrityLevel !== 'OK')) {
+      details.integrityLevel = input.execution?.integrityLevel ?? null;
+      details.orderbookTrusted = Boolean(input.execution?.orderbookTrusted);
+      return { passed: false, reason: 'GATE_STALE_ORDERBOOK', details };
+    }
     const tradeLag = Math.max(0, input.nowMs - input.trades.lastUpdatedMs);
     const bookLag = Math.max(0, input.nowMs - input.orderbook.lastUpdatedMs);
     details.tradeLagMs = tradeLag;
     details.bookLagMs = bookLag;
+    details.bestBid = input.orderbook.bestBid ?? null;
+    details.bestAsk = input.orderbook.bestAsk ?? null;
     if (tradeLag > 1000) {
       return { passed: false, reason: 'GATE_STALE_TRADES', details };
     }
-    if (bookLag > 2000) {
+    const hasTopOfBook = Number(input.orderbook.bestBid || 0) > 0
+      && Number(input.orderbook.bestAsk || 0) > 0
+      && Number(input.orderbook.bestAsk || 0) > Number(input.orderbook.bestBid || 0);
+    if (!hasTopOfBook) {
+      return { passed: false, reason: 'GATE_STALE_ORDERBOOK', details };
+    }
+    if (bookLag > DEFAULT_ORDERBOOK_STALE_HARD_MS) {
+      return { passed: false, reason: 'GATE_STALE_ORDERBOOK', details };
+    }
+    if (bookLag > DEFAULT_ORDERBOOK_STALE_SOFT_MS && input.trades.printsPerSecond < DEFAULT_ORDERBOOK_STALE_MIN_PRINTS) {
       return { passed: false, reason: 'GATE_STALE_ORDERBOOK', details };
     }
     if (input.trades.printsPerSecond < 0.2 || input.trades.tradeCount < 5) {
@@ -337,6 +379,10 @@ export class NewStrategyV11 {
       return false;
     }
 
+    if (this.allowTrendCarryEntry(input, desiredSide, dfsP, thresholds)) {
+      return true;
+    }
+
     if (regime === 'TR') {
       if (desiredSide === 'LONG') {
         return (
@@ -404,31 +450,108 @@ export class NewStrategyV11 {
     thresholds: { longEntry: number; shortEntry: number }
   ): boolean {
     if (!this.isLiquidTrendContext(input)) return false;
-    if (regime === 'MR') return false;
     const price = input.market.price;
     const vwap = input.market.vwap;
     const pullbackDistancePct = vwap > 0 ? Math.abs(price - vwap) / vwap : 0;
     if (pullbackDistancePct > 0.012) return false;
+    const mrMode = regime === 'MR';
     if (side === 'LONG') {
       return (
-        price >= (vwap * 0.9985) &&
-        dfsP >= Math.max(0.68, thresholds.longEntry - 0.15) &&
-        input.market.deltaZ > 0.75 &&
+        price >= (vwap * (mrMode ? 0.9975 : 0.9985)) &&
+        dfsP >= Math.max(mrMode ? 0.72 : 0.68, thresholds.longEntry - (mrMode ? 0.1 : 0.15)) &&
+        input.market.deltaZ > (mrMode ? 1.0 : 0.75) &&
         input.market.delta5s > 0 &&
         input.market.cvdSlope > 0 &&
-        input.market.obiWeighted > -0.02 &&
-        input.market.obiDeep > -0.12
+        input.market.obiWeighted > (mrMode ? -0.08 : -0.02) &&
+        input.market.obiDeep > (mrMode ? -0.18 : -0.12)
       );
     }
     return (
-      price <= (vwap * 1.0015) &&
-      dfsP <= Math.min(0.32, thresholds.shortEntry + 0.15) &&
-      input.market.deltaZ < -0.75 &&
+      price <= (vwap * (mrMode ? 1.0025 : 1.0015)) &&
+      dfsP <= Math.min(mrMode ? 0.28 : 0.32, thresholds.shortEntry + (mrMode ? 0.18 : 0.15)) &&
+      input.market.deltaZ < (mrMode ? -1.0 : -0.75) &&
       input.market.delta5s < 0 &&
       input.market.cvdSlope < 0 &&
-      input.market.obiWeighted < 0.02 &&
-      input.market.obiDeep < 0.12
+      input.market.obiWeighted < (mrMode ? 0.08 : 0.02) &&
+      input.market.obiDeep < (mrMode ? 0.18 : 0.12)
     );
+  }
+
+  private resolveActiveRegime(
+    input: StrategyInput,
+    regime: StrategyRegime,
+    dfsP: number
+  ): StrategyRegime {
+    if (this.shouldForceTrendCarryRegime(input, dfsP)) {
+      return 'TR';
+    }
+    return regime;
+  }
+
+  private shouldForceTrendCarryRegime(input: StrategyInput, dfsP: number): boolean {
+    if (input.execution?.tradeReady === false) return false;
+    const bias15m = this.bias15m(input);
+    const veto1h = this.veto1h(input);
+    if (bias15m === 'NEUTRAL') return false;
+    const pullbackDistancePct = input.market.vwap > 0
+      ? Math.abs(input.market.price - input.market.vwap) / input.market.vwap
+      : 0;
+    if (pullbackDistancePct > 0.02) return false;
+    if (bias15m === 'UP' && veto1h !== 'DOWN') {
+      return dfsP >= 0.45
+        && input.market.deltaZ > -0.5
+        && input.market.cvdSlope > -0.15
+        && input.market.delta5s > -0.25
+        && input.market.obiWeighted > -0.15;
+    }
+    if (bias15m === 'DOWN' && veto1h !== 'UP') {
+      return dfsP <= 0.55
+        && input.market.deltaZ < 0.5
+        && input.market.cvdSlope < 0.15
+        && input.market.delta5s < 0.25
+        && input.market.obiWeighted < 0.15;
+    }
+    return false;
+  }
+
+  private allowTrendCarryEntry(
+    input: StrategyInput,
+    side: StrategySide,
+    dfsP: number,
+    thresholds: { longEntry: number; shortEntry: number }
+  ): boolean {
+    const bias15m = this.bias15m(input);
+    const veto1h = this.veto1h(input);
+    const price = input.market.price;
+    const vwap = input.market.vwap;
+    const pullbackDistancePct = vwap > 0 ? Math.abs(price - vwap) / vwap : 0;
+    if (pullbackDistancePct > 0.018) return false;
+    const burstSide = input.trades.consecutiveBurst.side;
+    const burstCount = Number(input.trades.consecutiveBurst.count || 0);
+
+    if (side === 'LONG') {
+      if (!(bias15m === 'UP' && veto1h !== 'DOWN')) return false;
+      const noStrongCounterBurst = burstSide !== 'sell' || burstCount <= 3;
+      return noStrongCounterBurst
+        && price >= (vwap * 0.992)
+        && dfsP >= Math.max(0.48, thresholds.longEntry - 0.35)
+        && input.market.deltaZ > -0.2
+        && input.market.delta5s > -0.1
+        && input.market.cvdSlope > -0.05
+        && input.market.obiWeighted > -0.12
+        && input.market.obiDeep > -0.18;
+    }
+
+    if (!(bias15m === 'DOWN' && veto1h !== 'UP')) return false;
+    const noStrongCounterBurst = burstSide !== 'buy' || burstCount <= 3;
+    return noStrongCounterBurst
+      && price <= (vwap * 1.008)
+      && dfsP <= Math.min(0.52, thresholds.shortEntry + 0.35)
+      && input.market.deltaZ < 0.2
+      && input.market.delta5s < 0.1
+      && input.market.cvdSlope < 0.05
+      && input.market.obiWeighted < 0.12
+      && input.market.obiDeep < 0.18;
   }
 
   private maybeAdd(input: StrategyInput, dfsP: number, volLevel: number): StrategyAction | null {
@@ -498,48 +621,81 @@ export class NewStrategyV11 {
     }
     const bias15m = this.bias15m(input);
     const veto1h = this.veto1h(input);
+    const positionAgeMs = this.getPositionAgeMs(input) ?? 0;
+    const trendAligned = this.isTrendAligned(side, bias15m, veto1h);
+    const htfOpposes = this.isHtfOpposing(side, bias15m, veto1h);
     const softReduceRequireProfit = this.config.softReduceRequireProfit ?? true;
     const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
+    const peakPnlPct = this.getPeakPnlPct(input);
+    const givebackPct = this.getProfitGivebackPct(input);
+    const carryReduceArmed = peakPnlPct >= this.getTrendCarryReduceMinPeakPnlPct();
+    const carryReduceTriggered = carryReduceArmed && givebackPct >= this.getTrendCarryReduceGivebackPct();
+    const stillHoldingTrendWinner = trendAligned
+      && carryReduceArmed
+      && !carryReduceTriggered
+      && unrealizedPnlPct >= Math.max(0.003, peakPnlPct * 0.45);
     if (softReduceRequireProfit && unrealizedPnlPct <= 0) return null;
-    if (side === 'LONG' && (bias15m === 'DOWN' || veto1h === 'DOWN')) {
+    if (htfOpposes) {
+      if (stillHoldingTrendWinner && positionAgeMs < (18 * 3 * 60 * 1000)) {
+        return null;
+      }
       this.lastSoftReduceTs = input.nowMs;
       this.lastSoftReduceSide = side;
       return {
         type: StrategyActionType.REDUCE,
         side,
         reason: 'REDUCE_SOFT',
-        reducePct: 0.5,
-        expectedPrice: input.market.price,
-        metadata: { unrealizedPnlPct, mode: 'OPPOSITE_TREND' },
+        reducePct: carryReduceTriggered ? 0.5 : 0.35,
+          expectedPrice: input.market.price,
+          metadata: {
+            unrealizedPnlPct,
+            peakPnlPct,
+            givebackPct,
+            carryReduceTriggered,
+            mode: 'OPPOSITE_TREND',
+          },
       };
     }
-    if (side === 'SHORT' && (bias15m === 'UP' || veto1h === 'UP')) {
-      this.lastSoftReduceTs = input.nowMs;
-      this.lastSoftReduceSide = side;
-      return {
-        type: StrategyActionType.REDUCE,
-        side,
-        reason: 'REDUCE_SOFT',
-        reducePct: 0.5,
-        expectedPrice: input.market.price,
-        metadata: { unrealizedPnlPct, mode: 'OPPOSITE_TREND' },
-      };
+
+    if (trendAligned && positionAgeMs < DEFAULT_TREND_CARRY_PROTECT_MS) {
+      return null;
     }
-    const weakening = this.lastDfsPercentile >= 0.85 && dfsP <= 0.6;
-    const breakLevel = side === 'LONG' ? dfsP <= thresholds.longBreak : dfsP >= thresholds.shortBreak;
-    const timeStop = Number(input.position.timeInPositionMs || 0) >= (18 * 3 * 60 * 1000) && side === 'LONG'
-      ? (bias15m !== 'UP' || dfsP < 0.58)
-      : Number(input.position.timeInPositionMs || 0) >= (18 * 3 * 60 * 1000) && (bias15m !== 'DOWN' || dfsP > 0.42);
-    if (weakening || breakLevel || timeStop) {
+
+    const sideStrength = side === 'LONG' ? dfsP : (1 - dfsP);
+    const lastSideStrength = side === 'LONG' ? this.lastDfsPercentile : (1 - this.lastDfsPercentile);
+    const weakening = lastSideStrength >= 0.82
+      && sideStrength <= 0.62
+      && (lastSideStrength - sideStrength) >= 0.18;
+    const adverseFlow = this.hasTrendCarryPressure(input, side);
+    const structureBreak = this.hasTrendStructureBreak(input, side, dfsP, thresholds);
+    const timeStop = positionAgeMs >= (18 * 3 * 60 * 1000)
+      && (!trendAligned || adverseFlow || (side === 'LONG' ? dfsP < 0.45 : dfsP > 0.55));
+    const trailingReduce = weakening
+      && adverseFlow
+      && structureBreak
+      && (!trendAligned || carryReduceTriggered || peakPnlPct <= 0.0035 || unrealizedPnlPct <= 0.0025);
+    const timeStopTriggered = timeStop
+      && (!stillHoldingTrendWinner || carryReduceTriggered || unrealizedPnlPct <= 0.002);
+
+    if (trailingReduce || timeStopTriggered) {
       this.lastSoftReduceTs = input.nowMs;
       this.lastSoftReduceSide = side;
       return {
         type: StrategyActionType.REDUCE,
         side,
         reason: 'REDUCE_SOFT',
-        reducePct: (weakening || timeStop) ? 0.5 : 0.3,
+        reducePct: timeStopTriggered ? 0.5 : (trendAligned ? 0.25 : 0.4),
         expectedPrice: input.market.price,
-        metadata: { unrealizedPnlPct, timeStop },
+        metadata: {
+          unrealizedPnlPct,
+          peakPnlPct,
+          givebackPct,
+          carryReduceTriggered,
+          timeStop: timeStopTriggered,
+          adverseFlow,
+          structureBreak,
+          trendAligned,
+        },
       };
     }
     return null;
@@ -556,6 +712,8 @@ export class NewStrategyV11 {
     const vwap = input.market.vwap;
     const bias15m = this.bias15m(input);
     const veto1h = this.veto1h(input);
+    const positionAgeMs = this.getPositionAgeMs(input) ?? 0;
+    const trendAligned = this.isTrendAligned(side, bias15m, veto1h);
     const vwapHoldTicks = this.config.hardRevTicks;
     const configuredMaxLossPct = Number.isFinite(this.config.maxLossPct as number)
       ? Math.min(-0.0001, Number(this.config.maxLossPct))
@@ -566,6 +724,10 @@ export class NewStrategyV11 {
       ? configuredMaxLossPct * 1.5
       : configuredMaxLossPct;
     const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
+    const peakPnlPct = this.getPeakPnlPct(input);
+    const givebackPct = this.getProfitGivebackPct(input);
+    const carryHardExitArmed = peakPnlPct >= this.getTrendCarryHardExitMinPeakPnlPct();
+    const carryHardExitTriggered = carryHardExitArmed && givebackPct >= this.getTrendCarryHardExitGivebackPct();
     if (unrealizedPnlPct <= stopLossThreshold) {
       return {
         type: StrategyActionType.EXIT,
@@ -583,23 +745,44 @@ export class NewStrategyV11 {
     if (this.shouldProtectFreshExit(input, dfsP, thresholds)) {
       return null;
     }
-    if (side === 'LONG') {
-      if (bias15m === 'DOWN' || veto1h === 'DOWN') {
+
+    if (this.hasSevereOppositePressure(input, dfsP, thresholds)) {
+      if (!trendAligned || unrealizedPnlPct <= 0 || carryHardExitTriggered) {
         return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
       }
-      const vwapHold = this.vwapBelowTicks >= Math.max(3, Math.floor(vwapHoldTicks / 2));
-      if (price < vwap && vwapHold && dfsP <= thresholds.longBreak) {
-        return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
-      }
+      return null;
     }
-    if (side === 'SHORT') {
-      if (bias15m === 'UP' || veto1h === 'UP') {
-        return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
-      }
-      const vwapHold = this.vwapAboveTicks >= Math.max(3, Math.floor(vwapHoldTicks / 2));
-      if (price > vwap && vwapHold && dfsP >= thresholds.shortBreak) {
-        return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
-      }
+
+    const strongStructureFailure = side === 'LONG'
+      ? price < vwap
+        && this.vwapBelowTicks >= Math.max(6, vwapHoldTicks)
+        && dfsP <= Math.min(0.22, thresholds.longBreak - 0.15)
+        && input.market.deltaZ <= -1.2
+        && input.market.delta5s < 0
+        && input.market.cvdSlope < 0
+        && input.market.obiWeighted < -0.05
+      : price > vwap
+        && this.vwapAboveTicks >= Math.max(6, vwapHoldTicks)
+        && dfsP >= Math.max(0.78, thresholds.shortBreak + 0.15)
+        && input.market.deltaZ >= 1.2
+        && input.market.delta5s > 0
+        && input.market.cvdSlope > 0
+        && input.market.obiWeighted > 0.05;
+
+    if (!trendAligned && strongStructureFailure) {
+      return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
+    }
+
+    if (
+      trendAligned
+      && strongStructureFailure
+      && (
+        unrealizedPnlPct <= 0.001
+        || carryHardExitTriggered
+        || (positionAgeMs >= (18 * 3 * 60 * 1000) && unrealizedPnlPct <= 0.002)
+      )
+    ) {
+      return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
     }
     return null;
   }
@@ -687,16 +870,89 @@ export class NewStrategyV11 {
         && input.market.obiWeighted > 0.05
         && input.market.obiDeep > 0.02;
     const burstAligned = side === 'LONG' ? burstSide === 'sell' : burstSide === 'buy';
+    const burstCount = Number(input.trades.consecutiveBurst.count || 0);
     const dfsBroken = side === 'LONG'
       ? dfsP <= Math.min(0.25, thresholds.longBreak - 0.1)
       : dfsP >= Math.max(0.75, thresholds.shortBreak + 0.1);
     const vwapPersist = side === 'LONG'
-      ? this.vwapBelowTicks >= Math.max(4, Math.floor(this.config.hardRevTicks / 2))
-      : this.vwapAboveTicks >= Math.max(4, Math.floor(this.config.hardRevTicks / 2));
-    const htfOpposes = side === 'LONG'
+      ? this.vwapBelowTicks >= Math.max(5, this.config.hardRevTicks - 1)
+      : this.vwapAboveTicks >= Math.max(5, this.config.hardRevTicks - 1);
+    const htfOpposes = this.isHtfOpposing(side, bias15m, veto1h);
+    const htfBroken = side === 'LONG'
+      ? Boolean(input.htf?.m15?.structureBreakDn || input.htf?.h1?.structureBreakDn || veto1h === 'DOWN')
+      : Boolean(input.htf?.m15?.structureBreakUp || input.htf?.h1?.structureBreakUp || veto1h === 'UP');
+    const extremeOppositeTape = side === 'LONG'
+      ? input.market.deltaZ <= -3
+        && input.market.delta5s < -1
+        && input.market.cvdSlope < -1
+        && input.market.obiDeep < -0.4
+      : input.market.deltaZ >= 3
+        && input.market.delta5s > 1
+        && input.market.cvdSlope > 1
+        && input.market.obiDeep > 0.4;
+    const impulseExtreme = side === 'LONG'
+      ? input.market.delta1s <= -4
+      : input.market.delta1s >= 4;
+    const persistentOppositeBurst = burstAligned && burstCount >= Math.max(8, this.config.hardRevTicks + 3);
+    const brokenStructurePressure = htfBroken
+      && flowAligned
+      && dfsBroken
+      && vwapPersist
+      && (printsStrong || burstAligned || impulseExtreme);
+    const tapeShockPressure = (htfOpposes || extremeOppositeTape)
+      && flowAligned
+      && dfsBroken
+      && vwapPersist
+      && (persistentOppositeBurst || (printsStrong && impulseExtreme));
+    return brokenStructurePressure || tapeShockPressure;
+  }
+
+  private hasTrendCarryPressure(input: StrategyInput, side: StrategySide): boolean {
+    const burstSide = input.trades.consecutiveBurst.side;
+    const burstOpposite = side === 'LONG' ? burstSide === 'sell' : burstSide === 'buy';
+    const printsStrong = this.norm.percentile('prints', input.trades.printsPerSecond) >= 0.6 || input.trades.printsPerSecond >= 6;
+    if (side === 'LONG') {
+      return input.market.deltaZ <= -0.8
+        && input.market.delta5s < 0
+        && input.market.cvdSlope < 0
+        && input.market.obiWeighted < -0.02
+        && (printsStrong || burstOpposite);
+    }
+    return input.market.deltaZ >= 0.8
+      && input.market.delta5s > 0
+      && input.market.cvdSlope > 0
+      && input.market.obiWeighted > 0.02
+      && (printsStrong || burstOpposite);
+  }
+
+  private hasTrendStructureBreak(
+    input: StrategyInput,
+    side: StrategySide,
+    dfsP: number,
+    thresholds: { longBreak: number; shortBreak: number }
+  ): boolean {
+    const vwapPersist = side === 'LONG'
+      ? this.vwapBelowTicks >= Math.max(5, Math.floor(this.config.hardRevTicks * 0.8))
+      : this.vwapAboveTicks >= Math.max(5, Math.floor(this.config.hardRevTicks * 0.8));
+    const dfsBroken = side === 'LONG'
+      ? dfsP <= Math.min(0.32, thresholds.longBreak - 0.08)
+      : dfsP >= Math.max(0.68, thresholds.shortBreak + 0.08);
+    const vwapBroken = side === 'LONG'
+      ? input.market.price < input.market.vwap
+      : input.market.price > input.market.vwap;
+    return vwapPersist && dfsBroken && vwapBroken;
+  }
+
+  private isTrendAligned(side: StrategySide, bias15m: 'UP' | 'DOWN' | 'NEUTRAL', veto1h: 'NONE' | 'UP' | 'DOWN'): boolean {
+    return side === 'LONG'
+      ? bias15m === 'UP' && veto1h !== 'DOWN'
+      : bias15m === 'DOWN' && veto1h !== 'UP';
+  }
+
+  private isHtfOpposing(side: StrategySide, bias15m: 'UP' | 'DOWN' | 'NEUTRAL', veto1h: 'NONE' | 'UP' | 'DOWN'): boolean {
+    return side === 'LONG'
       ? (bias15m === 'DOWN' || veto1h === 'DOWN')
       : (bias15m === 'UP' || veto1h === 'UP');
-    return htfOpposes && flowAligned && dfsBroken && vwapPersist && (printsStrong || burstAligned);
   }
 
   private getPositionAgeMs(input: StrategyInput): number | null {
@@ -740,6 +996,53 @@ export class NewStrategyV11 {
     return DEFAULT_FRESH_EXIT_OVERRIDE_LOSS_PCT;
   }
 
+  private getTrendCarryReduceMinPeakPnlPct(): number {
+    const configured = Number(this.config.trendCarryReduceMinPeakPnlPct);
+    if (Number.isFinite(configured) && configured > 0) return configured;
+    return 0.006;
+  }
+
+  private getTrendCarryReduceGivebackPct(): number {
+    const configured = Number(this.config.trendCarryReduceGivebackPct);
+    if (Number.isFinite(configured) && configured > 0) return configured;
+    return 0.003;
+  }
+
+  private getTrendCarryHardExitMinPeakPnlPct(): number {
+    const configured = Number(this.config.trendCarryHardExitMinPeakPnlPct);
+    if (Number.isFinite(configured) && configured > 0) return configured;
+    return 0.009;
+  }
+
+  private getTrendCarryHardExitGivebackPct(): number {
+    const configured = Number(this.config.trendCarryHardExitGivebackPct);
+    if (Number.isFinite(configured) && configured > 0) return configured;
+    return 0.0045;
+  }
+
+  private getPeakPnlPct(input: StrategyInput): number {
+    if (!input.position) return 0;
+    const current = Number(input.position.unrealizedPnlPct ?? 0);
+    const peak = Number(input.position.peakPnlPct ?? current);
+    if (!Number.isFinite(peak)) return Math.max(0, current);
+    return Math.max(peak, current);
+  }
+
+  private getProfitGivebackPct(input: StrategyInput): number {
+    if (!input.position) return 0;
+    const peak = this.getPeakPnlPct(input);
+    const current = Number(input.position.unrealizedPnlPct ?? 0);
+    return Math.max(0, peak - current);
+  }
+
+  private isHardExitDebounced(side: StrategySide, nowMs: number): boolean {
+    return this.lastHardExitSide === side && this.lastHardExitTs > 0 && (nowMs - this.lastHardExitTs) < DEFAULT_HARD_EXIT_DEBOUNCE_MS;
+  }
+
+  private isHardReversalDebounced(side: StrategySide, nowMs: number): boolean {
+    return this.lastHardReversalSide === side && this.lastHardReversalTs > 0 && (nowMs - this.lastHardReversalTs) < DEFAULT_HARD_REVERSAL_DEBOUNCE_MS;
+  }
+
   private isInCooldown(side: StrategySide, nowMs: number, volLevel: number): boolean {
     if (this.lastExitTs <= 0 || !this.lastExitSide) return false;
     const flip = this.lastExitSide !== side;
@@ -774,15 +1077,11 @@ export class NewStrategyV11 {
   }
 
   private bias15m(input: StrategyInput): 'UP' | 'DOWN' | 'NEUTRAL' {
-    if (input.htf?.m15?.structureBreakUp) return 'UP';
-    if (input.htf?.m15?.structureBreakDn) return 'DOWN';
-    return 'NEUTRAL';
+    return deriveBias15m(input.htf?.m15, input.market.price);
   }
 
   private veto1h(input: StrategyInput): 'NONE' | 'UP' | 'DOWN' {
-    if (input.htf?.h1?.structureBreakDn) return 'DOWN';
-    if (input.htf?.h1?.structureBreakUp) return 'UP';
-    return 'NONE';
+    return deriveVeto1h(input.htf?.h1, input.market.price);
   }
 
   private mhtBaseMs(regime: StrategyRegime): number {
@@ -829,7 +1128,11 @@ export class NewStrategyV11 {
         cvdSlope: input.market.cvdSlope,
         obiDeep: input.market.obiDeep,
         printsPerSecond: input.trades.printsPerSecond,
+        unrealizedPnlPct: input.position?.unrealizedPnlPct ?? null,
+        peakPnlPct: input.position?.peakPnlPct ?? null,
+        givebackPnlPct: input.position ? this.getProfitGivebackPct(input) : null,
       },
+      replayInput: INCLUDE_REPLAY_INPUT ? this.cloneReplayInput(input) : undefined,
     };
 
     if (this.decisionLog) {
@@ -847,6 +1150,107 @@ export class NewStrategyV11 {
       actions,
       reasons,
       log,
+    };
+  }
+
+  private cloneReplayInput(input: StrategyInput): StrategyInput {
+    return {
+      symbol: input.symbol,
+      nowMs: input.nowMs,
+      source: input.source,
+      orderbook: {
+        lastUpdatedMs: input.orderbook.lastUpdatedMs,
+        spreadPct: input.orderbook.spreadPct ?? null,
+        bestBid: input.orderbook.bestBid ?? null,
+        bestAsk: input.orderbook.bestAsk ?? null,
+      },
+      trades: {
+        lastUpdatedMs: input.trades.lastUpdatedMs,
+        printsPerSecond: input.trades.printsPerSecond,
+        tradeCount: input.trades.tradeCount,
+        aggressiveBuyVolume: input.trades.aggressiveBuyVolume,
+        aggressiveSellVolume: input.trades.aggressiveSellVolume,
+        consecutiveBurst: {
+          side: input.trades.consecutiveBurst.side,
+          count: input.trades.consecutiveBurst.count,
+        },
+      },
+      market: {
+        price: input.market.price,
+        vwap: input.market.vwap,
+        delta1s: input.market.delta1s,
+        delta5s: input.market.delta5s,
+        deltaZ: input.market.deltaZ,
+        cvdSlope: input.market.cvdSlope,
+        obiWeighted: input.market.obiWeighted,
+        obiDeep: input.market.obiDeep,
+        obiDivergence: input.market.obiDivergence,
+      },
+      openInterest: input.openInterest
+        ? {
+            oiChangePct: input.openInterest.oiChangePct,
+            lastUpdatedMs: input.openInterest.lastUpdatedMs,
+            source: input.openInterest.source,
+          }
+        : null,
+      absorption: input.absorption
+        ? {
+            value: input.absorption.value,
+            side: input.absorption.side,
+          }
+        : null,
+      bootstrap: input.bootstrap
+        ? {
+            backfillDone: input.bootstrap.backfillDone,
+            barsLoaded1m: input.bootstrap.barsLoaded1m,
+          }
+        : null,
+      htf: input.htf
+        ? {
+            m15: input.htf.m15
+              ? {
+                  close: input.htf.m15.close,
+                  atr: input.htf.m15.atr,
+                  lastSwingHigh: input.htf.m15.lastSwingHigh,
+                  lastSwingLow: input.htf.m15.lastSwingLow,
+                  structureBreakUp: input.htf.m15.structureBreakUp,
+                  structureBreakDn: input.htf.m15.structureBreakDn,
+                }
+              : null,
+            h1: input.htf.h1
+              ? {
+                  close: input.htf.h1.close,
+                  atr: input.htf.h1.atr,
+                  lastSwingHigh: input.htf.h1.lastSwingHigh,
+                  lastSwingLow: input.htf.h1.lastSwingLow,
+                  structureBreakUp: input.htf.h1.structureBreakUp,
+                  structureBreakDn: input.htf.h1.structureBreakDn,
+                }
+              : null,
+          }
+        : null,
+      execution: input.execution
+        ? {
+            tradeReady: input.execution.tradeReady,
+            addonReady: input.execution.addonReady,
+            vetoReason: input.execution.vetoReason,
+            orderbookTrusted: input.execution.orderbookTrusted,
+            integrityLevel: input.execution.integrityLevel ?? null,
+          }
+        : null,
+      volatility: input.volatility,
+      position: input.position
+        ? {
+            side: input.position.side,
+            qty: input.position.qty,
+            entryPrice: input.position.entryPrice,
+            unrealizedPnlPct: input.position.unrealizedPnlPct,
+            addsUsed: input.position.addsUsed,
+            sizePct: input.position.sizePct,
+            timeInPositionMs: input.position.timeInPositionMs,
+            peakPnlPct: input.position.peakPnlPct,
+          }
+        : null,
     };
   }
 }

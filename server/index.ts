@@ -78,6 +78,8 @@ import {
 } from './metrics/AdvancedMicrostructureMetrics';
 import { SpotReferenceMonitor, SpotReferenceMetrics } from './metrics/SpotReferenceMonitor';
 import { HtfStructureMonitor } from './metrics/HtfStructureMonitor';
+import { deriveDryRunRuntimeContext } from './runtime/DryRunRuntimeContext';
+import { deriveBias15m, deriveVeto1h } from './strategy/HtfBias';
 import { SymbolCapitalConfig, materializeSymbolCapitalConfigs, normalizeSymbolCapitalConfigs } from './types/capital';
 import { AnalyticsEngine } from './analytics';
 import {
@@ -131,7 +133,7 @@ const SNAPSHOT_MIN_INTERVAL_MS = Number(process.env.SNAPSHOT_MIN_INTERVAL_MS || 
 const MIN_BACKOFF_MS = 5000;
 const MAX_BACKOFF_MS = 120000;
 const DEPTH_QUEUE_MAX = Number(process.env.DEPTH_QUEUE_MAX || 2000);
-const DEPTH_LAG_MAX_MS = Number(process.env.DEPTH_LAG_MAX_MS || 2000);
+const DEPTH_LAG_MAX_MS = Number(process.env.DEPTH_LAG_MAX_MS || 15000);
 const LIVE_SNAPSHOT_FRESH_MS = Number(process.env.LIVE_SNAPSHOT_FRESH_MS || 15000);
 const LIVE_DESYNC_RATE_10S_MAX = Number(process.env.LIVE_DESYNC_RATE_10S_MAX || 50);
 const LIVE_QUEUE_MAX = Number(process.env.LIVE_QUEUE_MAX || 200);
@@ -150,12 +152,16 @@ const BINANCE_SNAPSHOT_TIMEOUT_MS = Math.max(1000, Number(process.env.BINANCE_SN
 const BLOCKED_TELEMETRY_INTERVAL_MS = Number(process.env.BLOCKED_TELEMETRY_INTERVAL_MS || 1000);
 const MIN_RESYNC_INTERVAL_MS = 15000;
 const GRACE_PERIOD_MS = 5000;
+const ORDERBOOK_CATCHUP_GRACE_MS = Math.max(
+    GRACE_PERIOD_MS,
+    Number(process.env.ORDERBOOK_CATCHUP_GRACE_MS || 30000)
+);
 const CLIENT_HEARTBEAT_INTERVAL_MS = Number(process.env.CLIENT_HEARTBEAT_INTERVAL_MS || 15000);
 const CLIENT_STALE_CONNECTION_MS = Number(process.env.CLIENT_STALE_CONNECTION_MS || 60000);
 const WS_MAX_SUBSCRIPTIONS = Number(process.env.WS_MAX_SUBSCRIPTIONS || 500);
 const BACKFILL_RECORDING_ENABLED = parseEnvFlag(process.env.BACKFILL_RECORDING_ENABLED);
 const BACKFILL_SNAPSHOT_INTERVAL_MS = Number(process.env.BACKFILL_SNAPSHOT_INTERVAL_MS || 2000);
-const BOOTSTRAP_1M_LIMIT = Math.max(50, Math.trunc(Number(process.env.BOOTSTRAP_1M_LIMIT || 500)));
+const BOOTSTRAP_1M_LIMIT = Math.max(50, Math.trunc(Number(process.env.BOOTSTRAP_1M_LIMIT || 1440)));
 const STRATEGY_EVAL_MIN_INTERVAL_MS = Math.max(50, Number(process.env.STRATEGY_EVAL_MIN_INTERVAL_MS || 200));
 // Cross-market metrics should be available out-of-the-box.
 // Explicitly set ENABLE_CROSS_MARKET_CONFIRMATION=false to disable.
@@ -371,11 +377,15 @@ interface SymbolMeta {
     snapshotLastUpdateId: number;
     // Broadcast tracking
     lastBroadcastTs: number;
+    lastDepthBroadcastTs: number;
+    lastTradeBroadcastTs: number;
     metricsBroadcastCount10s: number;
     metricsBroadcastDepthCount10s: number;
     metricsBroadcastTradeCount10s: number;
     lastMetricsBroadcastReason: 'depth' | 'trade' | 'none';
     applyCount10s: number;
+    lastDepthApplyTs: number;
+    streamEpoch: number;
     // Reliability
     depthQueue: Array<{
         U: number;
@@ -986,11 +996,15 @@ function getMeta(symbol: string): SymbolMeta {
             lastSnapshotHttpStatus: 0,
             snapshotLastUpdateId: 0,
             lastBroadcastTs: 0,
+            lastDepthBroadcastTs: 0,
+            lastTradeBroadcastTs: 0,
             metricsBroadcastCount10s: 0,
             metricsBroadcastDepthCount10s: 0,
             metricsBroadcastTradeCount10s: 0,
             lastMetricsBroadcastReason: 'none',
             applyCount10s: 0,
+            lastDepthApplyTs: 0,
+            streamEpoch: 1,
             depthQueue: [],
             isProcessingDepthQueue: false,
             goodSequenceStreak: 0,
@@ -1014,6 +1028,31 @@ function getMeta(symbol: string): SymbolMeta {
         log('META_CREATED', { symbol: normalizedSymbol });
     }
     return meta;
+}
+
+function resetRealtimeSymbolState(symbol: string, reason: string, advanceEpoch = true): void {
+    const meta = getMeta(symbol);
+    if (advanceEpoch) {
+        meta.streamEpoch += 1;
+    }
+    meta.depthQueue = [];
+    meta.eventQueue.reset();
+    meta.isProcessingDepthQueue = false;
+    processingSymbols.delete(symbol);
+    meta.goodSequenceStreak = 0;
+    log('SYMBOL_REALTIME_RESET', { symbol, reason, streamEpoch: meta.streamEpoch });
+}
+
+function isOrderbookTrusted(symbol: string, now = Date.now()): boolean {
+    const meta = getMeta(symbol);
+    const ob = getOrderbook(symbol);
+    const integrity = getIntegrity(symbol).getStatus(now);
+    const depthRecentlyApplied = meta.lastDepthApplyTs > 0 && (now - meta.lastDepthApplyTs) <= GRACE_PERIOD_MS;
+    return ob.uiState === 'LIVE'
+        && integrity.level === 'OK'
+        && depthRecentlyApplied
+        && !meta.isResyncing
+        && snapshotInProgress.get(symbol) !== true;
 }
 
 function getOrderbook(symbol: string): OrderbookState {
@@ -1070,6 +1109,27 @@ function buildSymbolFallbackList(): string[] {
         }
     }
     return Array.from(seeds).sort();
+}
+
+function prioritizeSymbols(symbols: string[], priority: string[]): string[] {
+    const normalizedPriority = Array.from(new Set(
+        priority
+            .map((symbol) => String(symbol || '').trim().toUpperCase())
+            .filter(Boolean)
+    ));
+    if (normalizedPriority.length === 0) {
+        return symbols;
+    }
+
+    const available = Array.from(new Set(
+        symbols
+            .map((symbol) => String(symbol || '').trim().toUpperCase())
+            .filter(Boolean)
+    ));
+    const availableSet = new Set(available);
+    const head = normalizedPriority.filter((symbol) => availableSet.has(symbol));
+    const tail = available.filter((symbol) => !head.includes(symbol));
+    return [...head, ...tail];
 }
 
 function recordLiveSample(symbol: string, live: boolean): void {
@@ -1140,15 +1200,10 @@ function requestOrderbookResync(symbol: string, trigger: string, detail: any = {
     meta.desyncCount += 1;
     meta.desyncEvents.push(now);
 
-    // [P0-FIX-19] Clear processing lock
-    meta.isProcessingDepthQueue = false;
-    processingSymbols.delete(symbol);
+    const queueSizeBefore = meta.depthQueue.length + meta.eventQueue.getQueueLength();
+    resetRealtimeSymbolState(symbol, `resync:${trigger}`);
 
     const ob = getOrderbook(symbol);
-
-    // [P0-FIX-20] Queue'yu temizle - eski diff'ler ile devam ETME
-    const queueSizeBefore = meta.depthQueue.length;
-    meta.depthQueue = [];
 
     // [P0-FIX-21] Orderbook state reset
     resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true, desync: true });
@@ -1298,11 +1353,8 @@ async function fetchSnapshot(symbol: string, trigger: string, force = false) {
 
     if (force) {
         // [P0-FIX-6] Force mode: Complete cleanup before snapshot fetch
-        // Clear all pending diffs to prevent stale merge
-        meta.depthQueue = [];
-        meta.isProcessingDepthQueue = false;
-        processingSymbols.delete(symbol);
-        meta.goodSequenceStreak = 0;
+        // Clear all pending raw events and diffs to prevent stale merge.
+        resetRealtimeSymbolState(symbol, `snapshot_force:${trigger}`);
 
         // Reset orderbook to clean state
         resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true, desync: true });
@@ -1388,6 +1440,13 @@ async function fetchSnapshot(symbol: string, trigger: string, force = false) {
             transitionOrderbookState(symbol, 'LIVE', 'snapshot_applied_success');
             log('SNAPSHOT_OK', { symbol, trigger, lastUpdateId: data.lastUpdateId, queueValid: validQueueItems.length });
             recordLiveSample(symbol, true);
+            if (meta.depthQueue.length > 0) {
+                setImmediate(() => {
+                    processDepthQueue(symbol).catch((e) => {
+                        log('DEPTH_QUEUE_POST_SNAPSHOT_ERR', { symbol, error: e.message });
+                    });
+                });
+            }
         } else {
             // [P0-FIX-9] Buffer gap detected - clear queue and force resync
             meta.depthQueue = [];
@@ -1415,6 +1474,7 @@ let ws: WebSocket | null = null;
 let wsState = 'disconnected';
 let activeSymbols = new Set<string>();
 const dryRunForcedSymbols = new Set<string>();
+const dryRunPreviewSymbols = new Set<string>();
 const wsManager = new WebSocketManager({
     onSubscriptionsChanged: () => {
         updateStreams();
@@ -1473,9 +1533,41 @@ function buildDepthStream(symbolLower: string): string {
     return `${symbolLower}@depth${speedSuffix}`;
 }
 
+function getAllowedTelemetrySymbols(): Set<string> {
+    const allowed = new Set<string>();
+    for (const symbol of dryRunSession.getActiveSymbols()) {
+        if (symbol) allowed.add(String(symbol).toUpperCase());
+    }
+    for (const symbol of dryRunPreviewSymbols) {
+        if (symbol) allowed.add(String(symbol).toUpperCase());
+    }
+    const selectedSymbols = orchestrator.getExecutionStatus().selectedSymbols || [];
+    for (const symbol of selectedSymbols) {
+        if (symbol) allowed.add(String(symbol).toUpperCase());
+    }
+    return allowed;
+}
+
+function sanitizeTelemetrySymbols(symbols: string[]): string[] {
+    const normalized = [...new Set(symbols.map((s) => String(s || '').trim().toUpperCase()).filter(Boolean))];
+    const allowed = getAllowedTelemetrySymbols();
+    if (allowed.size === 0) {
+        return normalized;
+    }
+    return normalized.filter((symbol) => allowed.has(symbol));
+}
+
+function getConfiguredTelemetryUniverse(): string[] {
+    const allowed = getAllowedTelemetrySymbols();
+    return Array.from(allowed).sort();
+}
+
 function updateStreams() {
     const forcedSorted = [...dryRunForcedSymbols].sort();
-    const requiredSorted = wsManager.getRequiredSymbols();
+    const configuredUniverse = getConfiguredTelemetryUniverse();
+    const requiredSorted = configuredUniverse.length > 0
+        ? configuredUniverse
+        : sanitizeTelemetrySymbols(wsManager.getRequiredSymbols());
     const baseLimit = Math.max(AUTO_SCALE_MIN_SYMBOLS, symbolConcurrencyLimit);
     const effectiveLimit = Math.max(baseLimit, requiredSorted.length, forcedSorted.length);
     const limitedSymbols = requiredSorted.slice(0, effectiveLimit);
@@ -1544,11 +1636,9 @@ function updateStreams() {
             const meta = getMeta(symbol);
 
             // [P0-FIX-14] Full reset on WebSocket open - eski state ile devam ETME
-            meta.depthQueue = []; // Tüm bekleyen diff'leri temizle
-            meta.isProcessingDepthQueue = false;
-            processingSymbols.delete(symbol);
+            resetRealtimeSymbolState(symbol, 'ws_open_seed');
             meta.isResyncing = false;
-            meta.goodSequenceStreak = 0;
+
 
             // Orderbook state'ini sıfırla
             resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true, desync: true });
@@ -1590,11 +1680,9 @@ function updateStreams() {
             const ob = getOrderbook(symbol);
 
             // [P0-FIX-2] Full state reset on reconnect - queue temizleme
-            meta.depthQueue = []; // Tüm bekleyen diff'leri temizle
-            meta.isProcessingDepthQueue = false;
-            processingSymbols.delete(symbol); // Lock'u serbest bırak
+            resetRealtimeSymbolState(symbol, 'ws_reconnect_reset');
             meta.isResyncing = false;
-            meta.goodSequenceStreak = 0;
+
 
             // Orderbook state'ini tamamen sıfırla
             resetOrderbookState(ob, { uiState: 'SNAPSHOT_PENDING', keepStats: true, desync: true });
@@ -1618,19 +1706,22 @@ function updateStreams() {
 
 function enqueueDepthUpdate(symbol: string, update: { U: number; u: number; pu?: number; b: [string, string][]; a: [string, string][]; eventTimeMs: number; receiptTimeMs: number }) {
     const meta = getMeta(symbol);
+    const ob = getOrderbook(symbol);
 
-    // [P0-FIX-10] Skip diff processing if snapshot is in progress
+    // During snapshot/resync we must keep buffering diffs inside the orderbook
+    // bridge buffer so snapshot->diff continuity can be reconstructed.
     if (snapshotInProgress.get(symbol) === true) {
         log('DEPTH_UPDATE_DEFERRED', { symbol, U: update.U, u: update.u, reason: 'snapshot_in_progress' });
-        // Still queue but don't process yet
-        meta.depthQueue.push(update);
+        ob.lastSeenU_u = `${update.U}-${update.u}`;
+        applyDepthUpdate(ob, update);
         return;
     }
 
-    // [P0-FIX-11] Skip if resyncing
+    // Same rule for explicit resync windows.
     if (meta.isResyncing) {
         log('DEPTH_UPDATE_DEFERRED', { symbol, U: update.U, u: update.u, reason: 'resync_in_progress' });
-        meta.depthQueue.push(update);
+        ob.lastSeenU_u = `${update.U}-${update.u}`;
+        applyDepthUpdate(ob, update);
         return;
     }
 
@@ -1750,6 +1841,7 @@ async function processDepthQueue(symbol: string) {
             if (applied.applied) {
                 meta.applyCount10s++;
                 meta.goodSequenceStreak++;
+                meta.lastDepthApplyTs = now;
             }
 
             const integrity = getIntegrity(symbol).observe({
@@ -1866,6 +1958,7 @@ function evaluateLiveReadiness(symbol: string) {
 
     const snapshotFresh = meta.lastSnapshotOk > 0 && (now - meta.lastSnapshotOk) <= LIVE_SNAPSHOT_FRESH_MS;
     const hasBook = ob.bids.length > 0 && ob.asks.length > 0;
+    const appliedDepthFresh = meta.lastDepthApplyTs > 0 && (now - meta.lastDepthApplyTs) < GRACE_PERIOD_MS;
 
     // Data Liveness: Check if depth messages are flowing within GRACE_PERIOD
     // If we just resynced, give it time (MIN_RESYNC_INTERVAL check handles throttle)
@@ -1875,15 +1968,24 @@ function evaluateLiveReadiness(symbol: string) {
     // - recent depth updates are flowing, or
     // - a fresh snapshot was just applied.
     // This avoids forced resync loops every snapshot TTL when depth is healthy.
-    const isLiveCondition = hasBook && (dataFlowing || snapshotFresh);
+    const catchingUp = hasBook
+        && meta.lastSnapshotOk > 0
+        && (now - meta.lastSnapshotOk) <= ORDERBOOK_CATCHUP_GRACE_MS
+        && dataFlowing
+        && ob.reorderBuffer.size > 0
+        && meta.lastDepthApplyTs <= meta.lastSnapshotOk;
+    const isLiveCondition = hasBook && (appliedDepthFresh || snapshotFresh || catchingUp);
 
     if (isLiveCondition) {
         // We look good foundationally. Check data flow.
         if (ob.uiState !== 'LIVE') {
             transitionOrderbookState(symbol, 'LIVE', 'live_criteria_met', {
                 fresh: snapshotFresh,
+                catchingUp,
                 dataFlowing,
-                dataLag: now - meta.lastDepthMsgTs
+                appliedDepthFresh,
+                dataLag: now - meta.lastDepthMsgTs,
+                reorderBuffered: ob.reorderBuffer.size,
             });
         }
         recordLiveSample(symbol, true);
@@ -1897,9 +1999,13 @@ function evaluateLiveReadiness(symbol: string) {
         if (canResync && !meta.isResyncing) {
             requestOrderbookResync(symbol, 'live_criteria_failed_throttled', {
                 fresh: snapshotFresh,
+                catchingUp,
                 dataFlowing,
+                appliedDepthFresh,
                 dataLag: now - meta.lastDepthMsgTs,
+                applyLag: meta.lastDepthApplyTs > 0 ? (now - meta.lastDepthApplyTs) : null,
                 hasBook,
+                reorderBuffered: ob.reorderBuffer.size,
                 timeSinceResync
             });
         }
@@ -1946,6 +2052,10 @@ async function processSymbolEvent(s: string, d: any) {
     const ob = getOrderbook(s);
     const meta = getMeta(s);
     const now = Date.now();
+    const eventEpoch = Math.trunc(Number(d?.__streamEpoch || 0));
+    if (eventEpoch !== meta.streamEpoch) {
+        return;
+    }
 
     if (e === 'depthUpdate') {
         meta.depthMsgCount++;
@@ -2096,6 +2206,7 @@ async function processSymbolEvent(s: string, d: any) {
             legMetrics = leg.computeMetrics(ob, Number(t || now));
             tasMetrics = tas.computeMetrics();
             const integrity = getIntegrity(s).getStatus(now);
+            const orderbookTrusted = isOrderbookTrusted(s, now);
             const bestBidPx = bestBid(ob);
             const bestAskPx = bestAsk(ob);
             mid = (bestBidPx && bestAskPx) ? (bestBidPx + bestAskPx) / 2 : p;
@@ -2154,6 +2265,8 @@ async function processSymbolEvent(s: string, d: any) {
                     tradeReady: strategyBootstrapSnapshot.backfillDone,
                     addonReady: strategyBootstrapSnapshot.backfillDone,
                     vetoReason: strategyBootstrapSnapshot.backfillDone ? null : 'BOOTSTRAP_NOT_DONE',
+                    orderbookTrusted,
+                    integrityLevel: integrity.level,
                 },
                 volatility: backfill.getState().atr || 0,
                 position: dryRunSession.getStrategyPosition(s),
@@ -2375,7 +2488,10 @@ function handleMsg(raw: any) {
     if (!s) return;
 
     const meta = getMeta(s);
-    meta.eventQueue.enqueue(msg.data);
+    meta.eventQueue.enqueue({
+        ...msg.data,
+        __streamEpoch: meta.streamEpoch,
+    });
 }
 
 function broadcastMetrics(
@@ -2391,15 +2507,19 @@ function broadcastMetrics(
     precomputed?: { tasMetrics?: any; cvdMetrics?: any[]; legacyMetrics?: any; advancedBundle?: AdvancedMicrostructureBundle },
     receiptTimeMs?: number
 ) {
-    const THROTTLE_MS = 250; // 4Hz max per symbol
+    const GLOBAL_MIN_GAP_MS = 75;
+    const DEPTH_THROTTLE_MS = 350;
+    const TRADE_THROTTLE_MS = 250;
     const meta = getMeta(s);
     if (leg) leg.updateOpenInterest();
     const now = Date.now();
 
-    // Throttle check - skip if last broadcast was too recent
     const intervalMs = now - meta.lastBroadcastTs;
-    if (intervalMs < THROTTLE_MS) {
-        // Throttled - skip but log occasionally
+    const sameReasonIntervalMs = reason === 'depth'
+        ? now - meta.lastDepthBroadcastTs
+        : now - meta.lastTradeBroadcastTs;
+    const reasonThrottleMs = reason === 'depth' ? DEPTH_THROTTLE_MS : TRADE_THROTTLE_MS;
+    if (intervalMs < GLOBAL_MIN_GAP_MS || sameReasonIntervalMs < reasonThrottleMs) {
         return;
     }
 
@@ -2512,36 +2632,21 @@ function broadcastMetrics(
             : (legacyForUse?.obiWeighted || 0)
     );
     if (dryRunSession.isTrackingSymbol(s)) {
-        const bias15m: 'UP' | 'DOWN' | 'NEUTRAL' = htfSnapshot?.m15?.structureBreakUp
-            ? 'UP'
-            : htfSnapshot?.m15?.structureBreakDn
-                ? 'DOWN'
-                : 'NEUTRAL';
-        const veto1h: 'NONE' | 'UP' | 'DOWN' | 'EXHAUSTION' = htfSnapshot?.h1?.structureBreakDn
-            ? 'DOWN'
-            : htfSnapshot?.h1?.structureBreakUp
-                ? 'UP'
-                : 'NONE';
-        const contextPrice = Number(mid || legacyForUse?.price || 0);
+        const trendPrice = Number(mid || legacyForUse?.price || 0);
         const contextVwap = Number(sessionVwap?.value || legacyForUse?.vwap || mid || 0);
-        const trendState = bias15m === 'UP'
-            ? (contextPrice >= contextVwap ? 'UPTREND' : 'PULLBACK_UP')
-            : bias15m === 'DOWN'
-                ? (contextPrice <= contextVwap ? 'DOWNTREND' : 'PULLBACK_DOWN')
-                : 'RANGE';
-        const trendConfidence = Math.max(
-            0,
-            Math.min(
-                1,
-                (Math.abs(Number(advancedBundle.regimeMetrics?.trendinessScore || 0)) * 0.6)
-                + (Math.min(2, Math.abs(deltaZForDecision)) * 0.1)
-                + (Math.min(2, Math.abs(cvdSlopeForDecision)) * 0.1)
-                + (Math.min(1, Math.abs(obiWeightedForDecision)) * 0.2)
-            )
-        );
-        const bookMarkDeviationPct = contextPrice > 0 && contextVwap > 0
-            ? Math.abs(((contextPrice - contextVwap) / contextPrice) * 100)
-            : null;
+        const bias15m: 'UP' | 'DOWN' | 'NEUTRAL' = deriveBias15m(htfSnapshot?.m15, trendPrice);
+        const veto1h: 'NONE' | 'UP' | 'DOWN' | 'EXHAUSTION' = deriveVeto1h(htfSnapshot?.h1, trendPrice);
+        const runtimeContext = deriveDryRunRuntimeContext({
+            bias15m,
+            trendinessScore: Number(advancedBundle.regimeMetrics?.trendinessScore || 0),
+            deltaZ: deltaZForDecision,
+            cvdSlope: cvdSlopeForDecision,
+            obiWeighted: obiWeightedForDecision,
+            trendPrice,
+            sessionVwap: contextVwap,
+            bookMidPrice: Number(mid || 0),
+            referenceTradePrice: Number(legacyForUse?.price || 0),
+        });
         dryRunSession.updateRuntimeContext(s, {
             timestampMs: canonicalTimeMs,
             bootstrapDone: bootstrapSnapshot.backfillDone,
@@ -2549,9 +2654,9 @@ function broadcastMetrics(
             htfReady: Boolean(htfSnapshot?.m15?.close) && Boolean(htfSnapshot?.h1?.close),
             tradeStreamActive: Number(tasMetrics?.tradeCount || 0) > 0 || Number(tasMetrics?.printsPerSecond || 0) > 0,
             spreadPct: spreadRatio,
-            bookMarkDeviationPct,
-            trendState,
-            trendConfidence,
+            bookMarkDeviationPct: runtimeContext.bookMarkDeviationPct,
+            trendState: runtimeContext.trendState,
+            trendConfidence: runtimeContext.trendConfidence,
             bias15m,
             veto1h,
         });
@@ -2669,6 +2774,7 @@ function broadcastMetrics(
                 unrealizedPnlPct: Number(strategyPosition!.unrealizedPnlPct || 0),
                 addsUsed: Number(strategyPosition!.addsUsed || 0),
                 timeInPositionMs: Number((strategyPosition as any).timeInPositionMs || 0),
+                peakPnlPct: Number((strategyPosition as any).peakPnlPct || 0),
             }
             : null,
         legacyMetrics: legacyForUse,
@@ -2743,6 +2849,11 @@ function broadcastMetrics(
 
     // Update counters
     meta.lastBroadcastTs = now;
+    if (reason === 'depth') {
+        meta.lastDepthBroadcastTs = now;
+    } else {
+        meta.lastTradeBroadcastTs = now;
+    }
     meta.metricsBroadcastCount10s++;
     meta.lastMetricsBroadcastReason = reason;
     if (reason === 'depth') {
@@ -2802,13 +2913,107 @@ function resolveDashboardSymbol(requested?: string): string | undefined {
     return undefined;
 }
 
+function cloneStrategySignal(signal: StrategySignal): StrategySignal {
+    return {
+        ...signal,
+        metadata: signal.metadata && typeof signal.metadata === 'object'
+            ? { ...(signal.metadata as Record<string, unknown>) }
+            : signal.metadata,
+    };
+}
+
+function getAllDashboardStrategySignals(): StrategySignal[] {
+    const allSignals: StrategySignal[] = [];
+    for (const signals of strategySignalsBySymbol.values()) {
+        for (const signal of signals) {
+            allSignals.push(cloneStrategySignal(signal));
+        }
+    }
+    return allSignals.sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0));
+}
+
 function getDashboardStrategySignals(symbol?: string): StrategySignal[] {
+    if (!symbol) {
+        return getAllDashboardStrategySignals();
+    }
     const target = resolveDashboardSymbol(symbol);
     if (!target) return [];
-    return (strategySignalsBySymbol.get(target) || []).map((signal) => ({ ...signal }));
+    return (strategySignalsBySymbol.get(target) || []).map(cloneStrategySignal);
 }
 
 function getDashboardStrategyConsensus(symbol?: string) {
+    if (!symbol) {
+        const signals = getAllDashboardStrategySignals();
+        if (signals.length === 0) {
+            return null;
+        }
+        const buckets = {
+            LONG: { count: 0, confidenceSum: 0 },
+            SHORT: { count: 0, confidenceSum: 0 },
+            FLAT: { count: 0, confidenceSum: 0 },
+        };
+        let latestTs = 0;
+        const strategyIds = new Set<string>();
+        for (const signal of signals) {
+            const side = signal.side === StrategySignalSide.LONG
+                ? 'LONG'
+                : signal.side === StrategySignalSide.SHORT
+                    ? 'SHORT'
+                    : 'FLAT';
+            buckets[side].count += 1;
+            buckets[side].confidenceSum += Number(signal.confidence || 0);
+            latestTs = Math.max(latestTs, Number(signal.timestamp || 0));
+            if (signal.strategyId) {
+                strategyIds.add(signal.strategyId);
+            }
+        }
+        const rankedSides: Array<'LONG' | 'SHORT' | 'FLAT'> = ['LONG', 'SHORT', 'FLAT'];
+        const dominantSide = rankedSides
+            .sort((a: 'LONG' | 'SHORT' | 'FLAT', b: 'LONG' | 'SHORT' | 'FLAT') => {
+                const diff = buckets[b].confidenceSum - buckets[a].confidenceSum;
+                if (Math.abs(diff) > 1e-9) {
+                    return diff > 0 ? 1 : -1;
+                }
+                return buckets[b].count - buckets[a].count;
+            })[0];
+        const dominantCount = buckets[dominantSide].count;
+        const dominantConfidence = dominantCount > 0
+            ? buckets[dominantSide].confidenceSum / dominantCount
+            : 0;
+        const dominantSignals = signals.filter((signal) => {
+            if (dominantSide === 'LONG') return signal.side === StrategySignalSide.LONG;
+            if (dominantSide === 'SHORT') return signal.side === StrategySignalSide.SHORT;
+            return signal.side === StrategySignalSide.FLAT;
+        });
+        const riskGatePassed = dominantSide !== 'FLAT'
+            && dominantSignals.some((signal) => (signal.metadata as Record<string, unknown> | undefined)?.gatePassed !== false);
+        return {
+            timestampMs: latestTs || Date.now(),
+            side: dominantSide,
+            confidence: Math.max(0, Math.min(1, dominantConfidence)),
+            quorumMet: true,
+            riskGatePassed,
+            contributingStrategies: dominantCount,
+            totalStrategies: Math.max(1, signals.length),
+            vetoApplied: dominantSide !== 'FLAT' && !riskGatePassed,
+            breakdown: {
+                long: {
+                    count: buckets.LONG.count,
+                    avgConfidence: buckets.LONG.count > 0 ? buckets.LONG.confidenceSum / buckets.LONG.count : 0,
+                },
+                short: {
+                    count: buckets.SHORT.count,
+                    avgConfidence: buckets.SHORT.count > 0 ? buckets.SHORT.confidenceSum / buckets.SHORT.count : 0,
+                },
+                flat: {
+                    count: buckets.FLAT.count,
+                    avgConfidence: buckets.FLAT.count > 0 ? buckets.FLAT.confidenceSum / buckets.FLAT.count : 0,
+                },
+            },
+            strategyIds: [...strategyIds],
+            shouldTrade: riskGatePassed,
+        };
+    }
     const target = resolveDashboardSymbol(symbol);
     if (!target) return null;
     const consensus = strategyConsensusBySymbol.get(target);
@@ -2829,6 +3034,39 @@ function getDashboardRiskState(): RiskState {
         return RiskState.TRACKING;
     }
     return institutionalRiskEngine.getRiskState();
+}
+
+function buildStatusDecisionSnapshot(symbol: string) {
+    const signals = strategySignalsBySymbol.get(symbol) || [];
+    const latestSignal = signals.reduce<StrategySignal | null>((latest, signal) => {
+        if (!latest) return signal;
+        return Number(signal.timestamp || 0) >= Number(latest.timestamp || 0) ? signal : latest;
+    }, null);
+    const consensus = strategyConsensusBySymbol.get(symbol) || null;
+    if (!latestSignal && !consensus) {
+        return null;
+    }
+    const metadata = latestSignal?.metadata && typeof latestSignal.metadata === 'object'
+        ? latestSignal.metadata as Record<string, unknown>
+        : {};
+    const signalSide = latestSignal?.side === StrategySignalSide.LONG
+        ? 'LONG'
+        : latestSignal?.side === StrategySignalSide.SHORT
+            ? 'SHORT'
+            : 'FLAT';
+    return {
+        side: consensus?.side || signalSide,
+        confidence: Number(consensus?.confidence ?? latestSignal?.confidence ?? 0),
+        shouldTrade: Boolean(consensus?.shouldTrade),
+        gatePassed: typeof metadata.gatePassed === 'boolean'
+            ? metadata.gatePassed
+            : Boolean(consensus?.riskGatePassed),
+        regime: typeof metadata.regime === 'string' ? metadata.regime : null,
+        actionType: typeof metadata.actionType === 'string' ? metadata.actionType : null,
+        reason: typeof metadata.reason === 'string' ? metadata.reason : null,
+        reasons: Array.isArray(metadata.reasons) ? metadata.reasons.map((value) => String(value)) : [],
+        timestampMs: Number(latestSignal?.timestamp ?? consensus?.timestampMs ?? 0),
+    };
 }
 
 // =============================================================================
@@ -2980,6 +3218,7 @@ app.get('/api/status', (req, res) => {
         const livePct60s = liveUptimePct60s(s);
         result.symbols[s] = {
             status: ob.uiState,
+            orderbookTrusted: isOrderbookTrusted(s, now),
             lastSnapshot: meta.lastSnapshotOk ? Math.floor((now - meta.lastSnapshotOk) / 1000) + 's ago' : 'never',
             lastSnapshotOkTs: meta.lastSnapshotOk,
             snapshotLastUpdateId: meta.snapshotLastUpdateId,
@@ -2994,6 +3233,7 @@ app.get('/api/status', (req, res) => {
             depthMsgCount10s: meta.depthMsgCount10s,
             lastDepthMsgTs: meta.lastDepthMsgTs,
             bufferedDepthCount: ob.buffer.length,
+            reorderBufferedCount: ob.reorderBuffer.size,
             bufferedEventCount: meta.eventQueue.getQueueLength(),
             droppedEventCount: meta.eventQueue.getDroppedCount(),
             applyCount: ob.stats.applied,
@@ -3181,15 +3421,47 @@ app.get('/api/dry-run/symbols', async (req, res) => {
 
         const fallbackSymbols = buildSymbolFallbackList();
         const info = await fetchExchangeInfo();
-        const symbols = Array.isArray(info?.symbols) && info.symbols.length > 0 ? info.symbols : fallbackSymbols;
+        const previewPriority = Array.from(dryRunPreviewSymbols);
+        const defaultPriority = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT'];
+        const symbols = prioritizeSymbols(
+            Array.isArray(info?.symbols) && info.symbols.length > 0 ? info.symbols : fallbackSymbols,
+            previewPriority.length > 1 ? previewPriority : defaultPriority,
+        );
         res.json({ ok: true, symbols });
     } catch (e: any) {
-        res.status(200).json({ ok: true, symbols: buildSymbolFallbackList(), degraded: true });
+        res.status(200).json({
+            ok: true,
+            symbols: prioritizeSymbols(buildSymbolFallbackList(), Array.from(dryRunPreviewSymbols).length > 1
+                ? Array.from(dryRunPreviewSymbols)
+                : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT']),
+            degraded: true,
+        });
     }
 });
 
 function withRuntimeStrategyConfig(status: any): any {
-    return status;
+    if (!status || typeof status !== 'object' || !status.perSymbol || typeof status.perSymbol !== 'object') {
+        return {
+            ...(status || {}),
+            previewSymbols: Array.from(dryRunPreviewSymbols).sort(),
+        };
+    }
+    const perSymbol = Object.fromEntries(
+        Object.entries(status.perSymbol).map(([symbol, symbolStatus]) => {
+            const nextStatus = symbolStatus && typeof symbolStatus === 'object'
+                ? { ...(symbolStatus as Record<string, unknown>) }
+                : symbolStatus;
+            if (nextStatus && typeof nextStatus === 'object') {
+                (nextStatus as Record<string, unknown>).decision = buildStatusDecisionSnapshot(symbol);
+            }
+            return [symbol, nextStatus];
+        })
+    );
+    return {
+        ...status,
+        previewSymbols: Array.from(dryRunPreviewSymbols).sort(),
+        perSymbol,
+    };
 }
 
 app.get('/api/dry-run/status', (req, res) => {
@@ -3282,8 +3554,10 @@ app.post('/api/dry-run/start', async (req, res) => {
 
         updateDryRunHealthFlag();
         dryRunForcedSymbols.clear();
+        dryRunPreviewSymbols.clear();
         for (const symbol of symbolsRequested) {
             dryRunForcedSymbols.add(symbol);
+            dryRunPreviewSymbols.add(symbol);
         }
         updateStreams();
 
@@ -3308,6 +3582,9 @@ app.post('/api/dry-run/stop', (req, res) => {
         const status = dryRunSession.stop();
         updateDryRunHealthFlag();
         dryRunForcedSymbols.clear();
+        for (const symbol of status.symbols || []) {
+            if (symbol) dryRunPreviewSymbols.add(String(symbol).toUpperCase());
+        }
         updateStreams();
         res.json({ ok: true, status: withRuntimeStrategyConfig(status) });
     } catch (e: any) {
@@ -3327,6 +3604,22 @@ app.post('/api/dry-run/reset', (req, res) => {
         res.json({ ok: true, status: withRuntimeStrategyConfig(status) });
     } catch (e: any) {
         res.status(500).json({ ok: false, error: e?.message || 'dry_run_reset_failed' });
+    }
+});
+
+app.post('/api/dry-run/preview-symbols', (req, res) => {
+    try {
+        const symbols = Array.isArray(req.body?.symbols)
+            ? req.body.symbols.map((s: any) => String(s || '').toUpperCase()).filter(Boolean)
+            : [];
+        dryRunPreviewSymbols.clear();
+        for (const symbol of symbols) {
+            dryRunPreviewSymbols.add(symbol);
+        }
+        updateStreams();
+        res.json({ ok: true, symbols: Array.from(dryRunPreviewSymbols).sort() });
+    } catch (e: any) {
+        res.status(500).json({ ok: false, error: e?.message || 'dry_run_preview_symbols_failed' });
     }
 });
 
@@ -3881,7 +4174,17 @@ wss.on('connection', (wc, req) => {
     }
 
     const p = new URL(req.url || '', 'http://l').searchParams.get('symbols') || '';
-    const syms = p.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+    const requestedSyms = p.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+    const syms = sanitizeTelemetrySymbols(requestedSyms);
+    if (requestedSyms.length !== syms.length) {
+        log('WS_SYMBOLS_SANITIZED', {
+            requested: requestedSyms,
+            allowed: syms,
+            selectedSymbols: orchestrator.getExecutionStatus().selectedSymbols || [],
+            dryRunSymbols: dryRunSession.getActiveSymbols(),
+            remoteAddress: req.socket.remoteAddress || null,
+        });
+    }
     wsManager.registerClient(wc, syms, {
         remoteAddress: req.socket.remoteAddress || null,
     });

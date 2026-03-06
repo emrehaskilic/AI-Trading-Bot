@@ -53,6 +53,12 @@ export class SymbolEventQueue {
         return this.dropped;
     }
 
+    public reset() {
+        this.queue = [];
+        this.head = 0;
+        this.processing = false;
+    }
+
     private compactIfNeeded() {
         if (this.head > 0 && (this.head >= 2048 || this.head > (this.queue.length >> 1))) {
             this.queue = this.queue.slice(this.head);

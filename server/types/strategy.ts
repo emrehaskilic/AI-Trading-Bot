@@ -84,6 +84,7 @@ export interface StrategyDecisionLog {
   reasons: DecisionReason[];
   actions: StrategyAction[];
   stats: Record<string, number | null>;
+  replayInput?: StrategyInput;
 }
 
 export interface StrategyDecision {
@@ -174,6 +175,8 @@ export interface StrategyInput {
     tradeReady: boolean;
     addonReady: boolean;
     vetoReason: string | null;
+    orderbookTrusted?: boolean;
+    integrityLevel?: 'OK' | 'DEGRADED' | 'CRITICAL' | null;
   } | null;
   volatility: number;
   position: StrategyPositionState | null;
@@ -241,6 +244,10 @@ export interface StrategyConfig {
   freshExitProtectS?: number;
   freshReversalProtectS?: number;
   freshExitOverrideLossPct?: number;
+  trendCarryReduceMinPeakPnlPct?: number;
+  trendCarryReduceGivebackPct?: number;
+  trendCarryHardExitMinPeakPnlPct?: number;
+  trendCarryHardExitGivebackPct?: number;
 }
 
 export const defaultStrategyConfig: StrategyConfig = {
@@ -274,4 +281,8 @@ export const defaultStrategyConfig: StrategyConfig = {
   freshExitProtectS: Number(process.env.FRESH_EXIT_PROTECT_S || 90),
   freshReversalProtectS: Number(process.env.FRESH_REVERSAL_PROTECT_S || 180),
   freshExitOverrideLossPct: Number(process.env.FRESH_EXIT_OVERRIDE_LOSS_PCT || -0.004),
+  trendCarryReduceMinPeakPnlPct: Number(process.env.TREND_CARRY_REDUCE_MIN_PEAK_PNL_PCT || 0.006),
+  trendCarryReduceGivebackPct: Number(process.env.TREND_CARRY_REDUCE_GIVEBACK_PCT || 0.003),
+  trendCarryHardExitMinPeakPnlPct: Number(process.env.TREND_CARRY_HARD_EXIT_MIN_PEAK_PNL_PCT || 0.009),
+  trendCarryHardExitGivebackPct: Number(process.env.TREND_CARRY_HARD_EXIT_GIVEBACK_PCT || 0.0045),
 };

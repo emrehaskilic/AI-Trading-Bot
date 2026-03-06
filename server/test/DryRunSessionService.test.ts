@@ -136,6 +136,93 @@ export function runTests() {
   const adaptiveStatus = adaptiveSpreadSvc.getStatus();
   assert(adaptiveStatus.perSymbol.ETHUSDT?.warmup.tradeReady === true, 'adaptive spread gate should allow trend-trade spreads above the old hard cap');
 
+  const fastEntrySvc = new DryRunSessionService();
+  fastEntrySvc.start({
+    symbols: ['BTCUSDT'],
+    walletBalanceStartUsdt: 5000,
+    initialMarginUsdt: 500,
+    leverage: 10,
+    fundingRate: 0,
+    heartbeatIntervalMs: 1000,
+  });
+  const fastEntrySession = (fastEntrySvc as any).sessions.get('BTCUSDT');
+  const fastBook = {
+    bids: [{ price: 100, qty: 10 }, { price: 99.99, qty: 10 }],
+    asks: [{ price: 100.01, qty: 10 }, { price: 100.02, qty: 10 }],
+  };
+  fastEntrySession.lastOrderBook = fastBook;
+  fastEntrySession.latestMarkPrice = 100.005;
+  let fastEntryOrder = (fastEntrySvc as any).buildAiPostOnlyEntryOrder(fastEntrySession, 'SELL', 1, 'STRAT_ENTRY', true);
+  assert(fastEntryOrder?.type === 'LIMIT', 'seed entry should default to fast IOC limit');
+  assert(fastEntryOrder?.timeInForce === 'IOC', 'seed entry should not park as GTC when fast-fill is needed');
+  assert(fastEntryOrder?.postOnly === false, 'seed entry should ignore strict post-only parking');
+
+  fastEntrySession.aiEntryCancelStreak = 2;
+  fastEntryOrder = (fastEntrySvc as any).buildAiPostOnlyEntryOrder(fastEntrySession, 'SELL', 1, 'STRAT_ENTRY', true);
+  assert(fastEntryOrder?.type === 'MARKET', 'repeated unfilled seed entries should fall back to market');
+
+  const autonomousPathSvc = new DryRunSessionService();
+  autonomousPathSvc.start({
+    runId: 'dryrun-plain',
+    symbols: ['BTCUSDT'],
+    walletBalanceStartUsdt: 5000,
+    initialMarginUsdt: 500,
+    leverage: 10,
+    fundingRate: 0,
+    heartbeatIntervalMs: 1000,
+  });
+  const autonomousSession = (autonomousPathSvc as any).sessions.get('BTCUSDT');
+  autonomousSession.lastOrderBook = fastBook;
+  autonomousSession.latestMarkPrice = 100.005;
+  autonomousSession.warmup = {
+    ...autonomousSession.warmup,
+    bootstrapDone: true,
+    htfReady: true,
+    orderflow1mReady: true,
+    orderflow5mReady: true,
+    orderflow15mReady: true,
+    tradeReady: true,
+    addonReady: true,
+    vetoReason: null,
+  };
+  autonomousPathSvc.submitStrategyDecision('BTCUSDT', {
+    symbol: 'BTCUSDT',
+    timestampMs: 1_700_000_010_000,
+    regime: 'TR',
+    dfs: 0.8,
+    dfsPercentile: 0.8,
+    volLevel: 0.5,
+    gatePassed: true,
+    reasons: ['ENTRY_TR'],
+    actions: [{
+      type: 'ENTRY',
+      side: 'SHORT',
+      reason: 'ENTRY_TR',
+      expectedPrice: 100,
+    }],
+    log: {
+      timestampMs: 1_700_000_010_000,
+      symbol: 'BTCUSDT',
+      regime: 'TR',
+      gate: { passed: true, reason: null, details: {} },
+      dfs: 0.8,
+      dfsPercentile: 0.8,
+      volLevel: 0.5,
+      thresholds: { longEntry: 0.8, longBreak: 0.6, shortEntry: 0.2, shortBreak: 0.4 },
+      reasons: ['ENTRY_TR'],
+      actions: [{
+        type: 'ENTRY',
+        side: 'SHORT',
+        reason: 'ENTRY_TR',
+        expectedPrice: 100,
+      }],
+      stats: {},
+    },
+  } as any, 1_700_000_010_000);
+  const autonomousOrder = autonomousSession.manualOrders.find((o: any) => o.reasonCode === 'STRAT_ENTRY');
+  assert(autonomousOrder?.timeInForce === 'IOC', 'plain dry-run runIds must still use fast autonomous seed entry routing');
+  assert(autonomousOrder?.postOnly === false, 'plain dry-run runIds must not fall back to passive maker entry routing');
+
   const reduceCooldownSvc = new DryRunSessionService();
   reduceCooldownSvc.start({
     symbols: ['BTCUSDT'],
@@ -202,10 +289,66 @@ export function runTests() {
   assert(firstReduce.length === 1, 'first soft reduce should queue once');
   assert(secondReduce.length === 0, 'rapid repeated soft reduces must be blocked by cooldown');
 
+  const peakTrackingSvc = new DryRunSessionService();
+  peakTrackingSvc.start({
+    symbols: ['BTCUSDT'],
+    walletBalanceStartUsdt: 5000,
+    initialMarginUsdt: 500,
+    leverage: 10,
+    fundingRate: 0,
+    heartbeatIntervalMs: 1000,
+  });
+  const peakSession = (peakTrackingSvc as any).sessions.get('BTCUSDT');
+  peakSession.manualOrders.push({
+    side: 'BUY',
+    type: 'MARKET',
+    qty: 1,
+    timeInForce: 'IOC',
+    reduceOnly: false,
+    reasonCode: 'MANUAL_TEST',
+  });
+  peakTrackingSvc.ingestDepthEvent({
+    symbol: 'BTCUSDT',
+    eventTimestampMs: 1_700_000_004_000,
+    orderBook: {
+      bids: [{ price: 99.9, qty: 10 }],
+      asks: [{ price: 100, qty: 10 }],
+    },
+    markPrice: 100,
+  });
+  peakTrackingSvc.ingestDepthEvent({
+    symbol: 'BTCUSDT',
+    eventTimestampMs: 1_700_000_005_000,
+    orderBook: {
+      bids: [{ price: 100.95, qty: 10 }],
+      asks: [{ price: 101, qty: 10 }],
+    },
+    markPrice: 101,
+  });
+  const peakPosition = peakTrackingSvc.getStrategyPosition('BTCUSDT');
+  assert((peakPosition?.peakPnlPct || 0) >= 0.009, 'strategy position should retain peak pnl after favorable move');
+  peakTrackingSvc.ingestDepthEvent({
+    symbol: 'BTCUSDT',
+    eventTimestampMs: 1_700_000_006_000,
+    orderBook: {
+      bids: [{ price: 100.35, qty: 10 }],
+      asks: [{ price: 100.4, qty: 10 }],
+    },
+    markPrice: 100.4,
+  });
+  const retainedPeakPosition = peakTrackingSvc.getStrategyPosition('BTCUSDT');
+  assert(
+    (retainedPeakPosition?.peakPnlPct || 0) >= (retainedPeakPosition?.unrealizedPnlPct || 0),
+    'peak pnl should survive mild pullbacks so strategy trailing logic can use it'
+  );
+
   partialEntrySvc.stop();
   workingOrderSvc.stop();
   adaptiveSpreadSvc.stop();
+  fastEntrySvc.stop();
+  autonomousPathSvc.stop();
   reduceCooldownSvc.stop();
+  peakTrackingSvc.stop();
   const stopped = svc.stop();
   assert(stopped.running === false, 'session must stop cleanly');
 }

@@ -77,8 +77,11 @@ export interface ResetOrderbookOptions {
 const MAX_LEVELS_PER_SIDE = Math.max(200, Number(process.env.ORDERBOOK_MAX_LEVELS_PER_SIDE || 2000));
 const SNAPSHOT_BRIDGE_BUFFER_MAX = Math.max(200, Number(process.env.ORDERBOOK_SNAPSHOT_BUFFER_MAX || 4000));
 // Keep reorder buffer bounded but tolerant to short network jitter on 100ms streams.
-const REORDER_BUFFER_MAX = Math.max(8, Number(process.env.ORDERBOOK_REORDER_BUFFER_MAX || 64));
-const REORDER_BUFFER_TTL_MS = Math.max(250, Number(process.env.ORDERBOOK_REORDER_BUFFER_TTL_MS || 5000));
+// Binance futures diff streams can legitimately trail a fresh REST snapshot by several
+// seconds on busy symbols. If we expire the reorder buffer too early, we resync-loop
+// before the stream catches up and OBI becomes trade-driven instead of depth-driven.
+const REORDER_BUFFER_MAX = Math.max(32, Number(process.env.ORDERBOOK_REORDER_BUFFER_MAX || 1024));
+const REORDER_BUFFER_TTL_MS = Math.max(1000, Number(process.env.ORDERBOOK_REORDER_BUFFER_TTL_MS || 30000));
 
 type SequenceDecision = 'apply' | 'future' | 'stale' | 'gap';
 
@@ -312,7 +315,7 @@ function classifyUpdate(state: OrderbookState, update: BufferedDepthUpdate, expe
     if (pu > state.lastUpdateId) {
       return 'future';
     }
-    return update.U > expected ? 'future' : 'gap';
+    return 'apply';
   }
   if (update.U > expected) {
     return 'future';

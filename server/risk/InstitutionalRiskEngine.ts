@@ -565,6 +565,7 @@ export class InstitutionalRiskEngine {
    */
   reset(): void {
     this.stop();
+    this.killSwitchManager.reset();
     this.stateManager = new RiskStateManager(this.config.state);
     this.positionGuard = new PositionRiskGuard(this.stateManager, this.config.position);
     this.drawdownGuard = new DrawdownRiskGuard(this.stateManager, this.config.drawdown);
@@ -589,6 +590,7 @@ export class InstitutionalRiskEngine {
    */
   stop(): void {
     this.drawdownGuard.stop();
+    this.killSwitchManager.reset();
   }
 
   /**

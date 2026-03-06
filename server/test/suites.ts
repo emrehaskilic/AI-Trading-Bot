@@ -19,6 +19,8 @@ import * as OrderPlanTests from './OrderPlan.test';
 import * as DryRunEngineTests from './DryRunEngine.test';
 import * as DryRunSizingModelTests from './DryRunSizingModel.test';
 import * as DryRunSessionServiceTests from './DryRunSessionService.test';
+import * as DryRunRuntimeContextTests from './DryRunRuntimeContext.test';
+import * as StrategyDataQualityGateTests from './StrategyDataQualityGate.test';
 import * as NormalizationTests from './Normalization.test';
 import * as RegimeSelectorTests from './RegimeSelector.test';
 import * as StrategyHysteresisTests from './StrategyHysteresis.test';
@@ -37,6 +39,8 @@ import * as RiskApiRoutesTests from './RiskApiRoutes.test';
 import * as AnalyticsEngineMetricsTests from './AnalyticsEngineMetrics.test';
 import * as TelemetryApiTests from './TelemetryApi.test';
 import * as AnalyticsApiFallbackTests from './AnalyticsApiFallback.test';
+import * as SymbolEventQueueTests from './SymbolEventQueue.test';
+import * as DecisionReplayHarnessTests from './DecisionReplayHarness.test';
 
 export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'TimeAndSales', fn: TimeAndSalesTests.runTests },
@@ -60,6 +64,8 @@ export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'DryRunEngine', fn: DryRunEngineTests.runTests },
     { name: 'DryRunSizingModel', fn: DryRunSizingModelTests.runTests },
     { name: 'DryRunSessionService', fn: DryRunSessionServiceTests.runTests },
+    { name: 'DryRunRuntimeContext', fn: DryRunRuntimeContextTests.runTests },
+    { name: 'StrategyDataQualityGate', fn: StrategyDataQualityGateTests.runTests },
     { name: 'Normalization', fn: NormalizationTests.runTests },
     { name: 'RegimeSelector', fn: RegimeSelectorTests.runTests },
     { name: 'MarketImpactSimulator', fn: MarketImpactSimulatorTests.runTests },
@@ -77,4 +83,6 @@ export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'AnalyticsEngineMetrics', fn: AnalyticsEngineMetricsTests.runTests },
     { name: 'TelemetryApi', fn: TelemetryApiTests.runTests },
     { name: 'AnalyticsApiFallback', fn: AnalyticsApiFallbackTests.runTests },
+    { name: 'SymbolEventQueue', fn: SymbolEventQueueTests.runTests },
+    { name: 'DecisionReplayHarness', fn: DecisionReplayHarnessTests.runTests },
 ];

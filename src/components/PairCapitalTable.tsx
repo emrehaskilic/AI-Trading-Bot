@@ -16,10 +16,23 @@ type RuntimeTrend = {
   veto1h?: 'NONE' | 'UP' | 'DOWN' | 'EXHAUSTION';
 };
 
+type RuntimeDecision = {
+  side?: 'LONG' | 'SHORT' | 'FLAT';
+  confidence?: number;
+  shouldTrade?: boolean;
+  gatePassed?: boolean;
+  regime?: string | null;
+  actionType?: string | null;
+  reason?: string | null;
+  reasons?: string[];
+  timestampMs?: number;
+};
+
 export interface PairCapitalRuntimeRow {
   capital?: RuntimeCapital | null;
   warmup?: WarmupState | null;
   trend?: RuntimeTrend | null;
+  decision?: RuntimeDecision | null;
   warnings?: string[];
   leverageReady?: boolean | null;
 }
@@ -62,6 +75,12 @@ const badgeClass = (active: boolean): string =>
     ? 'bg-emerald-950/50 text-emerald-300 border-emerald-900'
     : 'bg-zinc-950/50 text-zinc-500 border-zinc-800';
 
+const decisionBadgeClass = (side?: 'LONG' | 'SHORT' | 'FLAT'): string => {
+  if (side === 'LONG') return 'bg-emerald-950/50 text-emerald-300 border-emerald-900';
+  if (side === 'SHORT') return 'bg-rose-950/50 text-rose-300 border-rose-900';
+  return 'bg-zinc-950/50 text-zinc-400 border-zinc-800';
+};
+
 const PairCapitalTable: React.FC<PairCapitalTableProps> = ({
   rows,
   runtime = {},
@@ -70,7 +89,7 @@ const PairCapitalTable: React.FC<PairCapitalTableProps> = ({
 }) => {
   return (
     <div className="overflow-x-auto rounded-lg border border-zinc-800">
-      <table className="w-full min-w-[1280px] text-xs">
+      <table className="w-full min-w-[1440px] text-xs">
         <thead className="bg-zinc-950/70 text-zinc-500 uppercase tracking-wider">
           <tr>
             <th className="px-3 py-2 text-left">Enabled</th>
@@ -82,6 +101,7 @@ const PairCapitalTable: React.FC<PairCapitalTableProps> = ({
             <th className="px-3 py-2 text-center">Bootstrap</th>
             <th className="px-3 py-2 text-center">Warmup</th>
             <th className="px-3 py-2 text-center">Trend State</th>
+            <th className="px-3 py-2 text-center">Decision</th>
             <th className="px-3 py-2 text-center">Trade Ready</th>
             <th className="px-3 py-2 text-center">Addon Ready</th>
             <th className="px-3 py-2 text-left">Warnings</th>
@@ -90,7 +110,7 @@ const PairCapitalTable: React.FC<PairCapitalTableProps> = ({
         <tbody className="divide-y divide-zinc-900 bg-black/20">
           {rows.length === 0 && (
             <tr>
-              <td colSpan={12} className="px-3 py-6 text-center text-zinc-600 italic">
+              <td colSpan={13} className="px-3 py-6 text-center text-zinc-600 italic">
                 No symbols configured.
               </td>
             </tr>
@@ -100,6 +120,7 @@ const PairCapitalTable: React.FC<PairCapitalTableProps> = ({
             const capital = runtimeRow.capital || null;
             const warmup = runtimeRow.warmup || null;
             const trend = runtimeRow.trend || null;
+            const decision = runtimeRow.decision || null;
             const warnings = runtimeRow.warnings || [];
 
             return (
@@ -159,6 +180,16 @@ const PairCapitalTable: React.FC<PairCapitalTableProps> = ({
                   {trend?.state || '-'}
                 </td>
                 <td className="px-3 py-2 text-center">
+                  <div className="flex flex-col items-center gap-1">
+                    <span className={`rounded border px-2 py-1 ${decisionBadgeClass(decision?.side)}`}>
+                      {decision?.side || '-'}
+                    </span>
+                    <span className="text-[10px] text-zinc-500">
+                      {decision?.actionType || decision?.reason || decision?.regime || '-'}
+                    </span>
+                  </div>
+                </td>
+                <td className="px-3 py-2 text-center">
                   <span className={`rounded border px-2 py-1 ${badgeClass(Boolean(warmup?.tradeReady))}`}>
                     {warmup?.tradeReady ? 'YES' : 'NO'}
                   </span>
@@ -171,7 +202,9 @@ const PairCapitalTable: React.FC<PairCapitalTableProps> = ({
                 <td className="px-3 py-2 text-zinc-500">
                   {warnings.length > 0
                     ? warnings.join(', ')
-                    : (warmup?.vetoReason || (runtimeRow.leverageReady === false ? 'leverage_sync_pending' : '-'))}
+                    : (warmup?.vetoReason
+                      || decision?.reason
+                      || (runtimeRow.leverageReady === false ? 'leverage_sync_pending' : '-'))}
                 </td>
               </tr>
             );

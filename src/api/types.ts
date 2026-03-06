@@ -317,6 +317,17 @@ export interface DryRunSymbolStatus {
     bias15m: 'UP' | 'DOWN' | 'NEUTRAL';
     veto1h: 'NONE' | 'UP' | 'DOWN' | 'EXHAUSTION';
   };
+  decision?: {
+    side: 'LONG' | 'SHORT' | 'FLAT';
+    confidence: number;
+    shouldTrade: boolean;
+    gatePassed: boolean;
+    regime: string | null;
+    actionType: string | null;
+    reason: string | null;
+    reasons: string[];
+    timestampMs: number;
+  } | null;
   position: {
     side: 'LONG' | 'SHORT' | null;
     qty: number;

@@ -31,10 +31,10 @@ export interface OrderbookIntegrityConfig {
 }
 
 const DEFAULT_CONFIG: OrderbookIntegrityConfig = {
-  staleWarnMs: 1500,
-  staleCriticalMs: 5000,
+  staleWarnMs: 4000,
+  staleCriticalMs: 15000,
   maxGapBeforeCritical: 3,
-  reconnectCooldownMs: 15000,
+  reconnectCooldownMs: 30000,
 };
 
 export class OrderbookIntegrityMonitor {

@@ -20,6 +20,7 @@ interface DryRunStatus {
   running: boolean;
   runId: string | null;
   symbols: string[];
+  previewSymbols?: string[];
   config: {
     sharedWalletStartUsdt: number;
     reserveScale: number;
@@ -77,6 +78,17 @@ interface DryRunStatus {
       bias15m: 'UP' | 'DOWN' | 'NEUTRAL';
       veto1h: 'NONE' | 'UP' | 'DOWN' | 'EXHAUSTION';
     };
+    decision?: {
+      side: 'LONG' | 'SHORT' | 'FLAT';
+      confidence: number;
+      shouldTrade: boolean;
+      gatePassed: boolean;
+      regime: string | null;
+      actionType: string | null;
+      reason: string | null;
+      reasons: string[];
+      timestampMs: number;
+    } | null;
     metrics: {
       markPrice: number;
       totalEquity: number;
@@ -195,6 +207,34 @@ const normalizeSymbolList = (values: string[]): string[] => {
   return [...unique];
 };
 
+const DEFAULT_DRY_RUN_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT'];
+
+const prioritizeSymbols = (symbols: string[], priority: string[]): string[] => {
+  const normalizedSymbols = normalizeSymbolList(symbols);
+  const normalizedPriority = normalizeSymbolList(priority);
+  if (normalizedPriority.length === 0) {
+    return normalizedSymbols;
+  }
+  const symbolSet = new Set(normalizedSymbols);
+  const head = normalizedPriority.filter((symbol) => symbolSet.has(symbol));
+  const tail = normalizedSymbols.filter((symbol) => !head.includes(symbol));
+  return [...head, ...tail];
+};
+
+const pickInitialSelectedPairs = (available: string[], current: string[]): string[] => {
+  const normalizedAvailable = normalizeSymbolList(available);
+  const availableSet = new Set(normalizedAvailable);
+  const validCurrent = normalizeSymbolList(current).filter((symbol) => availableSet.has(symbol));
+  if (validCurrent.length > 0) {
+    return validCurrent;
+  }
+  const preferred = DEFAULT_DRY_RUN_SYMBOLS.filter((symbol) => availableSet.has(symbol));
+  if (preferred.length > 0) {
+    return preferred;
+  }
+  return normalizedAvailable.length > 0 ? [normalizedAvailable[0]] : [];
+};
+
 const buildDefaultSymbolCapitalConfig = (symbol: string, sharedWalletStartUsdt: number): SymbolCapitalConfig => ({
   symbol,
   enabled: true,
@@ -215,6 +255,7 @@ const DryRunDashboard: React.FC = () => {
 
   const [actionError, setActionError] = useState<string | null>(null);
   const [status, setStatus] = useState<DryRunStatus>(DEFAULT_STATUS);
+  const [statusBootstrapped, setStatusBootstrapped] = useState(false);
 
   const [sharedWalletStart, setSharedWalletStart] = useState('5000');
   const [pairConfigs, setPairConfigs] = useState<Record<string, SymbolCapitalConfig>>({});
@@ -256,13 +297,10 @@ const DryRunDashboard: React.FC = () => {
         } catch {
           // Ignore storage failures (private mode/quota).
         }
-        setAvailablePairs(pairs);
+        const prioritizedPairs = prioritizeSymbols(pairs, selectedPairs.length > 0 ? selectedPairs : DEFAULT_DRY_RUN_SYMBOLS);
+        setAvailablePairs(prioritizedPairs);
         if (pairs.length > 0) {
-          setSelectedPairs((prev) => {
-            const valid = prev.filter((s) => pairs.includes(s));
-            if (valid.length > 0) return valid;
-            return [pairs[0]];
-          });
+          setSelectedPairs((prev) => pickInitialSelectedPairs(prioritizedPairs, prev));
         }
       } catch {
         let fallbackPairs: string[] = [];
@@ -276,14 +314,11 @@ const DryRunDashboard: React.FC = () => {
           fallbackPairs = [];
         }
         if (fallbackPairs.length === 0) {
-          fallbackPairs = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+          fallbackPairs = DEFAULT_DRY_RUN_SYMBOLS;
         }
-        setAvailablePairs(fallbackPairs);
-        setSelectedPairs((prev) => {
-          const valid = prev.filter((s) => fallbackPairs.includes(s));
-          if (valid.length > 0) return valid;
-          return [fallbackPairs[0]];
-        });
+        const prioritizedFallbackPairs = prioritizeSymbols(fallbackPairs, DEFAULT_DRY_RUN_SYMBOLS);
+        setAvailablePairs(prioritizedFallbackPairs);
+        setSelectedPairs((prev) => pickInitialSelectedPairs(prioritizedFallbackPairs, prev));
       } finally {
         window.clearTimeout(timer);
         setIsLoadingPairs(false);
@@ -325,10 +360,13 @@ const DryRunDashboard: React.FC = () => {
         if (res.ok && data?.status) {
           const next = data.status as DryRunStatus;
           setStatus(next);
+          setStatusBootstrapped(true);
           if (next.running && next.symbols.length > 0) {
             const normalized = normalizeSymbolList(next.symbols);
             setSelectedPairs(normalized);
             setTestOrderSymbol(normalized[0]);
+          } else if (!next.running && next.previewSymbols && next.previewSymbols.length > 0) {
+            setSelectedPairs(normalizeSymbolList(next.previewSymbols));
           } else if (!next.running && next.config) {
             setSharedWalletStart(String(next.config.sharedWalletStartUsdt));
             setHeartbeatSec(String(Math.max(1, Math.round(next.config.heartbeatIntervalMs / 1000))));
@@ -360,6 +398,28 @@ const DryRunDashboard: React.FC = () => {
       setTestOrderSymbol(activeMetricSymbols[0]);
     }
   }, [activeMetricSymbols, testOrderSymbol]);
+
+  useEffect(() => {
+    if (status.running || !statusBootstrapped || selectedPairs.length === 0) return;
+    const controller = new AbortController();
+    const syncPreviewSymbols = async () => {
+      try {
+        await fetchWithAuth(`${proxyUrl}/api/dry-run/preview-symbols`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ symbols: selectedPairs }),
+          signal: controller.signal,
+        });
+      } catch {
+        // ignore and retry on next selection change
+      }
+    };
+    const timer = window.setTimeout(syncPreviewSymbols, 200);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [proxyUrl, selectedPairs, status.running]);
 
   const filteredPairs = useMemo(
     () => availablePairs.filter((p) => p.includes(searchTerm.toUpperCase())),

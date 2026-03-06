@@ -147,6 +147,10 @@ export function runTests() {
 
   const exitDecision = strategy.evaluate(baseInput(now + 1000, {
     position,
+    htf: {
+      m15: { close: 99.2, atr: 1, lastSwingHigh: 100, lastSwingLow: 98.5, structureBreakUp: false, structureBreakDn: true },
+      h1: { close: 99.4, atr: 2, lastSwingHigh: 102, lastSwingLow: 98, structureBreakUp: false, structureBreakDn: false },
+    },
     market: {
       price: 99.2,
       vwap: 100,

@@ -94,6 +94,7 @@ export interface DryRunSymbolStatus {
     qty: number;
     notionalUsdt: number;
     entryPrice: number;
+    peakPnlPct?: number;
     breakEvenPrice: number | null;
     markPrice: number;
     unrealizedPnl: number;
@@ -279,8 +280,10 @@ type SymbolSession = {
   logTail: DryRunEventLog[];
   pendingEntry: PendingEntryContext | null;
   pendingExitReason: string | null;
+  pendingCloseAction: { kind: 'EXIT' | 'REVERSAL'; side: 'LONG' | 'SHORT'; expiresAtMs: number } | null;
   tradeSeq: number;
   currentTrade: ActiveTrade | null;
+  peakUnrealizedPnlPct: number;
   lastSnapshotLogTs: number;
   lastWinnerSignalLogTs: number;
   aiEntryCancelStreak: number;
@@ -386,6 +389,10 @@ const DEFAULT_STRAT_ENTRY_MIN_INTERVAL_MS = Math.max(
 const DEFAULT_STRAT_EXIT_MIN_INTERVAL_MS = Math.max(
   0,
   Math.trunc(clampNumber(process.env.STRAT_EXIT_MIN_INTERVAL_MS, 4000, 0, 60_000))
+);
+const DEFAULT_PENDING_CLOSE_GUARD_MS = Math.max(
+  1000,
+  Math.trunc(clampNumber(process.env.STRAT_PENDING_CLOSE_GUARD_MS, 12_000, 1000, 60_000))
 );
 const DEFAULT_STRAT_REDUCE_MIN_INTERVAL_MS = Math.max(
   0,
@@ -679,8 +686,10 @@ export class DryRunSessionService {
         logTail: [],
         pendingEntry: null,
         pendingExitReason: null,
+        pendingCloseAction: null,
         tradeSeq: 0,
         currentTrade: null,
+        peakUnrealizedPnlPct: 0,
         lastSnapshotLogTs: 0,
         lastWinnerSignalLogTs: 0,
         aiEntryCancelStreak: 0,
@@ -754,6 +763,7 @@ export class DryRunSessionService {
         fundingPnl: session.fundingPnl,
         eventCount: session.eventCount,
         lastEventTimestampMs: session.lastEventTimestampMs,
+        peakUnrealizedPnlPct: session.peakUnrealizedPnlPct,
       })),
     };
     await this.sessionStore.save(id, payload);
@@ -866,8 +876,10 @@ export class DryRunSessionService {
         logTail: [],
         pendingEntry: null,
         pendingExitReason: null,
+        pendingCloseAction: null,
         tradeSeq: 0,
         currentTrade: null,
+        peakUnrealizedPnlPct: Number(sessionSnapshot?.peakUnrealizedPnlPct || 0),
         lastSnapshotLogTs: 0,
         lastWinnerSignalLogTs: 0,
         aiEntryCancelStreak: 0,
@@ -1089,6 +1101,9 @@ export class DryRunSessionService {
       if (positionSide !== 'LONG' && positionSide !== 'SHORT') {
         return false;
       }
+      if (this.hasPendingCloseAction(session, positionSide, decisionTs)) {
+        return false;
+      }
       if (this.hasLiveReduceOnlyOrderForPosition(session, positionSide)) {
         return false;
       }
@@ -1175,6 +1190,7 @@ export class DryRunSessionService {
                 }
                 session.lastExitOrderTs = decisionTs;
                 session.pendingExitReason = 'STRAT_REVERSAL_EXIT';
+                this.armPendingCloseAction(session, 'REVERSAL', position.side, decisionTs);
                 this.addConsoleLog('INFO', normalized, `Strategy reversal: closing ${position.side} before ${actionSide}`, session.lastEventTimestampMs);
               }
             }
@@ -1377,6 +1393,7 @@ export class DryRunSessionService {
           session.lastExitOrderTs = decisionTs;
           if (forceFullClose) {
             session.pendingExitReason = action.reason || session.pendingExitReason || 'STRAT_DUST_FLATTEN';
+            this.armPendingCloseAction(session, 'EXIT', position.side, decisionTs);
             this.addConsoleLog('INFO', normalized, `Strategy reduce escalated to full exit for ${position.side} (dust guard)`, session.lastEventTimestampMs);
           } else {
             this.addConsoleLog('INFO', normalized, `Strategy reduce ${position.side} -${reduceQty} (${(reducePct * 100).toFixed(0)}%)`, session.lastEventTimestampMs);
@@ -1399,6 +1416,7 @@ export class DryRunSessionService {
         if (exitOrder) {
           if (!queueOrder(exitOrder)) continue;
           session.lastExitOrderTs = decisionTs;
+          this.armPendingCloseAction(session, 'EXIT', position.side, decisionTs);
           this.addConsoleLog('INFO', normalized, `Strategy exit ${position.side} completely`, session.lastEventTimestampMs);
           session.pendingExitReason = action.reason;
         }
@@ -1421,7 +1439,7 @@ export class DryRunSessionService {
       unrealizedPnlPct: this.computeUnrealizedPnlPct(session, markPrice),
       addsUsed: session.addOnState?.count ?? 0,
       timeInPositionMs: this.computePositionTimeInMs(session, Number(this.clock.now())),
-      peakPnlPct: undefined,
+      peakPnlPct: Number.isFinite(session.peakUnrealizedPnlPct) ? session.peakUnrealizedPnlPct : undefined,
     };
   }
 
@@ -1786,6 +1804,7 @@ export class DryRunSessionService {
             qty: session.lastState.position.qty,
             notionalUsdt: roundTo(Math.abs(session.lastState.position.qty * session.latestMarkPrice), 8),
             entryPrice: session.lastState.position.entryPrice,
+            peakPnlPct: Number.isFinite(session.peakUnrealizedPnlPct) ? roundTo(session.peakUnrealizedPnlPct, 6) : undefined,
             breakEvenPrice: (() => {
               const value = this.computeBreakEvenPrice(session);
               return value == null ? null : roundTo(value, 8);
@@ -2553,7 +2572,20 @@ export class DryRunSessionService {
     const forcePostOnlyEnv = ['1', 'true', 'yes', 'on'].includes(
       String(process.env.STRAT_ENTRY_POST_ONLY || 'false').trim().toLowerCase()
     );
-    const forcePostOnly = forcePostOnlyFromPolicy || forcePostOnlyEnv;
+    const entryCancelStreak = Math.max(0, Number(session.aiEntryCancelStreak || 0));
+    const isSeedEntry = reasonCode === 'STRAT_ENTRY';
+    const forcePostOnly = !isSeedEntry && (forcePostOnlyFromPolicy || forcePostOnlyEnv);
+    if (isSeedEntry && entryCancelStreak >= DEFAULT_STRAT_ENTRY_CANCEL_STREAK_TRIGGER) {
+      return {
+        side,
+        type: 'MARKET',
+        qty: roundTo(qty, 6),
+        timeInForce: 'IOC',
+        reduceOnly: false,
+        postOnly: false,
+        reasonCode,
+      };
+    }
     if (!forcePostOnly) {
       const aggressiveLimit = side === 'BUY' ? bestAsk : bestBid;
       return {
@@ -2565,7 +2597,7 @@ export class DryRunSessionService {
         reduceOnly: false,
         postOnly: false,
         reasonCode,
-        minFillRatio: DEFAULT_ENTRY_MIN_FILL_RATIO,
+        minFillRatio: isSeedEntry ? Math.min(DEFAULT_ENTRY_MIN_FILL_RATIO, 0.1) : DEFAULT_ENTRY_MIN_FILL_RATIO,
         cancelOnMinFillMiss: true,
       };
     }
@@ -2761,6 +2793,37 @@ export class DryRunSessionService {
     const hasOpen = session.lastState.openLimitOrders.some((o) => o.side === closeSide && Boolean(o.reduceOnly));
     if (hasOpen) return true;
     return session.manualOrders.some((o) => o.side === closeSide && Boolean(o.reduceOnly));
+  }
+
+  private hasPendingCloseAction(session: SymbolSession, positionSide: 'LONG' | 'SHORT', nowMs: number): boolean {
+    const pending = session.pendingCloseAction;
+    if (!pending) return false;
+    if (pending.side !== positionSide) return false;
+    if (nowMs >= pending.expiresAtMs) {
+      session.pendingCloseAction = null;
+      return false;
+    }
+    return true;
+  }
+
+  private armPendingCloseAction(
+    session: SymbolSession,
+    kind: 'EXIT' | 'REVERSAL',
+    side: 'LONG' | 'SHORT',
+    nowMs: number
+  ): void {
+    session.pendingCloseAction = {
+      kind,
+      side,
+      expiresAtMs: nowMs + DEFAULT_PENDING_CLOSE_GUARD_MS,
+    };
+  }
+
+  private clearPendingCloseAction(session: SymbolSession, side?: 'LONG' | 'SHORT' | null): void {
+    if (!session.pendingCloseAction) return;
+    if (!side || session.pendingCloseAction.side === side) {
+      session.pendingCloseAction = null;
+    }
   }
 
   private shouldBlockAiEntryByCooldown(session: SymbolSession, symbol: string, nowMs: number): boolean {
@@ -2984,8 +3047,9 @@ export class DryRunSessionService {
   }
 
   private isAIAutonomousRun(): boolean {
-    const runId = String(this.runId || '').toLowerCase();
-    return runId.startsWith('ai-');
+    // RunId must not decide whether the 3m trend strategy uses autonomous execution.
+    // All dry-run strategy sessions should follow the same execution path.
+    return Boolean(this.config);
   }
 
   private computeRiskSizing(
@@ -3347,6 +3411,13 @@ export class DryRunSessionService {
       this.registerAiEntryOrderOutcome(session, session.symbol, order, eventTimestampMs);
       const reasonCode = order.reasonCode ?? null;
       if (!reasonCode) continue;
+      if (
+        this.isExitLikeReasonCode(reasonCode)
+        && ['CANCELED', 'EXPIRED', 'REJECTED'].includes(String(order.status || ''))
+        && Number(order.filledQty || 0) <= 0
+      ) {
+        this.clearPendingCloseAction(session);
+      }
       if (this.isOrderCleanupReason(order.reason)) continue;
       const feePaidIncrement = Number.isFinite(order.fee) ? Number(order.fee) : 0;
       const impactEstimate = Number.isFinite(order.marketImpactBps as number) ? Number(order.marketImpactBps) : null;
@@ -3493,6 +3564,7 @@ export class DryRunSessionService {
     markPrice: number
   ): void {
     if (!prevPosition && nextPosition) {
+      this.clearPendingCloseAction(session);
       this.resetAiEntryBackoff(session);
       session.winnerState = this.winnerManager.initState({
         entryPrice: nextPosition.entryPrice,
@@ -3512,10 +3584,12 @@ export class DryRunSessionService {
       session.flipGovernor.reset();
       session.flipState.partialReduced = false;
       session.flipState.lastPartialReduceTs = 0;
+      session.peakUnrealizedPnlPct = Math.max(0, this.computeUnrealizedPnlPct(session, markPrice));
       return;
     }
 
     if (prevPosition && !nextPosition) {
+      this.clearPendingCloseAction(session, prevPosition.side);
       this.resetAiEntryBackoff(session);
       session.winnerState = null;
       session.stopLossPrice = null;
@@ -3526,10 +3600,12 @@ export class DryRunSessionService {
       session.flipGovernor.reset();
       session.flipState.partialReduced = false;
       session.flipState.lastPartialReduceTs = 0;
+      session.peakUnrealizedPnlPct = 0;
       return;
     }
 
     if (prevPosition && nextPosition && prevPosition.side !== nextPosition.side) {
+      this.clearPendingCloseAction(session, prevPosition.side);
       this.resetAiEntryBackoff(session);
       session.winnerState = this.winnerManager.initState({
         entryPrice: nextPosition.entryPrice,
@@ -3543,6 +3619,16 @@ export class DryRunSessionService {
       session.flipGovernor.reset();
       session.flipState.partialReduced = false;
       session.flipState.lastPartialReduceTs = 0;
+      session.peakUnrealizedPnlPct = Math.max(0, this.computeUnrealizedPnlPct(session, markPrice));
+      return;
+    }
+
+    if (nextPosition) {
+      const currentUnrealizedPnlPct = this.computeUnrealizedPnlPct(session, markPrice);
+      session.peakUnrealizedPnlPct = Math.max(
+        Number.isFinite(session.peakUnrealizedPnlPct) ? session.peakUnrealizedPnlPct : 0,
+        currentUnrealizedPnlPct
+      );
     }
   }
 

@@ -70,4 +70,20 @@ export function runTests() {
     receiptTimeMs: 7001,
   });
   assert(gap.ok === false && gap.gapDetected === true, 'expired reorder entry should trigger gap');
+
+  const obWithPuBridge = createOrderbookState();
+  applySnapshot(obWithPuBridge, snapshot);
+  const bridged = applyDepthUpdate(obWithPuBridge, {
+    U: 13,
+    u: 15,
+    pu: 10,
+    b: [['100.0', '6']],
+    a: [['101.0', '3']],
+    eventTimeMs: Date.now(),
+    receiptTimeMs: Date.now(),
+  });
+  assert(bridged.ok === true && bridged.applied === true, 'pu continuity update should apply');
+  assert(obWithPuBridge.lastUpdateId === 15, 'pu continuity update should advance lastUpdateId');
+  assert(getLevelSize(obWithPuBridge, 100.0) === 6, 'bridged bid update should apply');
+  assert(getLevelSize(obWithPuBridge, 101.0) === 3, 'bridged ask update should apply');
 }
