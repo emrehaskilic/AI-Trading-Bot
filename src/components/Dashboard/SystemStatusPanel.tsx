@@ -1,7 +1,7 @@
 import React, { memo, useMemo } from 'react';
 import { useHealth } from '../../hooks/useHealth';
 import { useRisk } from '../../hooks/useRisk';
-import { PanelErrorBoundary } from '../ErrorBoundary';
+import { useDryRunStatus } from '../../hooks/useDryRunStatus';
 
 interface StatusBadgeProps {
   label: string;
@@ -165,6 +165,7 @@ export interface SystemStatusPanelProps {
 export const SystemStatusPanel = memo<SystemStatusPanelProps>(({ className = '' }) => {
   const { health, ready, isLoading, error, lastUpdated } = useHealth();
   const { data: riskData, isLoading: riskLoading, error: riskError } = useRisk();
+  const { data: dryRunData, error: dryRunError, lastUpdated: dryRunLastUpdated } = useDryRunStatus();
 
   const healthStatus = useMemo(() => {
     if (!health) return 'unknown' as const;
@@ -177,11 +178,21 @@ export const SystemStatusPanel = memo<SystemStatusPanelProps>(({ className = '' 
   }, [ready]);
 
   const formattedLastUpdate = useMemo(() => {
-    if (!lastUpdated) return 'Never';
-    return lastUpdated.toLocaleTimeString();
-  }, [lastUpdated]);
+    const latest = [lastUpdated, dryRunLastUpdated]
+      .filter((value): value is Date => value instanceof Date)
+      .sort((a, b) => b.getTime() - a.getTime())[0];
+    if (!latest) return 'Never';
+    return latest.toLocaleTimeString();
+  }, [dryRunLastUpdated, lastUpdated]);
 
-  if (isLoading && !health && !ready && !error && !riskError) {
+  const dryRunPnl = useMemo(() => {
+    if (!dryRunData) return 0;
+    return Number(dryRunData.summary.realizedPnl || 0)
+      + Number(dryRunData.summary.unrealizedPnl || 0)
+      - Number(dryRunData.summary.feePaid || 0);
+  }, [dryRunData]);
+
+  if (isLoading && !health && !ready && !error && !riskError && !dryRunError) {
     return (
       <div className={`bg-zinc-900/60 border border-zinc-800 rounded-lg p-4 ${className}`}>
         <div className="flex items-center justify-center h-32 text-sm text-zinc-500">
@@ -200,7 +211,7 @@ export const SystemStatusPanel = memo<SystemStatusPanelProps>(({ className = '' 
           </svg>
           <span>System Status</span>
         </h3>
-        {(error || riskError) && (
+        {(error || riskError || dryRunError) && (
           <span className="px-2 py-1 text-xs bg-red-900/40 text-red-400 rounded">
             Error
           </span>
@@ -217,6 +228,11 @@ export const SystemStatusPanel = memo<SystemStatusPanelProps>(({ className = '' 
           label="Ready" 
           status={readyStatus}
           details={ready?.dependencies ? `${Object.values(ready.dependencies).filter(Boolean).length}/${Object.keys(ready.dependencies).length} deps` : undefined}
+        />
+        <StatusBadge
+          label="Dry Run"
+          status={dryRunData?.running ? 'healthy' : 'unknown'}
+          details={dryRunData?.running ? `${dryRunData.symbols.length} symbols` : 'inactive'}
         />
 
         {riskData && (
@@ -236,6 +252,53 @@ export const SystemStatusPanel = memo<SystemStatusPanelProps>(({ className = '' 
               <span className="text-sm font-medium">Kill Switch Active</span>
             </div>
             <p className="text-xs text-red-300/80">{riskData.killSwitchReason}</p>
+          </div>
+        )}
+
+        {dryRunData?.running && (
+          <div className="p-3 bg-blue-950/40 border border-blue-900 rounded-lg">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs text-blue-300 uppercase tracking-wider">Dry Run Session</span>
+              <span className="text-xs text-blue-200">{dryRunData.runId || 'active'}</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <div className="rounded bg-zinc-950/50 px-2 py-2">
+                <div className="text-zinc-500">Symbols</div>
+                <div className="mt-1 text-zinc-200">{dryRunData.symbols.join(', ') || '-'}</div>
+              </div>
+              <div className="rounded bg-zinc-950/50 px-2 py-2">
+                <div className="text-zinc-500">Reserve Scale</div>
+                <div className="mt-1 text-zinc-200">
+                  {(dryRunData.config?.reserveScale ?? 1).toFixed(4)}
+                </div>
+              </div>
+              <div className="rounded bg-zinc-950/50 px-2 py-2">
+                <div className="text-zinc-500">Shared Wallet</div>
+                <div className="mt-1 text-zinc-200">
+                  {(dryRunData.config?.sharedWalletStartUsdt ?? 0).toFixed(2)} USDT
+                </div>
+              </div>
+              <div className="rounded bg-zinc-950/50 px-2 py-2">
+                <div className="text-zinc-500">Configured Reserve</div>
+                <div className="mt-1 text-zinc-200">
+                  {(dryRunData.config?.totalConfiguredReserveUsdt ?? 0).toFixed(2)} USDT
+                </div>
+              </div>
+              <div className="rounded bg-zinc-950/50 px-2 py-2">
+                <div className="text-zinc-500">Total Equity</div>
+                <div className="mt-1 text-zinc-200">{dryRunData.summary.totalEquity.toFixed(2)} USDT</div>
+              </div>
+              <div className="rounded bg-zinc-950/50 px-2 py-2">
+                <div className="text-zinc-500">Open Positions</div>
+                <div className="mt-1 text-zinc-200">{dryRunData.openPositions}</div>
+              </div>
+            </div>
+            <div className="mt-2 flex items-center justify-between text-xs">
+              <span className="text-zinc-500">Net PnL</span>
+              <span className={dryRunPnl >= 0 ? 'text-green-400' : 'text-red-400'}>
+                {dryRunPnl >= 0 ? '+' : ''}{dryRunPnl.toFixed(2)} USDT
+              </span>
+            </div>
           </div>
         )}
       </div>

@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import SymbolRow from './SymbolRow';
 import MobileSymbolCard from './MobileSymbolCard';
+import PairCapitalTable from './PairCapitalTable';
+import { SymbolCapitalConfig } from '../api/types';
 import { TelemetrySocketStatus, useTelemetrySocket } from '../services/useTelemetrySocket';
 import { withProxyApiKey } from '../services/proxyAuth';
 import { getProxyApiBase } from '../services/proxyBase';
@@ -19,14 +21,16 @@ interface DryRunStatus {
   runId: string | null;
   symbols: string[];
   config: {
-    walletBalanceStartUsdt: number;
-    initialMarginUsdt: number;
-    leverage: number;
+    sharedWalletStartUsdt: number;
+    reserveScale: number;
+    totalConfiguredReserveUsdt: number;
+    totalEffectiveReserveUsdt: number;
     takerFeeRate: number;
     maintenanceMarginRate: number;
     fundingIntervalMs: number;
     heartbeatIntervalMs: number;
-    debugAggressiveEntry: boolean;
+    startupMode?: 'WAIT_MICRO_WARMUP';
+    symbolConfigs: SymbolCapitalConfig[];
   } | null;
   summary: {
     totalEquity: number;
@@ -49,6 +53,30 @@ interface DryRunStatus {
   };
   perSymbol: Record<string, {
     symbol: string;
+    capital?: {
+      configuredReserveUsdt: number;
+      effectiveReserveUsdt: number;
+      initialMarginUsdt: number;
+      leverage: number;
+      reserveScale: number;
+    };
+    warmup?: {
+      bootstrapDone: boolean;
+      bootstrapBars1m: number;
+      htfReady: boolean;
+      orderflow1mReady: boolean;
+      orderflow5mReady: boolean;
+      orderflow15mReady: boolean;
+      tradeReady: boolean;
+      addonReady: boolean;
+      vetoReason: string | null;
+    };
+    trend?: {
+      state: 'UPTREND' | 'DOWNTREND' | 'PULLBACK_UP' | 'PULLBACK_DOWN' | 'RANGE' | 'EXHAUSTION_UP' | 'EXHAUSTION_DOWN';
+      confidence: number;
+      bias15m: 'UP' | 'DOWN' | 'NEUTRAL';
+      veto1h: 'NONE' | 'UP' | 'DOWN' | 'EXHAUSTION';
+    };
     metrics: {
       markPrice: number;
       totalEquity: number;
@@ -102,6 +130,7 @@ interface DryRunStatus {
     }>;
     lastEventTimestampMs: number;
     eventCount: number;
+    warnings?: string[];
   }>;
   logTail: DryRunConsoleLog[];
   alphaDecay: Array<{
@@ -166,6 +195,14 @@ const normalizeSymbolList = (values: string[]): string[] => {
   return [...unique];
 };
 
+const buildDefaultSymbolCapitalConfig = (symbol: string, sharedWalletStartUsdt: number): SymbolCapitalConfig => ({
+  symbol,
+  enabled: true,
+  walletReserveUsdt: Math.max(0, sharedWalletStartUsdt / 4),
+  initialMarginUsdt: Math.max(25, sharedWalletStartUsdt / 20),
+  leverage: 10,
+});
+
 const DryRunDashboard: React.FC = () => {
   const proxyUrl = getProxyApiBase();
   const fetchWithAuth = (url: string, init?: RequestInit) => fetch(url, withProxyApiKey(init));
@@ -179,11 +216,9 @@ const DryRunDashboard: React.FC = () => {
   const [actionError, setActionError] = useState<string | null>(null);
   const [status, setStatus] = useState<DryRunStatus>(DEFAULT_STATUS);
 
-  const [startBalance, setStartBalance] = useState('5000');
-  const [initialMargin, setInitialMargin] = useState('200');
-  const [leverage, setLeverage] = useState('10');
+  const [sharedWalletStart, setSharedWalletStart] = useState('5000');
+  const [pairConfigs, setPairConfigs] = useState<Record<string, SymbolCapitalConfig>>({});
   const [heartbeatSec, setHeartbeatSec] = useState('10');
-  const [debugAggressiveEntry, setDebugAggressiveEntry] = useState(true);
   const [isRefreshingPositions, setIsRefreshingPositions] = useState(false);
   const [telemetryWsStatus, setTelemetryWsStatus] = useState<TelemetrySocketStatus>('connecting');
 
@@ -193,6 +228,10 @@ const DryRunDashboard: React.FC = () => {
     const source = status.running && status.symbols.length > 0 ? status.symbols : selectedPairs;
     return normalizeSymbolList(source);
   }, [status.running, status.symbols, selectedPairs]);
+  const configuredRows = useMemo(() => {
+    const wallet = Math.max(0, Number(sharedWalletStart) || 0);
+    return selectedPairs.map((symbol) => pairConfigs[symbol] || buildDefaultSymbolCapitalConfig(symbol, wallet));
+  }, [pairConfigs, selectedPairs, sharedWalletStart]);
   const marketData = useTelemetrySocket(activeMetricSymbols, setTelemetryWsStatus);
 
   useEffect(() => {
@@ -255,6 +294,27 @@ const DryRunDashboard: React.FC = () => {
   }, [proxyUrl]);
 
   useEffect(() => {
+    const wallet = Math.max(0, Number(sharedWalletStart) || 0);
+    setPairConfigs((prev) => {
+      const next = { ...prev };
+      let changed = false;
+      for (const symbol of selectedPairs) {
+        if (!next[symbol]) {
+          next[symbol] = buildDefaultSymbolCapitalConfig(symbol, wallet);
+          changed = true;
+        }
+      }
+      for (const symbol of Object.keys(next)) {
+        if (!selectedPairs.includes(symbol)) {
+          delete next[symbol];
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [selectedPairs, sharedWalletStart]);
+
+  useEffect(() => {
     let active = true;
 
     const poll = async () => {
@@ -270,11 +330,16 @@ const DryRunDashboard: React.FC = () => {
             setSelectedPairs(normalized);
             setTestOrderSymbol(normalized[0]);
           } else if (!next.running && next.config) {
-            setStartBalance(String(next.config.walletBalanceStartUsdt));
-            setInitialMargin(String(next.config.initialMarginUsdt));
-            setLeverage(String(next.config.leverage));
+            setSharedWalletStart(String(next.config.sharedWalletStartUsdt));
             setHeartbeatSec(String(Math.max(1, Math.round(next.config.heartbeatIntervalMs / 1000))));
-            setDebugAggressiveEntry(Boolean(next.config.debugAggressiveEntry));
+            const nextConfigs: Record<string, SymbolCapitalConfig> = {};
+            for (const config of next.config.symbolConfigs || []) {
+              nextConfigs[config.symbol] = config;
+            }
+            if (Object.keys(nextConfigs).length > 0) {
+              setPairConfigs(nextConfigs);
+              setSelectedPairs(Object.keys(nextConfigs));
+            }
           }
         }
       } catch {
@@ -312,6 +377,18 @@ const DryRunDashboard: React.FC = () => {
     });
   };
 
+  const updatePairConfig = (symbol: string, patch: Partial<SymbolCapitalConfig>) => {
+    const wallet = Math.max(0, Number(sharedWalletStart) || 0);
+    setPairConfigs((prev) => ({
+      ...prev,
+      [symbol]: {
+        ...(prev[symbol] || buildDefaultSymbolCapitalConfig(symbol, wallet)),
+        ...patch,
+        symbol,
+      },
+    }));
+  };
+
   const startDryRun = async () => {
     setActionError(null);
     try {
@@ -323,11 +400,10 @@ const DryRunDashboard: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           symbols: selectedPairs,
-          walletBalanceStartUsdt: Number(startBalance),
-          initialMarginUsdt: Number(initialMargin),
-          leverage: Number(leverage),
+          sharedWalletStartUsdt: Number(sharedWalletStart),
+          symbolConfigs: configuredRows,
           heartbeatIntervalMs: Math.max(1000, Number(heartbeatSec) * 1000),
-          debugAggressiveEntry,
+          startupMode: 'WAIT_MICRO_WARMUP',
         }),
       });
       const data = await res.json();
@@ -408,6 +484,31 @@ const DryRunDashboard: React.FC = () => {
   const perf = summary.performance || DEFAULT_STATUS.summary.performance!;
   const marginHealthPct = summary.marginHealth * 100;
   const symbolRows = useMemo(() => Object.values(status.perSymbol), [status.perSymbol]);
+  const configuredReserveTotal = useMemo(
+    () => configuredRows.reduce((sum, row) => sum + Math.max(0, Number(row.walletReserveUsdt || 0)), 0),
+    [configuredRows],
+  );
+  const sharedWalletNumeric = Math.max(0, Number(sharedWalletStart) || 0);
+  const reserveScalePreview = configuredReserveTotal > 0 && configuredReserveTotal > sharedWalletNumeric
+    ? sharedWalletNumeric / configuredReserveTotal
+    : 1;
+  const pairRuntime = useMemo(() => {
+    const next: Record<string, {
+      capital?: DryRunStatus['perSymbol'][string]['capital'];
+      warmup?: DryRunStatus['perSymbol'][string]['warmup'];
+      trend?: DryRunStatus['perSymbol'][string]['trend'];
+      warnings?: string[];
+    }> = {};
+    Object.entries(status.perSymbol).forEach(([symbol, row]) => {
+      next[symbol] = {
+        capital: row.capital,
+        warmup: row.warmup,
+        trend: row.trend,
+        warnings: row.warnings,
+      };
+    });
+    return next;
+  }, [status.perSymbol]);
   const resolvedMarketData = useMemo(() => {
     const next: Record<string, MetricsMessage> = {};
 
@@ -578,40 +679,15 @@ const DryRunDashboard: React.FC = () => {
             )}
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <label className="text-xs text-zinc-500">
-              Start Balance (USDT)
+              Shared Wallet Start (USDT)
               <input
                 type="number"
                 min={1}
-                value={startBalance}
+                value={sharedWalletStart}
                 disabled={status.running}
-                onChange={(e) => setStartBalance(e.target.value)}
-                className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm font-mono"
-              />
-            </label>
-
-            <label className="text-xs text-zinc-500">
-              Initial Margin (USDT)
-              <input
-                type="number"
-                min={1}
-                value={initialMargin}
-                disabled={status.running}
-                onChange={(e) => setInitialMargin(e.target.value)}
-                className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm font-mono"
-              />
-            </label>
-
-            <label className="text-xs text-zinc-500">
-              Leverage
-              <input
-                type="number"
-                min={1}
-                max={125}
-                value={leverage}
-                disabled={status.running}
-                onChange={(e) => setLeverage(e.target.value)}
+                onChange={(e) => setSharedWalletStart(e.target.value)}
                 className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm font-mono"
               />
             </label>
@@ -627,17 +703,24 @@ const DryRunDashboard: React.FC = () => {
                 className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm font-mono"
               />
             </label>
-
-            <label className="text-xs text-zinc-500 flex items-center gap-2 pt-6">
-              <input
-                type="checkbox"
-                checked={debugAggressiveEntry}
-                disabled={status.running}
-                onChange={(e) => setDebugAggressiveEntry(e.target.checked)}
-              />
-              Aggressive Entry
-            </label>
           </div>
+
+          <div className={`rounded border px-3 py-2 text-xs ${
+            configuredReserveTotal > sharedWalletNumeric
+              ? 'border-amber-800 bg-amber-950/30 text-amber-300'
+              : 'border-zinc-800 bg-zinc-950/40 text-zinc-400'
+          }`}>
+            <div>Configured reserve: {formatNum(configuredReserveTotal, 2)} USDT</div>
+            <div>Preview reserve scale: {formatNum(reserveScalePreview, 4)}</div>
+            <div>Startup mode: WAIT_MICRO_WARMUP</div>
+          </div>
+
+          <PairCapitalTable
+            rows={configuredRows}
+            runtime={pairRuntime}
+            readOnly={status.running}
+            onChange={updatePairConfig}
+          />
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
             <button

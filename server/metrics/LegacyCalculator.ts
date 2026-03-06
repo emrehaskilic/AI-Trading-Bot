@@ -296,23 +296,20 @@ export class LegacyCalculator {
      */
     computeMetrics(ob: OrderbookState, referenceTimestamp?: number) {
         // [P0-FIX-25] Sanitize orderbook inputs
-        const sanitizeMap = (map: Map<number, number>): Map<number, number> => {
-            const result = new Map<number, number>();
-            for (const [k, v] of map.entries()) {
+        const sanitizeLevels = (levels: [number, number][]): [number, number][] => {
+            const result: [number, number][] = [];
+            for (const [k, v] of levels) {
                 const key = sanitizeFinite(k, 0);
                 const val = sanitizeFinite(v, 0);
                 if (key > 0 && val > 0) {
-                    result.set(key, val);
+                    result.push([key, val]);
                 }
             }
             return result;
         };
 
-        const bids = sanitizeMap(ob.bids);
-        const asks = sanitizeMap(ob.asks);
-
-        const sortedBids = Array.from(bids.entries()).sort((a, b) => b[0] - a[0]);
-        const sortedAsks = Array.from(asks.entries()).sort((a, b) => a[0] - b[0]);
+        const sortedBids = sanitizeLevels(ob.bids).sort((a, b) => b[0] - a[0]);
+        const sortedAsks = sanitizeLevels(ob.asks).sort((a, b) => a[0] - b[0]);
         
         const sumTop = (levels: Array<[number, number]>, depth: number): number => {
             let vol = 0;
@@ -329,6 +326,8 @@ export class LegacyCalculator {
         const rawObiWeighted = bidVol10 - askVol10;
         const denomWeighted = bidVol10 + askVol10;
         // [P0-FIX-26] Consistent EPSILON comparison
+        // [P0-FIX-26] Consistent EPSILON comparison
+        // OBI Weighted (Normalized) hesaplama
         const obiWeighted = denomWeighted >= EPSILON 
             ? sanitizeFinite(rawObiWeighted / denomWeighted, 0) 
             : 0;
@@ -338,11 +337,14 @@ export class LegacyCalculator {
         const askVol50 = sumTop(sortedAsks, 50);
         const rawObiDeep = bidVol50 - askVol50;
         const denomDeep = bidVol50 + askVol50;
+        // [P0-FIX-26] Consistent EPSILON comparison
+        // OBI Deep Book (Normalized) hesaplama
         const obiDeep = denomDeep >= EPSILON 
             ? sanitizeFinite(rawObiDeep / denomDeep, 0) 
             : 0;
 
         // --- C) OBI Divergence ---
+        // OBI Divergence hesaplama
         const obiDivergence = sanitizeFinite(obiWeighted - obiDeep, 0);
 
         // [P0-FIX-27] Deterministic refTime - no Date.now() fallback
@@ -374,12 +376,15 @@ export class LegacyCalculator {
         if (this.deltaHistory.length >= 5) {
             const { std, mean } = calculateStdDevDeterministic(this.deltaHistory);
             // [P0-FIX-29] Explicit zero variance guard
+            // Delta Z-Score hesaplama
             deltaZ = std >= EPSILON 
                 ? sanitizeFinite((delta1s - mean) / std, 0) 
                 : 0;
         }
 
         // CVD slope: simple linear regression
+        // CVD slope: simple linear regression
+        // CVD Slope hesaplama
         const cvdSlope = this.calculateSlope(this.cvdHistory);
 
         // [P0-FIX-30] VWAP with deterministic fallback

@@ -1,8 +1,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { TelemetrySocketStatus, useTelemetrySocket } from '../services/useTelemetrySocket';
 import { MetricsState, MetricsMessage } from '../types/metrics';
+import PairCapitalTable from './PairCapitalTable';
 import SymbolRow from './SymbolRow';
 import MobileSymbolCard from './MobileSymbolCard';
+import { SymbolCapitalConfig } from '../api/types';
 import { isViewerModeEnabled, withProxyApiKey } from '../services/proxyAuth';
 import { getProxyApiBase } from '../services/proxyBase';
 
@@ -18,9 +20,15 @@ interface ExecutionStatus {
   };
   selectedSymbols: string[];
   settings: {
-    leverage: number;
+    leverage?: number;
+    reserveScale?: number;
+    totalConfiguredReserveUsdt?: number;
+    totalEffectiveReserveUsdt?: number;
     totalMarginBudgetUsdt: number;
+    symbolConfigs?: SymbolCapitalConfig[];
     pairInitialMargins: Record<string, number>;
+    pairWalletReserves?: Record<string, number>;
+    pairLeverageCaps?: Record<string, number>;
   };
   wallet: {
     totalWalletUsdt: number;
@@ -42,8 +50,8 @@ const defaultExecutionStatus: ExecutionStatus = {
   },
   selectedSymbols: [],
   settings: {
-    leverage: 10,
     totalMarginBudgetUsdt: 0,
+    symbolConfigs: [],
     pairInitialMargins: {},
   },
   wallet: {
@@ -58,6 +66,14 @@ const defaultExecutionStatus: ExecutionStatus = {
 
 const formatNum = (n: number, d = 2) => n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
 
+const buildDefaultSymbolCapitalConfig = (symbol: string, totalWalletUsdt: number): SymbolCapitalConfig => ({
+  symbol,
+  enabled: true,
+  walletReserveUsdt: Math.max(0, totalWalletUsdt / 4),
+  initialMarginUsdt: Math.max(25, totalWalletUsdt / 20),
+  leverage: 10,
+});
+
 export const Dashboard: React.FC = () => {
   const readOnlyViewer = useMemo(() => isViewerModeEnabled(), []);
   const [selectedPairs, setSelectedPairs] = useState<string[]>(['BTCUSDT']);
@@ -71,8 +87,7 @@ export const Dashboard: React.FC = () => {
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
   const [executionStatus, setExecutionStatus] = useState<ExecutionStatus>(defaultExecutionStatus);
-  const [leverageInput, setLeverageInput] = useState('10');
-  const [pairMarginInputs, setPairMarginInputs] = useState<Record<string, string>>({});
+  const [pairConfigs, setPairConfigs] = useState<Record<string, SymbolCapitalConfig>>({});
   const [settingsDirty, setSettingsDirty] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [settingsSavedAt, setSettingsSavedAt] = useState(0);
@@ -160,32 +175,47 @@ export const Dashboard: React.FC = () => {
 
   useEffect(() => {
     if (settingsDirty) return;
-    setLeverageInput(String(executionStatus.settings?.leverage || 1));
-    const syncedMargins: Record<string, string> = {};
-    Object.entries(executionStatus.settings?.pairInitialMargins || {}).forEach(([symbol, margin]) => {
-      syncedMargins[symbol] = String(margin);
-    });
-    setPairMarginInputs(syncedMargins);
-  }, [executionStatus, settingsDirty]);
+    const nextConfigs: Record<string, SymbolCapitalConfig> = {};
+    for (const config of executionStatus.settings?.symbolConfigs || []) {
+      nextConfigs[config.symbol] = config;
+    }
+    if (Object.keys(nextConfigs).length === 0) {
+      const leverage = Number(executionStatus.settings?.leverage || 10);
+      const reserves = executionStatus.settings?.pairWalletReserves || {};
+      const margins = executionStatus.settings?.pairInitialMargins || {};
+      for (const symbol of selectedPairs) {
+        nextConfigs[symbol] = {
+          symbol,
+          enabled: true,
+          walletReserveUsdt: Number(reserves[symbol] || margins[symbol] || 0),
+          initialMarginUsdt: Number(margins[symbol] || 0),
+          leverage,
+        };
+      }
+    }
+    setPairConfigs(nextConfigs);
+  }, [executionStatus, selectedPairs, settingsDirty]);
 
   useEffect(() => {
-    setPairMarginInputs((prev) => {
+    setPairConfigs((prev) => {
       const next = { ...prev };
       let changed = false;
-      const defaultMargin = selectedPairs.length > 0 && executionStatus.wallet.totalWalletUsdt > 0
-        ? executionStatus.wallet.totalWalletUsdt / selectedPairs.length
-        : 0;
-
-      selectedPairs.forEach((symbol) => {
-        if (typeof next[symbol] === 'undefined') {
-          next[symbol] = defaultMargin > 0 ? defaultMargin.toFixed(2) : '';
+      const wallet = Math.max(0, executionStatus.wallet.totalWalletUsdt || 0);
+      for (const symbol of selectedPairs) {
+        if (!next[symbol]) {
+          next[symbol] = buildDefaultSymbolCapitalConfig(symbol, wallet);
           changed = true;
         }
-      });
-
+      }
+      for (const symbol of Object.keys(next)) {
+        if (!selectedPairs.includes(symbol)) {
+          delete next[symbol];
+          changed = true;
+        }
+      }
       return changed ? next : prev;
     });
-  }, [selectedPairs, executionStatus.wallet.totalWalletUsdt]);
+  }, [executionStatus.wallet.totalWalletUsdt, selectedPairs]);
 
   useEffect(() => {
     if (readOnlyViewer) return;
@@ -212,6 +242,20 @@ export const Dashboard: React.FC = () => {
     } else {
       setSelectedPairs([...selectedPairs, pair]);
     }
+    setSettingsDirty(true);
+  };
+
+  const updatePairConfig = (symbol: string, patch: Partial<SymbolCapitalConfig>) => {
+    const wallet = Math.max(0, executionStatus.wallet.totalWalletUsdt || 0);
+    setPairConfigs((prev) => ({
+      ...prev,
+      [symbol]: {
+        ...(prev[symbol] || buildDefaultSymbolCapitalConfig(symbol, wallet)),
+        ...patch,
+        symbol,
+      },
+    }));
+    setSettingsDirty(true);
   };
 
   const connectTestnet = async () => {
@@ -283,21 +327,11 @@ export const Dashboard: React.FC = () => {
     if (readOnlyViewer) return;
     setSettingsError(null);
     try {
-      const parsedLeverage = Number(leverageInput);
-      const pairInitialMargins: Record<string, number> = {};
-      selectedPairs.forEach((symbol) => {
-        const margin = Number(pairMarginInputs[symbol]);
-        if (Number.isFinite(margin) && margin > 0) {
-          pairInitialMargins[symbol] = margin;
-        }
-      });
-
       const res = await fetchWithAuth(`${proxyUrl}/api/execution/settings`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          leverage: parsedLeverage,
-          pairInitialMargins,
+          symbolConfigs: selectedPairs.map((symbol) => pairConfigs[symbol] || buildDefaultSymbolCapitalConfig(symbol, executionStatus.wallet.totalWalletUsdt)),
         }),
       });
       const data = await res.json();
@@ -312,12 +346,31 @@ export const Dashboard: React.FC = () => {
     }
   };
 
+  const configuredRows = useMemo(() => {
+    const wallet = Math.max(0, executionStatus.wallet.totalWalletUsdt || 0);
+    return selectedPairs.map((symbol) => pairConfigs[symbol] || buildDefaultSymbolCapitalConfig(symbol, wallet));
+  }, [executionStatus.wallet.totalWalletUsdt, pairConfigs, selectedPairs]);
   const totalMarginBudgetUsdt = executionStatus.wallet.totalWalletUsdt;
-  const allocatedInitialMarginUsdt = selectedPairs.reduce((sum, symbol) => {
-    const margin = Number(pairMarginInputs[symbol]);
-    return sum + (Number.isFinite(margin) && margin > 0 ? margin : 0);
+  const allocatedInitialMarginUsdt = configuredRows.reduce((sum, row) => {
+    return sum + (Number.isFinite(row.initialMarginUsdt) && row.initialMarginUsdt > 0 ? row.initialMarginUsdt : 0);
   }, 0);
-  const remainingMarginUsdt = totalMarginBudgetUsdt - allocatedInitialMarginUsdt;
+  const configuredReserveUsdt = configuredRows.reduce((sum, row) => sum + Math.max(0, Number(row.walletReserveUsdt || 0)), 0);
+  const remainingMarginUsdt = totalMarginBudgetUsdt - configuredReserveUsdt;
+  const runtimeRows = useMemo(() => {
+    const next: Record<string, any> = {};
+    for (const config of executionStatus.settings?.symbolConfigs || []) {
+      next[config.symbol] = {
+        capital: {
+          configuredReserveUsdt: config.walletReserveUsdt,
+          effectiveReserveUsdt: config.walletReserveUsdt * Number(executionStatus.settings?.reserveScale || 1),
+          initialMarginUsdt: config.initialMarginUsdt,
+          leverage: config.leverage,
+          reserveScale: Number(executionStatus.settings?.reserveScale || 1),
+        },
+      };
+    }
+    return next;
+  }, [executionStatus.settings]);
 
   const latestTelemetryTs = activeSymbols.reduce((maxTs, symbol) => {
     const msg = marketData[symbol];
@@ -500,31 +553,36 @@ export const Dashboard: React.FC = () => {
               <h3 className="text-xs font-semibold text-zinc-300">Capital Settings</h3>
 
               <div className="grid grid-cols-2 gap-y-2 text-xs">
-                <div className="text-zinc-500">Total Margin Budget</div>
+                <div className="text-zinc-500">Shared Wallet</div>
                 <div className="text-right font-mono text-white">{formatNum(totalMarginBudgetUsdt)} USDT</div>
-                <div className="text-zinc-500">Allocated Initial Margin</div>
+                <div className="text-zinc-500">Configured Seed Margin</div>
                 <div className="text-right font-mono">{formatNum(allocatedInitialMarginUsdt)} USDT</div>
-                <div className="text-zinc-500">Remaining</div>
+                <div className="text-zinc-500">Configured Reserve</div>
+                <div className="text-right font-mono">{formatNum(configuredReserveUsdt)} USDT</div>
+                <div className="text-zinc-500">Reserve Remaining</div>
                 <div className={`text-right font-mono ${remainingMarginUsdt >= 0 ? 'text-zinc-300' : 'text-red-400'}`}>
                   {formatNum(remainingMarginUsdt)} USDT
                 </div>
               </div>
 
-              <div className="grid grid-cols-[1fr_auto] gap-2 items-end">
-                <label className="text-xs text-zinc-500">
-                  Leverage
-                  <input
-                    type="number"
-                    min={1}
-                    value={leverageInput}
-                    disabled={readOnlyViewer}
-                    onChange={(e) => {
-                      setLeverageInput(e.target.value);
-                      setSettingsDirty(true);
-                    }}
-                    className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-sm font-mono"
+              <div className={`rounded border px-3 py-2 text-xs ${
+                configuredReserveUsdt > totalMarginBudgetUsdt
+                  ? 'border-amber-800 bg-amber-950/30 text-amber-300'
+                  : 'border-zinc-800 bg-zinc-950/40 text-zinc-400'
+              }`}>
+                <div>Runtime reserve scale: {formatNum(Number(executionStatus.settings?.reserveScale || 1), 4)}</div>
+                <div>User-selected symbols only. Execution uses per-symbol leverage caps and reserves.</div>
+              </div>
+
+              <div className="grid grid-cols-[1fr_auto] gap-2 items-start">
+                <div className="min-w-0">
+                  <PairCapitalTable
+                    rows={configuredRows}
+                    runtime={runtimeRows}
+                    readOnly={readOnlyViewer}
+                    onChange={updatePairConfig}
                   />
-                </label>
+                </div>
                 <button
                   disabled={readOnlyViewer}
                   onClick={applyExecutionSettings}
@@ -532,32 +590,6 @@ export const Dashboard: React.FC = () => {
                 >
                   APPLY
                 </button>
-              </div>
-
-              <div className="space-y-2">
-                <div className="text-xs text-zinc-500">Initial Margin per Selected Pair</div>
-                {selectedPairs.length === 0 && (
-                  <div className="text-[11px] text-zinc-600 italic">Select at least one pair.</div>
-                )}
-                {selectedPairs.map((symbol) => (
-                  <div key={symbol} className="grid grid-cols-[90px_1fr] gap-2 items-center">
-                    <div className="text-[11px] text-zinc-400 font-mono">{symbol}</div>
-                    <input
-                      type="number"
-                      min={0}
-                      step="0.01"
-                      value={pairMarginInputs[symbol] ?? ''}
-                      disabled={readOnlyViewer}
-                      onChange={(e) => {
-                        const value = e.target.value;
-                        setPairMarginInputs((prev) => ({ ...prev, [symbol]: value }));
-                        setSettingsDirty(true);
-                      }}
-                      className="bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-sm font-mono"
-                      placeholder="USDT"
-                    />
-                  </div>
-                ))}
               </div>
 
               {settingsError && (

@@ -157,16 +157,16 @@ export class AntiSpoofGuard {
    * Calculate OBI with spoof-aware weighting
    */
   calculateOBI(
-    bids: Map<number, number>,
-    asks: Map<number, number>,
+    bids: Map<number, number> | [number, number][],
+    asks: Map<number, number> | [number, number][],
     depth: number,
     nowMs: number
   ): { obi: number; obiWeighted: number; spoofAdjusted: boolean } {
-    const bidEntries = Array.from(bids.entries())
+    const bidEntries = Array.from(Array.isArray(bids) ? bids : bids.entries())
       .sort((a, b) => b[0] - a[0])
       .slice(0, depth);
     
-    const askEntries = Array.from(asks.entries())
+    const askEntries = Array.from(Array.isArray(asks) ? asks : asks.entries())
       .sort((a, b) => a[0] - b[0])
       .slice(0, depth);
 
@@ -368,6 +368,10 @@ export class AntiSpoofGuardRegistry {
       status[symbol] = guard.getStatus(nowMs);
     }
     return status;
+  }
+
+  getGuardMap(): Map<string, AntiSpoofGuard> {
+    return this.guards;
   }
 }
 

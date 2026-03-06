@@ -234,108 +234,6 @@ export interface BootstrapMetrics {
   doneAtMs: number | null;
 }
 
-export interface OrchestratorV1GateMetrics {
-  passed: boolean;
-  reason: string | null;
-  checks: Record<string, boolean>;
-}
-
-export interface OrchestratorV1OrderMetrics {
-  id: string;
-  kind: 'MAKER' | 'TAKER_ENTRY_FALLBACK' | 'TAKER_RISK_EXIT';
-  side: 'BUY' | 'SELL';
-  qty: number;
-  notionalPct: number;
-  price: number | null;
-  postOnly: boolean;
-  ttlMs: number;
-  repriceMs: number;
-  maxReprices: number;
-  repriceAttempt: number;
-  role: 'ENTRY_L1' | 'ENTRY_L2' | 'ENTRY_FALLBACK' | 'ADD_1' | 'ADD_2' | 'EXIT_RISK_MAKER' | 'EXIT_RISK_TAKER';
-}
-
-export interface OrchestratorV1Metrics {
-  intent: 'HOLD' | 'ENTRY' | 'ADD' | 'EXIT_RISK';
-  side: 'BUY' | 'SELL' | null;
-  readiness: {
-    ready: boolean;
-    reasons: string[];
-  };
-  gateA: OrchestratorV1GateMetrics;
-  gateB: OrchestratorV1GateMetrics;
-  gateC: OrchestratorV1GateMetrics;
-  allGatesPassed: boolean;
-  impulse: {
-    passed: boolean;
-    checks: {
-      printsPerSecond: boolean;
-      deltaZ: boolean;
-      spread: boolean;
-    };
-  };
-  add: {
-    triggered: boolean;
-    step: 1 | 2 | null;
-    gatePassed: boolean;
-    rateLimitPassed: boolean;
-    thresholdPrice: number | null;
-  };
-  exitRisk: {
-    triggered: boolean;
-    triggeredThisTick: boolean;
-    reason: 'REGIME' | 'FLOW_FLIP' | 'INTEGRITY' | null;
-    makerAttemptsUsed: number;
-    takerUsed: boolean;
-  };
-  position: {
-    isOpen: boolean;
-    qty: number;
-    entryVwap: number | null;
-    baseQty: number;
-    addsUsed: number;
-    lastAddTs: number | null;
-    cooldownUntilTs: number;
-    atr3m: number;
-    atrSource: 'MICRO_ATR' | 'BACKFILL_ATR' | 'UNKNOWN';
-  };
-  orders: OrchestratorV1OrderMetrics[];
-  chase: {
-    active: boolean;
-    startedAtMs: number | null;
-    expiresAtMs: number | null;
-    repriceMs: number;
-    maxReprices: number;
-    repricesUsed: number;
-    chaseMaxSeconds: number;
-    ttlMs: number;
-  };
-  telemetry: {
-    sideFlipCount5m: number;
-    sideFlipPerMin: number;
-    allGatesTrueCount5m: number;
-    entryIntentCount5m: number;
-    smoothed: {
-      deltaZ: number;
-      cvdSlope: number;
-      obiWeighted: number;
-    };
-    hysteresis: {
-      confirmCountLong: number;
-      confirmCountShort: number;
-      entryConfirmCount: number;
-    };
-  };
-  debug?: {
-    blockReason: string;
-    gateA: boolean;
-    gateB: boolean;
-    gateC: boolean;
-    impulse: boolean;
-    chaseActive: boolean;
-  };
-}
-
 /**
  * The structure of a single ``metrics`` message from the server.
  * Each message contains data for one symbol.  The UI should not
@@ -388,7 +286,6 @@ export interface MetricsMessage {
   sessionVwap?: SessionVwapMetrics | null;
   htf?: HtfMetrics | null;
   bootstrap?: BootstrapMetrics | null;
-  orchestratorV1?: OrchestratorV1Metrics | null;
   enableCrossMarketConfirmation?: boolean;
   bids: [number, number, number][];
   asks: [number, number, number][];

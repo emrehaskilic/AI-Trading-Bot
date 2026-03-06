@@ -74,6 +74,8 @@ export class AddOnManager {
         ttlMs: this.config.ttlMs,
         reasonCode: 'ADDON_MAKER',
         addonIndex: params.addonIndex,
+        minFillRatio: 0.25,
+        cancelOnMinFillMiss: true,
       },
     };
   }

@@ -39,6 +39,173 @@ export function runTests() {
   const afterManual = svc.getStatus();
   assert(afterManual.logTail.some((l) => l.message.includes('Manual test order queued')), 'manual order log missing');
 
+  const partialEntrySvc = new DryRunSessionService();
+  partialEntrySvc.start({
+    symbols: ['BTCUSDT'],
+    walletBalanceStartUsdt: 5000,
+    initialMarginUsdt: 500,
+    leverage: 10,
+    fundingRate: 0,
+    debugAggressiveEntry: false,
+    heartbeatIntervalMs: 1000,
+  });
+
+  const partialBook = {
+    bids: [{ price: 99, qty: 10 }],
+    asks: [{ price: 100, qty: 1 }, { price: 101, qty: 10 }],
+  };
+  const partialSession = (partialEntrySvc as any).sessions.get('BTCUSDT');
+  partialSession.manualOrders.push({
+    side: 'BUY',
+    type: 'LIMIT',
+    qty: 3,
+    price: 100,
+    timeInForce: 'GTC',
+    reduceOnly: false,
+    reasonCode: 'STRAT_ENTRY',
+  });
+  partialEntrySvc.ingestDepthEvent({
+    symbol: 'BTCUSDT',
+    eventTimestampMs: 1_700_000_001_000,
+    orderBook: partialBook,
+    markPrice: 100,
+  });
+
+  const afterPartialEntry = partialEntrySvc.getStatus();
+  assert(afterPartialEntry.perSymbol.BTCUSDT?.openLimitOrders.length === 0, 'stale STRAT_ENTRY remainder must be canceled after first fill');
+  assert(afterPartialEntry.perSymbol.BTCUSDT?.position?.qty === 1, 'partial fill should keep only the filled entry size');
+
+  const workingOrderSvc = new DryRunSessionService();
+  workingOrderSvc.start({
+    symbols: ['BTCUSDT'],
+    walletBalanceStartUsdt: 5000,
+    initialMarginUsdt: 500,
+    leverage: 10,
+    fundingRate: 0,
+    debugAggressiveEntry: false,
+    heartbeatIntervalMs: 1000,
+  });
+  const workingSession = (workingOrderSvc as any).sessions.get('BTCUSDT');
+  workingSession.manualOrders.push({
+    side: 'BUY',
+    type: 'LIMIT',
+    qty: 1,
+    price: 99,
+    timeInForce: 'GTC',
+    reduceOnly: false,
+    reasonCode: 'STRAT_ENTRY',
+  });
+  workingOrderSvc.ingestDepthEvent({
+    symbol: 'BTCUSDT',
+    eventTimestampMs: 1_700_000_002_000,
+    orderBook: baseBook,
+    markPrice: 100.5,
+  });
+  workingOrderSvc.ingestDepthEvent({
+    symbol: 'BTCUSDT',
+    eventTimestampMs: 1_700_000_003_000,
+    orderBook: baseBook,
+    markPrice: 100.5,
+  });
+
+  const workingLogs = workingOrderSvc.getStatus().logTail.filter((l) => l.message.includes('Working limit order'));
+  assert(workingLogs.length === 1, 'unchanged working limit order must not spam duplicate NEW logs');
+
+  const adaptiveSpreadSvc = new DryRunSessionService();
+  adaptiveSpreadSvc.start({
+    symbols: ['ETHUSDT'],
+    walletBalanceStartUsdt: 5000,
+    initialMarginUsdt: 500,
+    leverage: 10,
+    fundingRate: 0,
+    heartbeatIntervalMs: 1000,
+  });
+  const adaptiveSession = (adaptiveSpreadSvc as any).sessions.get('ETHUSDT');
+  adaptiveSession.startedAtMs = 1;
+  adaptiveSession.latestMarkPrice = 2000;
+  adaptiveSession.atr = 12;
+  adaptiveSpreadSvc.updateRuntimeContext('ETHUSDT', {
+    timestampMs: 16 * 60 * 1000,
+    bootstrapDone: true,
+    bootstrapBars1m: 500,
+    htfReady: true,
+    tradeStreamActive: true,
+    trendConfidence: 0.8,
+    spreadPct: 0.0012,
+  });
+  const adaptiveStatus = adaptiveSpreadSvc.getStatus();
+  assert(adaptiveStatus.perSymbol.ETHUSDT?.warmup.tradeReady === true, 'adaptive spread gate should allow trend-trade spreads above the old hard cap');
+
+  const reduceCooldownSvc = new DryRunSessionService();
+  reduceCooldownSvc.start({
+    symbols: ['BTCUSDT'],
+    walletBalanceStartUsdt: 5000,
+    initialMarginUsdt: 500,
+    leverage: 10,
+    fundingRate: 0,
+    heartbeatIntervalMs: 1000,
+  });
+  const reduceSession = (reduceCooldownSvc as any).sessions.get('BTCUSDT');
+  reduceSession.latestMarkPrice = 100;
+  reduceSession.lastOrderBook = baseBook;
+  reduceSession.lastEntryOrAddOnTs = 1_700_000_000_000 - 300_000;
+  reduceSession.lastState = {
+    ...reduceSession.lastState,
+    walletBalance: 5000,
+    position: {
+      side: 'LONG',
+      qty: 10,
+      entryPrice: 100,
+      entryTimestampMs: 1_700_000_000_000 - 300_000,
+    },
+    openLimitOrders: [],
+    marginHealth: 1,
+  };
+  const reduceDecision = {
+    symbol: 'BTCUSDT',
+    timestampMs: 1_700_000_000_000,
+    regime: 'TR' as const,
+    dfs: 0.7,
+    dfsPercentile: 0.7,
+    volLevel: 0.5,
+    gatePassed: true,
+    reasons: ['REDUCE_SOFT' as const],
+    actions: [{
+      type: 'REDUCE' as const,
+      side: 'LONG' as const,
+      reason: 'REDUCE_SOFT' as const,
+      reducePct: 0.3,
+      expectedPrice: 100,
+    }],
+    log: {
+      timestampMs: 1_700_000_000_000,
+      symbol: 'BTCUSDT',
+      regime: 'TR' as const,
+      gate: { passed: true, reason: null, details: {} },
+      dfs: 0.7,
+      dfsPercentile: 0.7,
+      volLevel: 0.5,
+      thresholds: { longEntry: 0.8, longBreak: 0.6, shortEntry: 0.2, shortBreak: 0.4 },
+      reasons: ['REDUCE_SOFT' as const],
+      actions: [{
+        type: 'REDUCE' as const,
+        side: 'LONG' as const,
+        reason: 'REDUCE_SOFT' as const,
+        reducePct: 0.3,
+        expectedPrice: 100,
+      }],
+      stats: {},
+    },
+  };
+  const firstReduce = reduceCooldownSvc.submitStrategyDecision('BTCUSDT', reduceDecision, 1_700_000_000_000);
+  const secondReduce = reduceCooldownSvc.submitStrategyDecision('BTCUSDT', reduceDecision, 1_700_000_001_000);
+  assert(firstReduce.length === 1, 'first soft reduce should queue once');
+  assert(secondReduce.length === 0, 'rapid repeated soft reduces must be blocked by cooldown');
+
+  partialEntrySvc.stop();
+  workingOrderSvc.stop();
+  adaptiveSpreadSvc.stop();
+  reduceCooldownSvc.stop();
   const stopped = svc.stop();
   assert(stopped.running === false, 'session must stop cleanly');
 }

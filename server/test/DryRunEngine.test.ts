@@ -144,6 +144,70 @@ export function runTests() {
     assert(gapResult.state.walletBalance === 4998, 'wallet after funding gap must be exact');
   }
 
+  // Session/service can explicitly cancel stale working limits after a partial entry fill.
+  {
+    const cfg = baseConfig({
+      runId: 'run-manual-cancel-001',
+      initialMarginUsdt: 500,
+    });
+    const engine = new DryRunEngine(cfg);
+    engine.processEvent({
+      timestampMs: 1_700_002_000_000,
+      markPrice: 100,
+      orderBook: {
+        bids: [{ price: 99, qty: 10 }],
+        asks: [{ price: 100, qty: 1 }, { price: 101, qty: 10 }],
+      },
+      orders: [{ side: 'BUY', type: 'LIMIT', qty: 3, price: 100, timeInForce: 'GTC', reasonCode: 'STRAT_ENTRY' }],
+    });
+
+    const openBeforeCancel = engine.getStateSnapshot().openLimitOrders;
+    assert(openBeforeCancel.length === 1, 'partial GTC limit must remain open before cleanup');
+    assert(openBeforeCancel[0].remainingQty === 2, 'remaining entry qty must stay open before cleanup');
+
+    const canceled = engine.cancelPendingLimits(
+      1_700_002_000_500,
+      (order) => order.reasonCode === 'STRAT_ENTRY',
+      'ENTRY_REMAINDER_CANCELED'
+    );
+    assert(canceled.length === 1, 'cleanup must cancel the stale STRAT_ENTRY remainder');
+    assert(canceled[0].status === 'CANCELED', 'cleanup must return canceled status');
+    assert(engine.getStateSnapshot().openLimitOrders.length === 0, 'cleanup must remove pending limit from snapshot');
+  }
+
+  // Tiny partial fills must not open a residual trend position.
+  {
+    const cfg = baseConfig({
+      runId: 'run-min-fill-cancel-001',
+      initialMarginUsdt: 500,
+    });
+    const engine = new DryRunEngine(cfg);
+    const out = engine.processEvent({
+      timestampMs: 1_700_002_100_000,
+      markPrice: 100,
+      orderBook: {
+        bids: [{ price: 99, qty: 10 }],
+        asks: [{ price: 100, qty: 1 }, { price: 101, qty: 10 }],
+      },
+      orders: [{
+        side: 'BUY',
+        type: 'LIMIT',
+        qty: 3,
+        price: 100,
+        timeInForce: 'GTC',
+        reasonCode: 'STRAT_ENTRY',
+        minFillRatio: 0.5,
+        cancelOnMinFillMiss: true,
+      }],
+    });
+
+    const minFillMiss = out.log.orderResults[0];
+    assert(minFillMiss.status === 'CANCELED', 'tiny partial entry must be canceled instead of becoming a live position');
+    assert(minFillMiss.filledQty === 0, 'tiny partial entry must not apply any fill');
+    assert(out.state.position === null, 'tiny partial entry must not open a residual position');
+    assert(out.state.openLimitOrders.length === 0, 'tiny partial entry must not remain as a working order');
+  }
+
   // Upstream guard: non-mainnet upstream must hard-fail.
   {
     let threw = false;

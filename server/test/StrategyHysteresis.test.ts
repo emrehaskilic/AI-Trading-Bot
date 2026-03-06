@@ -40,6 +40,12 @@ function baseInput(nowMs: number, overrides: Partial<StrategyInput> = {}): Strat
     },
     openInterest: null,
     absorption: { value: 0, side: null },
+    bootstrap: { backfillDone: true, barsLoaded1m: 1440 },
+    htf: {
+      m15: { close: 100, atr: 1, lastSwingHigh: 101, lastSwingLow: 99, structureBreakUp: false, structureBreakDn: false },
+      h1: { close: 100, atr: 2, lastSwingHigh: 102, lastSwingLow: 98, structureBreakUp: false, structureBreakDn: false },
+    },
+    execution: { tradeReady: true, addonReady: true, vetoReason: null },
     volatility: 0.5,
     position: null,
     ...overrides,
@@ -164,6 +170,70 @@ export function runTests() {
 
   const hasExit = exitDecision.actions.some((a) => a.type === 'EXIT' && a.reason === 'EXIT_HARD');
   assert(hasExit, 'should generate EXIT_HARD after persistent break');
+
+  const protectedFreshExit = strategy.evaluate(baseInput(now + 1500, {
+    position: {
+      side: 'LONG',
+      qty: 1,
+      entryPrice: 101,
+      unrealizedPnlPct: -0.002,
+      addsUsed: 0,
+      timeInPositionMs: 30_000,
+    },
+    market: {
+      price: 99.2,
+      vwap: 100,
+      delta1s: -2.0,
+      delta5s: -1.8,
+      deltaZ: -3.0,
+      cvdSlope: -1.2,
+      obiWeighted: -0.8,
+      obiDeep: -0.9,
+      obiDivergence: -0.3,
+    },
+    trades: {
+      lastUpdatedMs: now + 1500,
+      printsPerSecond: 6,
+      tradeCount: 25,
+      aggressiveBuyVolume: 3,
+      aggressiveSellVolume: 12,
+      consecutiveBurst: { side: 'sell', count: 6 },
+    },
+  }));
+  assert(
+    !protectedFreshExit.actions.some((a) => a.type === 'EXIT' && a.reason === 'EXIT_HARD'),
+    'fresh positions should not hard-exit on the first opposite burst unless loss override is hit'
+  );
+
+  const freshSoftReduceBlocked = strategy.evaluate(baseInput(now + 1600, {
+    position: {
+      side: 'LONG',
+      qty: 1,
+      entryPrice: 101,
+      unrealizedPnlPct: 0.01,
+      addsUsed: 0,
+      timeInPositionMs: 60_000,
+    },
+    htf: {
+      m15: { close: 99.2, atr: 1, lastSwingHigh: 100, lastSwingLow: 98.5, structureBreakUp: false, structureBreakDn: true },
+      h1: { close: 100, atr: 2, lastSwingHigh: 102, lastSwingLow: 98, structureBreakUp: false, structureBreakDn: false },
+    },
+    market: {
+      price: 99.2,
+      vwap: 100,
+      delta1s: -2.0,
+      delta5s: -1.8,
+      deltaZ: -3.0,
+      cvdSlope: -1.2,
+      obiWeighted: -0.8,
+      obiDeep: -0.9,
+      obiDivergence: -0.3,
+    },
+  }));
+  assert(
+    !freshSoftReduceBlocked.actions.some((a) => a.type === 'REDUCE' && a.reason === 'REDUCE_SOFT'),
+    'fresh profitable positions should not soft-reduce before the 3m trend leg has time to develop'
+  );
 
   // Cooldown should block immediate re-entry
   const reentryDecision = strategy.evaluate(baseInput(now + 2000, {

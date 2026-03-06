@@ -155,11 +155,22 @@ export const AnalyticsPanel = memo<AnalyticsPanelProps>(({ className = '' }) => 
           </svg>
           <span>Analytics</span>
         </h3>
-        {error && (
-          <span className="px-2 py-1 text-xs bg-red-900/40 text-red-400 rounded">
-            Error
-          </span>
-        )}
+        <div className="flex items-center space-x-2">
+          {data && !error && (
+            <span className={`px-2 py-1 text-[10px] uppercase tracking-wide rounded ${
+              data.source === 'dry_run_fallback'
+                ? 'bg-blue-900/40 text-blue-300'
+                : 'bg-zinc-800 text-zinc-400'
+            }`}>
+              {data.source === 'dry_run_fallback' ? 'Dry Run Source' : 'Analytics Engine'}
+            </span>
+          )}
+          {error && (
+            <span className="px-2 py-1 text-xs bg-red-900/40 text-red-400 rounded">
+              Error
+            </span>
+          )}
+        </div>
       </div>
 
       {data && !error && !hasTradeHistory && (

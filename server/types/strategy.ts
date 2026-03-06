@@ -148,6 +148,33 @@ export interface StrategyInput {
     value: number; // 0 or 1
     side: 'buy' | 'sell' | null;
   } | null;
+  bootstrap?: {
+    backfillDone: boolean;
+    barsLoaded1m: number;
+  } | null;
+  htf?: {
+    m15?: {
+      close: number | null;
+      atr: number | null;
+      lastSwingHigh: number | null;
+      lastSwingLow: number | null;
+      structureBreakUp: boolean;
+      structureBreakDn: boolean;
+    } | null;
+    h1?: {
+      close: number | null;
+      atr: number | null;
+      lastSwingHigh: number | null;
+      lastSwingLow: number | null;
+      structureBreakUp: boolean;
+      structureBreakDn: boolean;
+    } | null;
+  } | null;
+  execution?: {
+    tradeReady: boolean;
+    addonReady: boolean;
+    vetoReason: string | null;
+  } | null;
   volatility: number;
   position: StrategyPositionState | null;
 }
@@ -209,6 +236,11 @@ export interface StrategyConfig {
   hardRevSizeMultiplier?: number;
   mrRequireAbsorption?: boolean;
   softReduceRequireProfit?: boolean;
+  freshSoftReduceProtectS?: number;
+  softReduceCooldownS?: number;
+  freshExitProtectS?: number;
+  freshReversalProtectS?: number;
+  freshExitOverrideLossPct?: number;
 }
 
 export const defaultStrategyConfig: StrategyConfig = {
@@ -218,19 +250,28 @@ export const defaultStrategyConfig: StrategyConfig = {
   regimeLockEVTicks: Number(process.env.REGIME_LOCK_EV_TICKS || 5),
   volHighP: Number(process.env.VOL_HIGH_P || 0.8),
   volLowP: Number(process.env.VOL_LOW_P || 0.2),
-  dfsEntryLongBase: Number(process.env.DFS_ENTRY_LONG_BASE || 0.85),
-  dfsBreakLongBase: Number(process.env.DFS_BREAK_LONG_BASE || 0.55),
-  dfsEntryShortBase: Number(process.env.DFS_ENTRY_SHORT_BASE || 0.15),
-  dfsBreakShortBase: Number(process.env.DFS_BREAK_SHORT_BASE || 0.45),
-  mhtTRs: Number(process.env.MHT_TR_S || 120),
-  mhtMRs: Number(process.env.MHT_MR_S || 60),
-  mhtEVs: Number(process.env.MHT_EV_S || 10),
-  cooldownSameS: Number(process.env.COOLDOWN_SAME_S || 20),
-  cooldownFlipS: Number(process.env.COOLDOWN_FLIP_S || 120),
-  hardRevTicks: Number(process.env.HARDREV_TICKS || 8),
-  hardRevDfsP: Number(process.env.HARDREV_DFS_P || 0.10),
+  dfsEntryLongBase: Number(process.env.DFS_ENTRY_LONG_BASE || 0.9),
+  dfsBreakLongBase: Number(process.env.DFS_BREAK_LONG_BASE || 0.6),
+  dfsEntryShortBase: Number(process.env.DFS_ENTRY_SHORT_BASE || 0.1),
+  dfsBreakShortBase: Number(process.env.DFS_BREAK_SHORT_BASE || 0.4),
+  mhtTRs: Number(process.env.MHT_TR_S || 180),
+  mhtMRs: Number(process.env.MHT_MR_S || 90),
+  mhtEVs: Number(process.env.MHT_EV_S || 15),
+  cooldownSameS: Number(process.env.COOLDOWN_SAME_S || 45),
+  cooldownFlipS: Number(process.env.COOLDOWN_FLIP_S || 180),
+  hardRevTicks: Number(process.env.HARDREV_TICKS || 10),
+  hardRevDfsP: Number(process.env.HARDREV_DFS_P || 0.08),
   hardRevRequireAbsorption: String(process.env.HARDREV_REQUIRE_ABSORPTION || 'true').toLowerCase() === 'true',
-  defensiveAddEnabled: String(process.env.DEFENSIVE_ADD_ENABLED || 'true').toLowerCase() === 'true',
+  defensiveAddEnabled: String(process.env.DEFENSIVE_ADD_ENABLED || 'false').toLowerCase() === 'true',
   dryRun: String(process.env.DRY_RUN || 'true').toLowerCase() === 'true',
   addSizing: [1.0, 0.6, 0.4],
+  maxLossPct: Number(process.env.STRATEGY_MAX_LOSS_PCT || -0.012),
+  hardRevSizeMultiplier: Number(process.env.HARDREV_SIZE_MULTIPLIER || 0.5),
+  mrRequireAbsorption: String(process.env.MR_REQUIRE_ABSORPTION || 'true').toLowerCase() === 'true',
+  softReduceRequireProfit: String(process.env.SOFT_REDUCE_REQUIRE_PROFIT || 'true').toLowerCase() === 'true',
+  freshSoftReduceProtectS: Number(process.env.FRESH_SOFT_REDUCE_PROTECT_S || 180),
+  softReduceCooldownS: Number(process.env.SOFT_REDUCE_COOLDOWN_S || 180),
+  freshExitProtectS: Number(process.env.FRESH_EXIT_PROTECT_S || 90),
+  freshReversalProtectS: Number(process.env.FRESH_REVERSAL_PROTECT_S || 180),
+  freshExitOverrideLossPct: Number(process.env.FRESH_EXIT_OVERRIDE_LOSS_PCT || -0.004),
 };

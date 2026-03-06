@@ -327,6 +327,10 @@ export class DeltaBurstFilterRegistry {
     }
     return min;
   }
+
+  getFilterMap(): Map<string, DeltaBurstFilter> {
+    return this.filters;
+  }
 }
 
 export default DeltaBurstFilter;

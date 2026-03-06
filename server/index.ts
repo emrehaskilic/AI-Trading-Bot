@@ -78,20 +78,14 @@ import {
 } from './metrics/AdvancedMicrostructureMetrics';
 import { SpotReferenceMonitor, SpotReferenceMetrics } from './metrics/SpotReferenceMonitor';
 import { HtfStructureMonitor } from './metrics/HtfStructureMonitor';
-import { OrchestratorV1 } from './orchestrator_v1/OrchestratorV1';
-import { OrchestratorV1Decision, OrchestratorV1Order, OrchestratorV1Side } from './orchestrator_v1/types';
+import { SymbolCapitalConfig, materializeSymbolCapitalConfigs, normalizeSymbolCapitalConfigs } from './types/capital';
 import { AnalyticsEngine } from './analytics';
 import {
-    ExampleChopFilterStrategy,
-    ExampleMeanRevertStrategy,
-    ExampleTrendFollowStrategy,
     SignalSide as StrategySignalSide,
     type StrategySignal,
-    StrategyContextBuilder,
-    StrategyRegistry,
 } from './strategies';
-import { ConsensusEngine } from './consensus/ConsensusEngine';
 import { ResiliencePatches } from './risk/ResiliencePatches';
+import { StrategyActionType, type StrategyDecision, type StrategySide } from './types/strategy';
 import {
     metrics as observabilityMetrics,
     RiskState as TelemetryRiskState,
@@ -184,7 +178,6 @@ function parseEnvNumber(value: string | undefined, fallback: number): number {
 const EXECUTION_ENABLED_DEFAULT = parseEnvFlag(process.env.EXECUTION_ENABLED);
 let EXECUTION_ENABLED = EXECUTION_ENABLED_DEFAULT;
 const EXECUTION_ENV = 'testnet';
-let SUPER_SCALP_ENABLED = parseEnvFlag(process.env.SUPER_SCALP_ENABLED);
 const RISK_ENGINE_ENABLED = process.env.RISK_ENGINE_ENABLED == null
     ? true
     : parseEnvFlag(process.env.RISK_ENGINE_ENABLED);
@@ -442,7 +435,6 @@ function validateSymbolState(symbol: string): boolean {
     }
     return true;
 }
-const orchestratorEvalErrorTs = new Map<string, number>();
 
 // Metrics
 const timeAndSalesMap = new Map<string, TimeAndSales>();
@@ -485,18 +477,8 @@ const analyticsEngine = new AnalyticsEngine({
 const analyticsLastErrorByKind = new Map<string, number>();
 const orchestrator = createOrchestratorFromEnv(alertService);
 const dryRunSession = new DryRunSessionService(alertService);
-const orchestratorV1 = new OrchestratorV1();
-const strategyFrameworkEnabled = process.env.STRATEGY_FRAMEWORK_ENABLED == null
-    ? true
-    : parseEnvFlag(process.env.STRATEGY_FRAMEWORK_ENABLED);
-const strategyContextBuilder = new StrategyContextBuilder();
-const strategyRegistry = new StrategyRegistry();
-strategyRegistry.register(new ExampleTrendFollowStrategy());
-strategyRegistry.register(new ExampleMeanRevertStrategy());
-strategyRegistry.register(new ExampleChopFilterStrategy());
-const consensusEngine = new ConsensusEngine();
 const strategySignalsBySymbol = new Map<string, StrategySignal[]>();
-const strategyConsensusBySymbol = new Map<string, {
+type StrategyConsensusSnapshot = {
     timestampMs: number;
     side: 'LONG' | 'SHORT' | 'FLAT';
     confidence: number;
@@ -512,7 +494,35 @@ const strategyConsensusBySymbol = new Map<string, {
     };
     strategyIds: string[];
     shouldTrade: boolean;
-}>();
+};
+const strategyConsensusBySymbol = new Map<string, StrategyConsensusSnapshot>();
+const strategyApiConsensusEngine = {
+    evaluate: (_signals: StrategySignal[], _riskState: RiskState, timestamp: number): StrategyConsensusSnapshot => ({
+        timestampMs: timestamp,
+        side: 'FLAT',
+        confidence: 0,
+        quorumMet: true,
+        riskGatePassed: false,
+        contributingStrategies: 1,
+        totalStrategies: 1,
+        vetoApplied: false,
+        breakdown: {
+            long: { count: 0, avgConfidence: 0 },
+            short: { count: 0, avgConfidence: 0 },
+            flat: { count: 1, avgConfidence: 0 },
+        },
+        strategyIds: ['new-strategy-v11'],
+        shouldTrade: false,
+    }),
+    getConfig: () => ({
+        minQuorumSize: 1,
+        minConfidenceThreshold: 0,
+        maxSignalAgeMs: 15_000,
+        minActionConfidence: 0.5,
+        longWeight: 1,
+        shortWeight: 1,
+    }),
+};
 const resilienceGuardActions: ResilienceGuardAction[] = [];
 const resilienceActionDedupMap = new Map<string, number>();
 const resilienceTriggerCounters = {
@@ -531,6 +541,9 @@ const resiliencePatches = new ResiliencePatches({
     enableAll: RESILIENCE_PATCHES_ENABLED,
     autoKillSwitch: RESILIENCE_AUTO_KILL_SWITCH,
     autoHalt: RESILIENCE_AUTO_HALT,
+    onGuardAction: (event) => {
+        trackResilience(event.reason, event.symbol || 'SYSTEM', event.action, event.timestampMs);
+    },
     latency: {
         p95ThresholdMs: RESILIENCE_LATENCY_P95_THRESHOLD_MS,
         p99ThresholdMs: RESILIENCE_LATENCY_P99_THRESHOLD_MS,
@@ -599,6 +612,45 @@ function syncObservabilityMetrics(nowMs: number): void {
     }
 }
 
+function resetDryRunRuntimeState(initialEquityUsdt?: number): void {
+    const normalizedEquity = Number(initialEquityUsdt);
+    const nextEquity = Number.isFinite(normalizedEquity) && normalizedEquity > 0
+        ? normalizedEquity
+        : RISK_ENGINE_DEFAULT_EQUITY_USDT;
+
+    analyticsEngine.reset();
+    riskEngineLastKnownEquity = nextEquity;
+    riskEngineLastRealizedPnlBySymbol.clear();
+    riskEngineLastState = null;
+    lastObservabilityPnlSyncMs = 0;
+    observabilityMetrics.setPnL(0);
+    observabilityMetrics.setPositionCount(0);
+
+    resilienceLastSideBySymbol.clear();
+    resilienceGuardActions.splice(0, resilienceGuardActions.length);
+    resilienceActionDedupMap.clear();
+    resilienceTriggerCounters.antiSpoof = 0;
+    resilienceTriggerCounters.deltaBurst = 0;
+    resilienceTriggerCounters.latencySpike = 0;
+    resilienceTriggerCounters.flashCrash = 0;
+
+    if (RISK_ENGINE_ENABLED) {
+        institutionalRiskEngine.reset();
+        institutionalRiskEngine.initialize(nextEquity);
+        riskEngineLastState = institutionalRiskEngine.getRiskState();
+        observabilityMetrics.setRiskState(toTelemetryRiskState(riskEngineLastState));
+    } else {
+        observabilityMetrics.setRiskState(TelemetryRiskState.NORMAL);
+    }
+
+    if (RESILIENCE_PATCHES_ENABLED) {
+        resiliencePatches.reset();
+        if (RISK_ENGINE_ENABLED) {
+            resiliencePatches.initialize(institutionalRiskEngine);
+        }
+    }
+}
+
 function logAnalyticsError(kind: string, symbol: string | null, error: unknown): void {
     const now = Date.now();
     const last = analyticsLastErrorByKind.get(kind) || 0;
@@ -625,7 +677,12 @@ function trackResilience(reason: string, symbol: string, action: string, timesta
     } else if (normalized.includes('delta_burst') || normalized.includes('burst')) {
         guardType = 'delta_burst';
         counterKey = 'deltaBurst';
-    } else if (normalized.includes('flash_crash') || normalized.includes('flash')) {
+    } else if (
+        normalized.includes('flash_crash')
+        || normalized.includes('flash')
+        || normalized.includes('liquidity_vacuum')
+        || normalized.includes('vacuum')
+    ) {
         guardType = 'flash_crash';
         counterKey = 'flashCrash';
         severity = 'high';
@@ -736,9 +793,8 @@ log('EXECUTION_CONFIG', {
     execEnabled: EXECUTION_ENABLED,
     killSwitch: KILL_SWITCH,
     env: EXECUTION_ENV,
-    decisionMode: 'orchestrator_v1',
+    decisionMode: 'strategy_v11',
     decisionEnabled: true,
-    superScalpEnabled: SUPER_SCALP_ENABLED,
     riskEngineEnabled: RISK_ENGINE_ENABLED,
     riskEngineDefaultEquityUsdt: RISK_ENGINE_DEFAULT_EQUITY_USDT,
     riskAutoRecoveryEnabled: Boolean(RISK_ENGINE_CONFIG.autoRecovery?.enabled),
@@ -754,280 +810,7 @@ const EXCHANGE_INFO_TTL_MS = 1000 * 60 * 60; // 1 hr
 let globalBackoffUntil = 0; // Starts at 0 to allow fresh attempts on restart
 let symbolConcurrencyLimit = Math.max(AUTO_SCALE_MIN_SYMBOLS, Number(process.env.SYMBOL_CONCURRENCY || 20));
 let autoScaleLastUpTs = 0;
-const decisionRuntimeStats = {
-    legacyDecisionCalls: 0,
-    executorEntrySkipped: 0,
-    orchestratorEvaluations: 0,
-    ordersAttempted: 0,
-    makerOrdersPlaced: 0,
-    takerOrdersPlaced: 0,
-    entryTakerNotionalPct: 0,
-    addsUsed: 0,
-    exitRiskTriggeredCount: 0,
-    gateB_fail_cvd_count: 0,
-    gateB_fail_obi_count: 0,
-    gateB_fail_deltaZ_count: 0,
-    gateA_fail_trendiness_count: 0,
-    allGatesTrue_count: 0,
-    entryCandidateCount: 0,
-    chaseStartedCount: 0,
-    chaseTimedOutCount: 0,
-    impulseTrueCount: 0,
-    fallbackEligibleCount: 0,
-    fallbackTriggeredCount: 0,
-    fallbackBlockedReasonCounts: {} as Record<string, number>,
-    makerFillsCount: 0,
-    takerFillsCount: 0,
-    positionSide: null as OrchestratorV1Side | null,
-    positionQty: 0,
-    entryVwap: null as number | null,
-    postOnlyRejectCount: 0,
-    cancelCount: 0,
-    replaceCount: 0,
-};
-
-type FallbackBlockedReason =
-    | 'NO_TIMEOUT'
-    | 'IMPULSE_FALSE'
-    | 'GATES_FALSE'
-    | 'DRYRUN_BLOCK'
-    | 'CONFIG_BLOCK'
-    | 'OTHER';
-
-const fallbackReasonPriority: FallbackBlockedReason[] = [
-    'IMPULSE_FALSE',
-    'GATES_FALSE',
-    'NO_TIMEOUT',
-    'DRYRUN_BLOCK',
-    'CONFIG_BLOCK',
-    'OTHER',
-];
-
-const orchestratorDiagState = {
-    chaseActiveBySymbol: new Map<string, boolean>(),
-    chaseExpiresAtBySymbol: new Map<string, number | null>(),
-    blockReasonCountsBySymbol: new Map<string, Record<string, number>>(),
-};
-
-function incrementCounter(map: Record<string, number>, key: string): void {
-    map[key] = Number(map[key] || 0) + 1;
-}
-
-function topFallbackBlockedReason(): string {
-    const counts = decisionRuntimeStats.fallbackBlockedReasonCounts;
-    let top = 'OTHER';
-    let max = -1;
-    for (const reason of fallbackReasonPriority) {
-        const value = Number(counts[reason] || 0);
-        if (value > max) {
-            max = value;
-            top = reason;
-        }
-    }
-    return top;
-}
-
-function deriveOrchestratorBlockReason(decision: OrchestratorV1Decision, nowMs: number): string {
-    if (!decision.readiness.ready) return 'READINESS';
-    if (!decision.gateA.passed) {
-        if (decision.gateA.checks.trendiness === false) return 'GateA.trendiness';
-        if (decision.gateA.checks.chop === false) return 'GateA.chop';
-        if (decision.gateA.checks.volOfVol === false) return 'GateA.volOfVol';
-        if (decision.gateA.checks.spread === false) return 'GateA.spread';
-        if (decision.gateA.checks.oiDrop === false) return 'GateA.oiDrop';
-        return 'GateA.other';
-    }
-    if (!decision.gateB.passed) {
-        if (decision.gateB.checks.cvd === false) return 'GateB.cvd';
-        if (decision.gateB.checks.obiSupport === false) return 'GateB.obiSupport';
-        if (decision.gateB.checks.deltaZ === false) return 'GateB.deltaZ';
-        if (decision.gateB.checks.side === false) return 'GateB.side';
-        return 'GateB.other';
-    }
-    if (!decision.gateC.passed) {
-        if (decision.gateC.checks.vwapDistance === false) return 'GateC.vwapDistance';
-        if (decision.gateC.checks.vol1m === false) return 'GateC.vol1m';
-        return 'GateC.other';
-    }
-    if (Number(decision.position?.cooldownUntilTs || 0) > nowMs) return 'COOLDOWN';
-    return 'NONE';
-}
-
-function recordSymbolBlockReason(symbol: string, blockReason: string): void {
-    const current = orchestratorDiagState.blockReasonCountsBySymbol.get(symbol) || {};
-    incrementCounter(current, blockReason);
-    orchestratorDiagState.blockReasonCountsBySymbol.set(symbol, current);
-}
-
-function updateOrchestratorDiagnostics(symbol: string, decision: OrchestratorV1Decision, nowMs: number): {
-    blockReason: string;
-    gateA: boolean;
-    gateB: boolean;
-    gateC: boolean;
-    impulse: boolean;
-    chaseActive: boolean;
-} {
-    const gateA = Boolean(decision.gateA.passed);
-    const gateB = Boolean(decision.gateB.passed);
-    const gateC = Boolean(decision.gateC.passed);
-    const impulse = Boolean(decision.impulse?.passed);
-    const chaseActive = Boolean(decision.chase?.active);
-    const entryCandidate = Boolean(decision.readiness.ready && gateA && gateB && gateC);
-
-    if (decision.gateB.checks.cvd === false) decisionRuntimeStats.gateB_fail_cvd_count += 1;
-    if (decision.gateB.checks.obiSupport === false) decisionRuntimeStats.gateB_fail_obi_count += 1;
-    if (decision.gateB.checks.deltaZ === false) decisionRuntimeStats.gateB_fail_deltaZ_count += 1;
-    if (decision.gateA.checks.trendiness === false) decisionRuntimeStats.gateA_fail_trendiness_count += 1;
-    if (decision.allGatesPassed) decisionRuntimeStats.allGatesTrue_count += 1;
-    if (entryCandidate) decisionRuntimeStats.entryCandidateCount += 1;
-    if (impulse) decisionRuntimeStats.impulseTrueCount += 1;
-
-    const prevChaseActive = Boolean(orchestratorDiagState.chaseActiveBySymbol.get(symbol));
-    const prevExpiresAt = orchestratorDiagState.chaseExpiresAtBySymbol.get(symbol) ?? null;
-
-    if (!prevChaseActive && chaseActive) {
-        decisionRuntimeStats.chaseStartedCount += 1;
-    }
-
-    const timedOutNow = prevChaseActive && !chaseActive && (
-        (Number.isFinite(Number(prevExpiresAt)) && Number(prevExpiresAt) > 0 && nowMs >= Number(prevExpiresAt))
-        || Number(decision.chase?.repricesUsed || 0) >= Number(decision.chase?.maxReprices || 0)
-    );
-    if (timedOutNow) {
-        decisionRuntimeStats.chaseTimedOutCount += 1;
-    }
-
-    const fallbackTriggered = Array.isArray(decision.orders)
-        && decision.orders.some((order) => order.kind === 'TAKER_ENTRY_FALLBACK');
-    if (fallbackTriggered) {
-        decisionRuntimeStats.fallbackTriggeredCount += 1;
-    }
-
-    const fallbackEligible = Boolean(timedOutNow && impulse && entryCandidate);
-    if (fallbackEligible) {
-        decisionRuntimeStats.fallbackEligibleCount += 1;
-    }
-
-    let fallbackBlockedReason: FallbackBlockedReason | null = null;
-    if (!fallbackTriggered) {
-        if (chaseActive && !timedOutNow) fallbackBlockedReason = 'NO_TIMEOUT';
-        else if (timedOutNow && !impulse) fallbackBlockedReason = 'IMPULSE_FALSE';
-        else if (timedOutNow && !entryCandidate) fallbackBlockedReason = 'GATES_FALSE';
-        else if (timedOutNow) fallbackBlockedReason = 'OTHER';
-    }
-    if (fallbackBlockedReason) {
-        incrementCounter(decisionRuntimeStats.fallbackBlockedReasonCounts, fallbackBlockedReason);
-    }
-
-    if (decision.position.isOpen && Number(decision.position.qty || 0) > 0) {
-        decisionRuntimeStats.positionSide = decision.side || null;
-        decisionRuntimeStats.positionQty = Number(decision.position.qty || 0);
-        decisionRuntimeStats.entryVwap = Number.isFinite(Number(decision.position.entryVwap))
-            ? Number(decision.position.entryVwap)
-            : null;
-    } else if (!decision.position.isOpen) {
-        decisionRuntimeStats.positionSide = null;
-        decisionRuntimeStats.positionQty = 0;
-        decisionRuntimeStats.entryVwap = null;
-    }
-
-    orchestratorDiagState.chaseActiveBySymbol.set(symbol, chaseActive);
-    orchestratorDiagState.chaseExpiresAtBySymbol.set(
-        symbol,
-        Number.isFinite(Number(decision.chase?.expiresAtMs)) ? Number(decision.chase?.expiresAtMs) : null
-    );
-
-    const blockReason = deriveOrchestratorBlockReason(decision, nowMs);
-    recordSymbolBlockReason(symbol, blockReason);
-    return {
-        blockReason,
-        gateA,
-        gateB,
-        gateC,
-        impulse,
-        chaseActive,
-    };
-}
-
-function computeRiskExposureFromOrders(orders: OrchestratorV1Order[], fallbackPrice: number | null): {
-    quantity: number;
-    notional: number;
-} {
-    const quantity = orders.reduce((sum, order) => sum + Math.max(0, Math.abs(Number(order.qty || 0))), 0);
-    const directNotional = orders.reduce((sum, order) => {
-        const qty = Math.max(0, Math.abs(Number(order.qty || 0)));
-        const price = Number(order.price || 0);
-        if (qty > 0 && price > 0) {
-            return sum + (qty * price);
-        }
-        return sum;
-    }, 0);
-    const notionalFromPct = orders.reduce((sum, order) => {
-        const pct = Math.max(0, Math.abs(Number(order.notionalPct || 0)));
-        return sum + ((pct / 100) * riskEngineLastKnownEquity);
-    }, 0);
-    const notionalFromFallback = quantity > 0 && Number(fallbackPrice || 0) > 0
-        ? quantity * Number(fallbackPrice)
-        : 0;
-
-    return {
-        quantity,
-        notional: Math.max(0, directNotional, notionalFromPct, notionalFromFallback),
-    };
-}
-
-function submitRiskAwareStrategyDecision(
-    symbol: string,
-    side: 'BUY' | 'SELL',
-    intent: 'ENTRY' | 'ADD',
-    timestampMs: number,
-    riskMultiplier: number,
-    expectedPrice: number | null
-): void {
-    const score = intent === 'ENTRY' ? 100 : 80;
-    const strategySide = side === 'BUY' ? 'LONG' : 'SHORT';
-    const reason = intent === 'ENTRY' ? 'ENTRY_TR' : 'STRAT_ADD';
-    const actionType = intent === 'ENTRY' ? 'ENTRY' : 'ADD';
-    const boundedMultiplier = Math.max(0, Math.min(1, Number(riskMultiplier || 1)));
-    const percentile = Math.max(0, Math.min(1, score / 100));
-
-    dryRunSession.submitStrategyDecision(symbol, {
-        symbol,
-        timestampMs,
-        regime: 'TR',
-        dfs: score,
-        dfsPercentile: percentile,
-        volLevel: 0.5,
-        gatePassed: true,
-        reasons: [reason],
-        actions: [{
-            type: actionType as any,
-            side: strategySide as any,
-            reason: reason as any,
-            expectedPrice,
-            sizeMultiplier: boundedMultiplier,
-        }],
-        log: {
-            timestampMs,
-            symbol,
-            regime: 'TR',
-            gate: { passed: true, reason: null, details: {} },
-            dfs: score,
-            dfsPercentile: percentile,
-            volLevel: 0.5,
-            thresholds: { longEntry: 0.85, longBreak: 0.55, shortEntry: 0.15, shortBreak: 0.45 },
-            reasons: [reason],
-            actions: [{
-                type: actionType as any,
-                side: strategySide as any,
-                reason: reason as any,
-                expectedPrice,
-                sizeMultiplier: boundedMultiplier,
-            }],
-            stats: {},
-        },
-    } as any, timestampMs);
-}
+const STRATEGY_ENGINE_NAME = 'NewStrategyV11';
 
 function syncRiskEngineRuntime(
     symbol: string,
@@ -1577,8 +1360,8 @@ async function fetchSnapshot(symbol: string, trigger: string, force = false) {
             snapshotLastUpdateId: data.lastUpdateId,
             bestBid: bestBid(ob),
             bestAsk: bestAsk(ob),
-            bidsCount: ob.bids.size,
-            asksCount: ob.asks.size,
+            bidsCount: ob.bids.length,
+            asksCount: ob.asks.length,
             bufferedApplied: snapshotResult.appliedCount,
             bufferedDropped: snapshotResult.droppedCount,
             gapDetected: snapshotResult.gapDetected
@@ -1915,16 +1698,6 @@ async function processDepthQueue(symbol: string) {
                 continue;
             }
 
-            if (update.U > lastUpdateId + 1) {
-                // [P0-FIX-13] Gap detected - U should be lastUpdateId + 1
-                log('DEPTH_GAP_DETECTED', { symbol, U: update.U, u: update.u, lastUpdateId, expected: lastUpdateId + 1 });
-
-                // Re-queue this update and trigger resync
-                meta.depthQueue.unshift(update);
-                requestOrderbookResync(symbol, 'sequence_gap', { U: update.U, u: update.u, lastUpdateId });
-                break;
-            }
-
             const applied = applyDepthUpdate(ob, update);
             if (!applied.ok && applied.gapDetected) {
                 log('DEPTH_DESYNC', { symbol, U: update.U, u: update.u, lastUpdateId: ob.lastUpdateId });
@@ -2092,7 +1865,7 @@ function evaluateLiveReadiness(symbol: string) {
     const now = Date.now();
 
     const snapshotFresh = meta.lastSnapshotOk > 0 && (now - meta.lastSnapshotOk) <= LIVE_SNAPSHOT_FRESH_MS;
-    const hasBook = ob.bids.size > 0 && ob.asks.size > 0;
+    const hasBook = ob.bids.length > 0 && ob.asks.length > 0;
 
     // Data Liveness: Check if depth messages are flowing within GRACE_PERIOD
     // If we just resynced, give it time (MIN_RESYNC_INTERVAL check handles throttle)
@@ -2246,7 +2019,7 @@ async function processSymbolEvent(s: string, d: any) {
         }
 
         if (dryRunSession.isTrackingSymbol(s)) {
-            const hasDepth = ob.uiState === 'LIVE' && ob.bids.size > 0 && ob.asks.size > 0;
+            const hasDepth = ob.uiState === 'LIVE' && ob.bids.length > 0 && ob.asks.length > 0;
             if (!hasDepth && Number.isFinite(p) && p > 0) {
                 const spreadBps = Number(process.env.DRY_RUN_SYNTH_SPREAD_BPS || 2);
                 const qty = Number(process.env.DRY_RUN_SYNTH_QTY || 5);
@@ -2306,6 +2079,15 @@ async function processSymbolEvent(s: string, d: any) {
         let spreadPct: number | null = null;
         let spreadRatio: number | null = null;
         let mid = p;
+        const strategyHtfSnapshot = getHtfMonitor(s).getSnapshot();
+        const strategyBootstrapState = backfillCoordinator.getState(s);
+        const strategyBootstrapSnapshot = {
+            backfillInProgress: Boolean(strategyBootstrapState.inProgress),
+            backfillDone: Boolean(strategyBootstrapState.done),
+            barsLoaded1m: Number(strategyBootstrapState.barsLoaded1m || 0),
+            startedAtMs: Number.isFinite(Number(strategyBootstrapState.startedAtMs)) ? Number(strategyBootstrapState.startedAtMs) : null,
+            doneAtMs: Number.isFinite(Number(strategyBootstrapState.doneAtMs)) ? Number(strategyBootstrapState.doneAtMs) : null,
+        };
 
         const shouldEvaluateStrategy = decisionFlowEnabled
             && (!decision || (now - meta.lastStrategyEvalTs) >= STRATEGY_EVAL_MIN_INTERVAL_MS);
@@ -2359,6 +2141,19 @@ async function processSymbolEvent(s: string, d: any) {
                 absorption: {
                     value: absVal,
                     side: absVal ? side : null,
+                },
+                bootstrap: {
+                    backfillDone: strategyBootstrapSnapshot.backfillDone,
+                    barsLoaded1m: strategyBootstrapSnapshot.barsLoaded1m,
+                },
+                htf: {
+                    m15: strategyHtfSnapshot.m15,
+                    h1: strategyHtfSnapshot.h1,
+                },
+                execution: {
+                    tradeReady: strategyBootstrapSnapshot.backfillDone,
+                    addonReady: strategyBootstrapSnapshot.backfillDone,
+                    vetoReason: strategyBootstrapSnapshot.backfillDone ? null : 'BOOTSTRAP_NOT_DONE',
                 },
                 volatility: backfill.getState().atr || 0,
                 position: dryRunSession.getStrategyPosition(s),
@@ -2452,174 +2247,109 @@ function classifyCVDState(delta: number): 'Normal' | 'High Vol' | 'Extreme' {
     return 'Normal';
 }
 
-function defaultOrchestratorDecision(symbol: string, nowMs: number): OrchestratorV1Decision {
+function normalizeExecutionSide(side: StrategySide | null | undefined): 'BUY' | 'SELL' | null {
+    if (side === 'LONG') return 'BUY';
+    if (side === 'SHORT') return 'SELL';
+    return null;
+}
+
+function deriveStrategyExecutionSide(
+    decision: StrategyDecision | null,
+    position: { side?: string | null } | null
+): 'BUY' | 'SELL' | null {
+    const actionable = Array.isArray(decision?.actions)
+        ? decision!.actions.find((action) => action.type === StrategyActionType.ENTRY || action.type === StrategyActionType.ADD)
+        : null;
+    const actionSide = normalizeExecutionSide(actionable?.side);
+    if (actionSide) return actionSide;
+    if (position?.side === 'LONG') return 'BUY';
+    if (position?.side === 'SHORT') return 'SELL';
+    return null;
+}
+
+function buildStrategyTelemetryFromDecision(
+    symbol: string,
+    decision: StrategyDecision | null,
+    position: { side?: string | null } | null,
+    price: number | null,
+    nowMs: number
+): { signals: StrategySignal[]; consensus: StrategyConsensusSnapshot } {
+    const executionSide = deriveStrategyExecutionSide(decision, position);
+    const signalSide = executionSide === 'BUY'
+        ? StrategySignalSide.LONG
+        : executionSide === 'SELL'
+            ? StrategySignalSide.SHORT
+            : StrategySignalSide.FLAT;
+    const consensusSide: StrategyConsensusSnapshot['side'] = executionSide === 'BUY'
+        ? 'LONG'
+        : executionSide === 'SELL'
+            ? 'SHORT'
+            : 'FLAT';
+    const rawConfidence = Math.max(0, Math.min(1, Number(decision?.dfsPercentile || 0)));
+    const gatePassed = Boolean(decision?.gatePassed);
+    const confidence = gatePassed ? rawConfidence : Math.min(rawConfidence, 0.25);
+    const timestampMs = Number(decision?.timestampMs || nowMs);
+    const reasons = Array.isArray(decision?.reasons) ? [...decision.reasons] : [];
+    const primaryAction = Array.isArray(decision?.actions) ? decision.actions[0] : null;
+    const signal: StrategySignal = {
+        strategyId: 'new-strategy-v11',
+        strategyName: STRATEGY_ENGINE_NAME,
+        side: signalSide,
+        confidence,
+        timestamp: timestampMs,
+        validityDurationMs: 15_000,
+        metadata: {
+            symbol,
+            price,
+            gatePassed,
+            regime: decision?.regime ?? null,
+            reason: primaryAction?.reason ?? reasons[0] ?? null,
+            actionType: primaryAction?.type ?? StrategyActionType.NOOP,
+            reasons,
+        },
+    };
+    const breakdown = {
+        long: { count: signalSide === StrategySignalSide.LONG ? 1 : 0, avgConfidence: signalSide === StrategySignalSide.LONG ? confidence : 0 },
+        short: { count: signalSide === StrategySignalSide.SHORT ? 1 : 0, avgConfidence: signalSide === StrategySignalSide.SHORT ? confidence : 0 },
+        flat: { count: signalSide === StrategySignalSide.FLAT ? 1 : 0, avgConfidence: signalSide === StrategySignalSide.FLAT ? confidence : 0 },
+    };
     return {
-        symbol,
-        timestampMs: nowMs,
-        intent: 'HOLD',
-        side: null,
-        readiness: { ready: false, reasons: ['ORCHESTRATOR_INPUT_MISSING'] },
-        gateA: { passed: false, reason: 'GATE_A_BLOCK', checks: {} },
-        gateB: { passed: false, reason: 'GATE_B_BLOCK', checks: {} },
-        gateC: { passed: false, reason: 'GATE_C_BLOCK', checks: {} },
-        allGatesPassed: false,
-        impulse: {
-            passed: false,
-            checks: {
-                printsPerSecond: false,
-                deltaZ: false,
-                spread: false,
-            },
-        },
-        add: {
-            triggered: false,
-            step: null,
-            gatePassed: false,
-            rateLimitPassed: false,
-            thresholdPrice: null,
-        },
-        exitRisk: {
-            triggered: false,
-            triggeredThisTick: false,
-            reason: null,
-            makerAttemptsUsed: 0,
-            takerUsed: false,
-        },
-        position: {
-            isOpen: false,
-            qty: 0,
-            entryVwap: null,
-            baseQty: 0,
-            addsUsed: 0,
-            lastAddTs: null,
-            cooldownUntilTs: 0,
-            atr3m: 0,
-            atrSource: 'UNKNOWN',
-        },
-        orders: [],
-        chase: {
-            active: false,
-            startedAtMs: null,
-            expiresAtMs: null,
-            repriceMs: 0,
-            maxReprices: 0,
-            repricesUsed: 0,
-            chaseMaxSeconds: 0,
-            ttlMs: 0,
-        },
-        chaseDebug: {
-            chaseActive: false,
-            chaseStartTs: null,
-            chaseElapsedMs: 0,
-            chaseAttempts: 0,
-            chaseTimedOut: false,
-            impulse: false,
-            fallbackEligible: false,
-            fallbackBlockedReason: 'NO_TIMEOUT' as const,
-        },
-        crossMarketBlockReason: null,
-        telemetry: {
-            sideFlipCount5m: 0,
-            sideFlipPerMin: 0,
-            allGatesTrueCount5m: 0,
-            entryIntentCount5m: 0,
-            smoothed: {
-                deltaZ: 0,
-                cvdSlope: 0,
-                obiWeighted: 0,
-            },
-            hysteresis: {
-                confirmCountLong: 0,
-                confirmCountShort: 0,
-                entryConfirmCount: 0,
-            },
-            chase: {
-                chaseStartedCount: 0,
-                chaseTimedOutCount: 0,
-                chaseElapsedMaxMs: 0,
-                fallbackEligibleCount: 0,
-                fallbackTriggeredCount: 0,
-                fallbackBlocked_NO_TIMEOUT: 0,
-                fallbackBlocked_IMPULSE_FALSE: 0,
-                fallbackBlocked_GATES_FALSE: 0,
-            },
-            crossMarket: {
-                crossMarketVetoCount: 0,
-                crossMarketNeutralCount: 0,
-                crossMarketAllowedCount: 0,
-                active: false,
-                mode: 'DISABLED_NO_BTC' as const,
-                disableReason: null,
-                anchorSide: 'NONE' as const,
-                anchorMode: 'NONE' as const,
-                btcHasPosition: false,
-                mismatchActive: false,
-                mismatchSinceMs: null,
-                exitTriggeredCount: 0,
-            },
-            lastExitReasonCode: null,
-            reversal: {
-                reversalAttempted: 0,
-                reversalBlocked: 0,
-                reversalConvertedToExit: 0,
-                exitOnFlipCount: 0,
-                currentPositionSide: null,
-                sideCandidate: null,
-                flipPersistenceCount: 0,
-                flipFirstDetectedMs: null,
-                minFlipIntervalMs: 0,
-                entryConfirmations: 0,
-            },
-            htf: {
-                price: 0,
-                h1SwingLow: null,
-                h1SwingHigh: null,
-                h1SBUp: false,
-                h1SBDn: false,
-                vetoed: false,
-                softBiasApplied: false,
-                reason: null,
-            },
-            superScalp: {
-                active: false,
-                m15SwingLow: null,
-                m15SwingHigh: null,
-                sweepDetected: false,
-                reclaimDetected: false,
-                sideCandidate: null,
-            },
+        signals: [signal],
+        consensus: {
+            timestampMs,
+            side: consensusSide,
+            confidence,
+            quorumMet: true,
+            riskGatePassed: gatePassed,
+            contributingStrategies: 1,
+            totalStrategies: 1,
+            vetoApplied: !gatePassed && reasons.length > 0,
+            breakdown,
+            strategyIds: [signal.strategyId],
+            shouldTrade: gatePassed && consensusSide !== 'FLAT',
         },
     };
 }
 
-function buildDecisionViewFromOrchestrator(decision: OrchestratorV1Decision) {
-    const side = decision.side === 'BUY' ? 'LONG' : (decision.side === 'SELL' ? 'SHORT' : 'NONE');
-    const signal = decision.intent === 'ENTRY'
-        ? (side === 'LONG' ? 'ENTRY_LONG' : (side === 'SHORT' ? 'ENTRY_SHORT' : 'NONE'))
-        : decision.intent === 'ADD'
-            ? (side === 'LONG' ? 'POSITION_LONG' : (side === 'SHORT' ? 'POSITION_SHORT' : 'NONE'))
-            : 'NONE';
-    const score = decision.intent === 'ENTRY'
-        ? 100
-        : decision.intent === 'ADD'
-            ? 80
-            : 0;
-    const vetoReason = decision.intent === 'HOLD'
-        ? (decision.readiness.reasons[0] || decision.gateA.reason || decision.gateB.reason || decision.gateC.reason || 'HOLD')
-        : decision.intent === 'EXIT_RISK'
-            ? (decision.exitRisk.reason || 'EXIT_RISK')
-            : decision.intent === 'EXIT_FLIP'
-                ? 'EXIT_FLIP'
-                : null;
-    const reasonTag = decision.intent === 'ENTRY'
-        ? 'ORCHESTRATOR_V1_ENTRY'
-        : decision.intent === 'ADD'
-            ? `ORCHESTRATOR_V1_ADD_${decision.add.step ?? 'NA'}`
-            : decision.intent === 'EXIT_RISK'
-                ? `ORCHESTRATOR_V1_EXIT_${decision.exitRisk.reason || 'RISK'}`
-                : decision.intent === 'EXIT_FLIP'
-                    ? 'ORCHESTRATOR_V1_EXIT_FLIP'
-                    : (decision.readiness.reasons[0] || 'ORCHESTRATOR_V1_HOLD');
+function buildSignalDisplayFromStrategyDecision(decision: StrategyDecision | null) {
+    const primaryAction = Array.isArray(decision?.actions) ? decision!.actions[0] : null;
+    const score = Math.max(0, Math.min(100, Number(decision?.dfsPercentile || 0) * 100));
+    const signal = (() => {
+        if (!primaryAction?.side) return 'NONE';
+        if (primaryAction.type === StrategyActionType.ENTRY) {
+            if (decision?.regime === 'TR') {
+                return primaryAction.side === 'LONG' ? 'TREND_LONG' : 'TREND_SHORT';
+            }
+            return primaryAction.side === 'LONG' ? 'ENTRY_LONG' : 'ENTRY_SHORT';
+        }
+        if (primaryAction.type === StrategyActionType.ADD) {
+            return primaryAction.side === 'LONG' ? 'POSITION_LONG' : 'POSITION_SHORT';
+        }
+        return 'NONE';
+    })();
+    const vetoReason = decision
+        ? (decision.gatePassed ? null : String(decision.reasons?.[0] || 'GATE_BLOCKED'))
+        : null;
 
     return {
         signalDisplay: {
@@ -2628,162 +2358,12 @@ function buildDecisionViewFromOrchestrator(decision: OrchestratorV1Decision) {
             confidence: score >= 75 ? 'HIGH' as const : score >= 50 ? 'MEDIUM' as const : 'LOW' as const,
             vetoReason,
             candidate: null,
-            regime: null,
-            dfsPercentile: null,
-            actions: decision.orders,
-            reasons: [reasonTag],
-            gatePassed: decision.allGatesPassed,
+            reasons: Array.isArray(decision?.reasons) ? [...decision!.reasons] : [],
+            gatePassed: Boolean(decision?.gatePassed),
+            regime: decision?.regime ?? null,
+            dfsPercentile: decision?.dfsPercentile ?? null,
         },
-        suppressDryRunPosition: true,
     };
-}
-
-function applyOrchestratorOrders(symbol: string, decision: OrchestratorV1Decision): void {
-    decisionRuntimeStats.addsUsed = Math.max(
-        decisionRuntimeStats.addsUsed,
-        Number(decision?.position?.addsUsed || 0)
-    );
-    if (decision.exitRisk.triggeredThisTick) {
-        decisionRuntimeStats.exitRiskTriggeredCount += 1;
-    }
-
-    const isPreTradeIntent = decision.intent === 'ENTRY' || decision.intent === 'ADD';
-    const riskMultiplier = RISK_ENGINE_ENABLED ? institutionalRiskEngine.getPositionMultiplier() : 1;
-    if (isPreTradeIntent && decision.side) {
-        observabilityMetrics.recordTradeAttempt();
-    }
-    if (RISK_ENGINE_ENABLED && isPreTradeIntent && decision.side) {
-        const currentPos = dryRunSession.getStrategyPosition(symbol);
-        const fallbackPrice = Number(currentPos?.entryPrice || decision.position?.entryVwap || 0) > 0
-            ? Number(currentPos?.entryPrice || decision.position?.entryVwap || 0)
-            : null;
-        const exposure = computeRiskExposureFromOrders(Array.isArray(decision.orders) ? decision.orders : [], fallbackPrice);
-        const checkQty = exposure.quantity > 0 ? exposure.quantity : 1;
-        const checkNotional = exposure.notional > 0 ? exposure.notional : Math.max(1, riskEngineLastKnownEquity * 0.01);
-        const direction = decision.side === 'BUY' ? 'long' as const : 'short' as const;
-        const riskCheck = institutionalRiskEngine.canTrade(symbol, checkQty, checkNotional, direction);
-        if (!riskCheck.allowed) {
-            observabilityMetrics.recordTradeRejected();
-            log('RISK_ENGINE_TRADE_REJECTED', {
-                symbol,
-                intent: decision.intent,
-                side: decision.side,
-                quantity: checkQty,
-                notional: checkNotional,
-                reason: riskCheck.reason || 'risk_rejected',
-                state: riskCheck.state,
-                guards: riskCheck.guards,
-                positionMultiplier: riskCheck.positionMultiplier,
-            });
-            return;
-        }
-    }
-
-    // Dry Run integration: forward OrchestratorV1 decisions to dryRunSession
-    const isDryRunTracked = dryRunSession.isTrackingSymbol(symbol);
-    if (isDryRunTracked && (decision.intent === 'ENTRY' || decision.intent === 'ADD' || decision.intent === 'EXIT_RISK' || decision.intent === 'EXIT_FLIP')) {
-        const currentPos = dryRunSession.getStrategyPosition(symbol);
-        if ((decision.intent === 'ENTRY' || decision.intent === 'ADD') && decision.side) {
-            if (RISK_ENGINE_ENABLED && riskMultiplier <= 0) {
-                observabilityMetrics.recordTradeRejected();
-                log('RISK_ENGINE_TRADE_REJECTED', {
-                    symbol,
-                    intent: decision.intent,
-                    reason: 'position_multiplier_zero',
-                    state: institutionalRiskEngine.getRiskState(),
-                });
-                return;
-            }
-            const expectedPrice = Array.isArray(decision.orders)
-                ? (decision.orders.find((order) => Number(order.price || 0) > 0)?.price ?? null)
-                : null;
-            submitRiskAwareStrategyDecision(
-                symbol,
-                decision.side,
-                decision.intent === 'ENTRY' ? 'ENTRY' : 'ADD',
-                Number(decision.timestampMs || Date.now()),
-                riskMultiplier,
-                expectedPrice
-            );
-        } else if ((decision.intent === 'EXIT_RISK' || decision.intent === 'EXIT_FLIP') && currentPos) {
-            if (currentPos.side === 'LONG' || currentPos.side === 'SHORT') {
-                const exitSignal = currentPos.side === 'LONG' ? 'ENTRY_SHORT' : 'ENTRY_LONG';
-                dryRunSession.submitStrategySignal(symbol, {
-                    signal: exitSignal,
-                    score: 0,
-                    vetoReason: null,
-                    candidate: null,
-                }, decision.timestampMs);
-            }
-        }
-    }
-
-    if (!decision || !Array.isArray(decision.orders) || decision.orders.length === 0) {
-        return;
-    }
-    if (!isPreTradeIntent) {
-        observabilityMetrics.recordTradeAttempt();
-    }
-    for (const order of decision.orders) {
-        decisionRuntimeStats.ordersAttempted += 1;
-        const orderId = String(order.id || `${symbol}-${decision.timestampMs}-${decisionRuntimeStats.ordersAttempted}`);
-        const expectedPrice = Number(order.price || decision.position?.entryVwap || 0);
-        const expectedQty = Math.max(0, Math.abs(Number(order.qty || 0)));
-        if (expectedPrice > 0 && expectedQty > 0) {
-            analyticsEngine.recordExpectedFill(
-                orderId,
-                symbol,
-                expectedPrice,
-                order.side,
-                expectedQty
-            );
-        }
-        if (order.kind === 'MAKER') {
-            decisionRuntimeStats.makerOrdersPlaced += 1;
-        } else {
-            decisionRuntimeStats.takerOrdersPlaced += 1;
-        }
-        observabilityMetrics.recordTradeExecuted();
-        if (order.kind === 'TAKER_ENTRY_FALLBACK') {
-            decisionRuntimeStats.entryTakerNotionalPct = Math.max(
-                decisionRuntimeStats.entryTakerNotionalPct,
-                Number(order.notionalPct || 0)
-            );
-            decisionRuntimeStats.takerFillsCount += 1;
-        }
-        if (RISK_ENGINE_ENABLED) {
-            const requestedQty = Math.max(0, Math.abs(Number(order.qty || 0)));
-            if (requestedQty > 0) {
-                institutionalRiskEngine.recordExecutionEvent(
-                    orderId,
-                    symbol,
-                    'fill',
-                    requestedQty,
-                    requestedQty
-                );
-            }
-        }
-    }
-    log('ORCHESTRATOR_V1_ORDERS', {
-        symbol,
-        intent: decision.intent,
-        side: decision.side,
-        riskState: RISK_ENGINE_ENABLED ? institutionalRiskEngine.getRiskState() : 'DISABLED',
-        riskMultiplier,
-        orders: decision.orders.map((order: OrchestratorV1Order) => ({
-            id: order.id,
-            kind: order.kind,
-            side: order.side,
-            role: order.role,
-            notionalPct: order.notionalPct,
-            qty: order.qty,
-            price: order.price,
-            postOnly: order.postOnly,
-            repriceAttempt: order.repriceAttempt,
-        })),
-        addsUsed: decision.position.addsUsed,
-        exitRisk: decision.exitRisk,
-    });
 }
 
 function handleMsg(raw: any) {
@@ -2827,7 +2407,7 @@ function broadcastMetrics(
     const tasMetrics = precomputed?.tasMetrics ?? tas.computeMetrics();
     // Calculate OBI/Legacy if Orderbook has data (bids and asks exist)
     // This allows metrics to continue displaying during brief resyncs
-    const hasBookData = ob.bids.size > 0 && ob.asks.size > 0;
+    const hasBookData = ob.bids.length > 0 && ob.asks.length > 0;
     const legacyM = precomputed && Object.prototype.hasOwnProperty.call(precomputed, 'legacyMetrics')
         ? precomputed.legacyMetrics
         : (hasBookData ? leg.computeMetrics(ob, Number(eventTimeMs || now)) : null);
@@ -2913,73 +2493,7 @@ function broadcastMetrics(
     const dryRunPosition = dryRunSession.getStrategyPosition(s);
     const liveExecutionPosition = orchestrator.getSymbolPosition(s);
     const rawStrategyPosition = dryRunPosition || liveExecutionPosition;
-    const rawPositionSource: 'dryrun' | 'live' | null = liveExecutionPosition
-        ? 'live'
-        : (dryRunPosition ? 'dryrun' : null);
     const spreadRatio = spreadPct == null ? null : (spreadPct / 100);
-    const integrityLevelNumeric = integrity.level === 'CRITICAL'
-        ? 2
-        : integrity.level === 'DEGRADED'
-            ? 1
-            : 0;
-    const selectedAtr3m = Number(advancedBundle.regimeMetrics?.microATR || 0) > 0
-        ? Number(advancedBundle.regimeMetrics?.microATR || 0)
-        : Number(bf.atr || 0);
-    const selectedAtrSource = Number(advancedBundle.regimeMetrics?.microATR || 0) > 0
-        ? 'MICRO_ATR'
-        : Number(bf.atr || 0) > 0
-            ? 'BACKFILL_ATR'
-            : 'UNKNOWN';
-    const cvdTf5mState = Number(tf5m?.delta || 0) > 0
-        ? 'BUY'
-        : Number(tf5m?.delta || 0) < 0
-            ? 'SELL'
-            : 'NEUTRAL';
-    const crossMarketRuntimeActive = ENABLE_CROSS_MARKET_CONFIRMATION && activeSymbols.has('BTCUSDT');
-    let btcContext: any = null;
-        if (s !== 'BTCUSDT' && crossMarketRuntimeActive) {
-            try {
-                const btcHtf = getHtfMonitor('BTCUSDT').getSnapshot();
-                const btcAdvanced = advancedMicroMap.get('BTCUSDT')?.getMetrics(now);
-                if (btcHtf && btcAdvanced?.regimeMetrics) {
-                    btcContext = {
-                        h1BarStartMs: Number.isFinite(btcHtf.h1?.barStartMs) ? Number(btcHtf.h1?.barStartMs) : null,
-                        h4BarStartMs: Number.isFinite(btcHtf.h4?.barStartMs) ? Number(btcHtf.h4?.barStartMs) : null,
-                        h1StructureUp: Boolean(btcHtf.h1?.structureBreakUp),
-                        h1StructureDn: Boolean(btcHtf.h1?.structureBreakDn),
-                        h4StructureUp: Boolean(btcHtf.h4?.structureBreakUp),
-                        h4StructureDn: Boolean(btcHtf.h4?.structureBreakDn),
-                        trendiness: Number(btcAdvanced.regimeMetrics.trendinessScore || 0),
-                        chop: Number(btcAdvanced.regimeMetrics.chopScore || 0),
-                    };
-                }
-            } catch (err) {
-                // Ignore btc context derivation error
-            }
-        }
-
-        // ── P0: Build dryRunPosition snapshot for this symbol ──
-        const buildDrpSnapshot = (sym: string) => {
-            const pos = dryRunSession.getStrategyPosition(sym);
-            if (!pos || !pos.side || !(Number(pos.qty) > 0)) {
-                return { hasPosition: false, side: null, qty: 0, entryPrice: 0, notional: 0, addsUsed: 0 };
-            }
-            const refPrice = Number(pos.entryPrice) || 0;
-            return {
-                hasPosition: true,
-                side: pos.side as 'LONG' | 'SHORT',
-                qty: Number(pos.qty),
-                entryPrice: refPrice,
-                notional: Number(pos.qty) * refPrice,
-                addsUsed: Number(pos.addsUsed || 0),
-            };
-        };
-
-        const dryRunPositionSnapshot = dryRunSession.isTrackingSymbol(s) ? buildDrpSnapshot(s) : null;
-        const btcDryRunPosition = (s !== 'BTCUSDT' && crossMarketRuntimeActive && dryRunSession.isTrackingSymbol('BTCUSDT'))
-            ? buildDrpSnapshot('BTCUSDT')
-            : null;
-
     const canonicalTimeMs = Number(eventTimeMs || now);
     const deltaZForDecision = Number(legacyForUse?.deltaZ ?? tf1m?.delta ?? 0);
     const cvdSlopeForDecision = Number(legacyForUse?.cvdSlope ?? tf5m?.delta ?? 0);
@@ -2997,56 +2511,50 @@ function broadcastMetrics(
             ? spoofAwareObi.obiWeighted
             : (legacyForUse?.obiWeighted || 0)
     );
-    let resolvedOrchestratorDecision = defaultOrchestratorDecision(s, canonicalTimeMs);
-    try {
-        resolvedOrchestratorDecision = orchestratorV1.evaluate({
-            symbol: s,
-            nowMs: canonicalTimeMs,
-            price: Number(mid || legacyForUse?.price || 0),
-            bestBid: bestBidPx,
-            bestAsk: bestAskPx,
+    if (dryRunSession.isTrackingSymbol(s)) {
+        const bias15m: 'UP' | 'DOWN' | 'NEUTRAL' = htfSnapshot?.m15?.structureBreakUp
+            ? 'UP'
+            : htfSnapshot?.m15?.structureBreakDn
+                ? 'DOWN'
+                : 'NEUTRAL';
+        const veto1h: 'NONE' | 'UP' | 'DOWN' | 'EXHAUSTION' = htfSnapshot?.h1?.structureBreakDn
+            ? 'DOWN'
+            : htfSnapshot?.h1?.structureBreakUp
+                ? 'UP'
+                : 'NONE';
+        const contextPrice = Number(mid || legacyForUse?.price || 0);
+        const contextVwap = Number(sessionVwap?.value || legacyForUse?.vwap || mid || 0);
+        const trendState = bias15m === 'UP'
+            ? (contextPrice >= contextVwap ? 'UPTREND' : 'PULLBACK_UP')
+            : bias15m === 'DOWN'
+                ? (contextPrice <= contextVwap ? 'DOWNTREND' : 'PULLBACK_DOWN')
+                : 'RANGE';
+        const trendConfidence = Math.max(
+            0,
+            Math.min(
+                1,
+                (Math.abs(Number(advancedBundle.regimeMetrics?.trendinessScore || 0)) * 0.6)
+                + (Math.min(2, Math.abs(deltaZForDecision)) * 0.1)
+                + (Math.min(2, Math.abs(cvdSlopeForDecision)) * 0.1)
+                + (Math.min(1, Math.abs(obiWeightedForDecision)) * 0.2)
+            )
+        );
+        const bookMarkDeviationPct = contextPrice > 0 && contextVwap > 0
+            ? Math.abs(((contextPrice - contextVwap) / contextPrice) * 100)
+            : null;
+        dryRunSession.updateRuntimeContext(s, {
+            timestampMs: canonicalTimeMs,
+            bootstrapDone: bootstrapSnapshot.backfillDone,
+            bootstrapBars1m: bootstrapSnapshot.barsLoaded1m,
+            htfReady: Boolean(htfSnapshot?.m15?.close) && Boolean(htfSnapshot?.h1?.close),
+            tradeStreamActive: Number(tasMetrics?.tradeCount || 0) > 0 || Number(tasMetrics?.printsPerSecond || 0) > 0,
             spreadPct: spreadRatio,
-            printsPerSecond: Number(tasMetrics?.printsPerSecond || 0),
-            deltaZ: deltaZForDecision,
-            cvdSlope: cvdSlopeForDecision,
-            cvdTf5mState,
-            obiDeep: obiDeepForDecision,
-            obiWeighted: obiWeightedForDecision,
-            trendinessScore: Number(advancedBundle.regimeMetrics?.trendinessScore || 0),
-            chopScore: chopScoreForDecision,
-            volOfVol: Number(advancedBundle.regimeMetrics?.volOfVol || 0),
-            realizedVol1m: Number(advancedBundle.regimeMetrics?.realizedVol1m || 0),
-            atr3m: selectedAtr3m,
-            atrSource: selectedAtrSource as 'MICRO_ATR' | 'BACKFILL_ATR' | 'UNKNOWN',
-            orderbookIntegrityLevel: integrityLevelNumeric,
-            oiChangePct: Number.isFinite(Number(resolvedOpenInterest.oiChangePct)) ? Number(resolvedOpenInterest.oiChangePct) : null,
-            sessionVwapValue: Number.isFinite(Number(sessionVwap?.value)) ? Number(sessionVwap?.value) : null,
-            htfH1BarStartMs: Number.isFinite(Number(htfSnapshot?.h1?.barStartMs)) ? Number(htfSnapshot?.h1?.barStartMs) : null,
-            htfH1SwingLow: Number.isFinite(Number(htfSnapshot?.h1?.lastSwingLow)) ? Number(htfSnapshot?.h1?.lastSwingLow) : null,
-            htfH1SwingHigh: Number.isFinite(Number(htfSnapshot?.h1?.lastSwingHigh)) ? Number(htfSnapshot?.h1?.lastSwingHigh) : null,
-            htfH1StructureBreakUp: Boolean(htfSnapshot?.h1?.structureBreakUp),
-            htfH1StructureBreakDn: Boolean(htfSnapshot?.h1?.structureBreakDn),
-            htfH4BarStartMs: Number.isFinite(Number(htfSnapshot?.h4?.barStartMs)) ? Number(htfSnapshot?.h4?.barStartMs) : null,
-            m15SwingLow: Number.isFinite(Number(htfSnapshot?.m15?.lastSwingLow)) ? Number(htfSnapshot?.m15?.lastSwingLow) : null,
-            m15SwingHigh: Number.isFinite(Number(htfSnapshot?.m15?.lastSwingHigh)) ? Number(htfSnapshot?.m15?.lastSwingHigh) : null,
-            superScalpEnabled: SUPER_SCALP_ENABLED,
-            backfillDone: bootstrapSnapshot.backfillDone,
-            barsLoaded1m: bootstrapSnapshot.barsLoaded1m,
-            btcContext,
-            crossMarketActive: crossMarketRuntimeActive,
-            dryRunPosition: dryRunPositionSnapshot,
-            btcDryRunPosition,
+            bookMarkDeviationPct,
+            trendState,
+            trendConfidence,
+            bias15m,
+            veto1h,
         });
-    } catch (e: any) {
-        const nowMs = now;
-        const lastErrTs = orchestratorEvalErrorTs.get(s) || 0;
-        if (nowMs - lastErrTs > 5000) {
-            log('ORCHESTRATOR_V1_EVAL_ERROR', {
-                symbol: s,
-                error: e?.message || 'orchestrator_eval_failed',
-            });
-            orchestratorEvalErrorTs.set(s, nowMs);
-        }
     }
     const riskSummary = syncRiskEngineRuntime(s, canonicalTimeMs, mid, receiptTimeMs);
     const resolvedRiskState = RISK_ENGINE_ENABLED
@@ -3061,7 +2569,7 @@ function broadcastMetrics(
         const previousSide = resilienceLastSideBySymbol.has(s)
             ? (resilienceLastSideBySymbol.get(s) ?? null)
             : null;
-        const currentSide = resolvedOrchestratorDecision.side;
+        const currentSide = deriveStrategyExecutionSide(decision, rawStrategyPosition);
         if ((currentSide === 'BUY' || currentSide === 'SELL') && currentSide !== previousSide) {
             resiliencePatches.recordSideFlip(s, currentSide, decisionPrice, canonicalTimeMs);
             resilienceLastSideBySymbol.set(s, currentSide);
@@ -3071,174 +2579,39 @@ function broadcastMetrics(
         resilienceGuardResult = resiliencePatches.evaluate(s, canonicalTimeMs);
         resilienceStatus = resiliencePatches.getStatus(canonicalTimeMs);
     }
-    let strategySignals: ReturnType<StrategyRegistry['evaluateAll']> = [];
-    let consensusDecision: ReturnType<ConsensusEngine['evaluate']> | null = null;
+    let strategySignals: StrategySignal[] = [];
+    let consensusDecision: StrategyConsensusSnapshot | null = null;
 
-    if (strategyFrameworkEnabled) {
-        try {
-            const deltaZForStrategy = deltaZForDecision;
-            const cvdSlopeForStrategy = cvdSlopeForDecision;
-            const trendinessScore = Math.max(0, Math.min(1, Number(advancedBundle.regimeMetrics?.trendinessScore || 0)));
-            const trendDirection = cvdSlopeForStrategy > 0
-                ? 1
-                : cvdSlopeForStrategy < 0
-                    ? -1
-                    : deltaZForStrategy > 0
-                        ? 1
-                        : deltaZForStrategy < 0
-                            ? -1
-                            : 0;
-            const m3TrendScore = Math.max(-1, Math.min(1, Math.tanh(deltaZForStrategy / 3)));
-            const m5TrendScore = Math.max(-1, Math.min(1, trendDirection * trendinessScore));
-            const strategyContext = strategyContextBuilder.build({
-                symbol: s,
-                timestamp: canonicalTimeMs,
-                price: Number(mid || legacyForUse?.price || 0),
-                m3TrendScore,
-                m5TrendScore,
-                obiDeep: obiDeepForDecision,
-                deltaZ: deltaZForStrategy,
-                volatilityIndex: Number(advancedBundle.regimeMetrics?.realizedVol1m || advancedBundle.regimeMetrics?.volOfVol || 0),
-                spreadPct,
-                printsPerSecond: Number(tasMetrics?.printsPerSecond || 0),
-                position: rawStrategyPosition
-                    ? {
-                        side: (rawStrategyPosition.side === 'LONG' || rawStrategyPosition.side === 'SHORT')
-                            ? rawStrategyPosition.side
-                            : null,
-                        qty: Number(rawStrategyPosition.qty || 0),
-                        entryPrice: Number(rawStrategyPosition.entryPrice || 0) > 0
-                            ? Number(rawStrategyPosition.entryPrice || 0)
-                            : null,
-                        unrealizedPnl: Number(
-                            (rawStrategyPosition as any).unrealizedPnl
-                            ?? (rawStrategyPosition as any).unrealizedPnlPct
-                            ?? 0
-                        ),
-                    }
-                    : null,
-            }, resolvedRiskState, canonicalTimeMs);
-
-            strategySignals = strategyRegistry.evaluateAll(strategyContext);
-            strategySignalsBySymbol.set(s, strategySignals.map((signal) => ({ ...signal })));
-            consensusDecision = consensusEngine.evaluate(strategySignals, resolvedRiskState, canonicalTimeMs);
-            observabilityMetrics.recordDecisionConfidence(
-                Math.max(0, Math.min(1, Number(consensusDecision.confidence || 0)))
-            );
-            strategyConsensusBySymbol.set(s, {
-                timestampMs: canonicalTimeMs,
-                side: consensusDecision.side,
-                confidence: Number(consensusDecision.confidence || 0),
-                quorumMet: Boolean(consensusDecision.quorumMet),
-                riskGatePassed: Boolean(consensusDecision.riskGatePassed),
-                contributingStrategies: Number(consensusDecision.contributingStrategies || 0),
-                totalStrategies: Number(consensusDecision.totalStrategies || 0),
-                vetoApplied: Boolean(consensusDecision.vetoApplied),
-                breakdown: {
-                    long: {
-                        count: Number(consensusDecision.breakdown?.long?.count || 0),
-                        avgConfidence: Number(consensusDecision.breakdown?.long?.avgConfidence || 0),
-                    },
-                    short: {
-                        count: Number(consensusDecision.breakdown?.short?.count || 0),
-                        avgConfidence: Number(consensusDecision.breakdown?.short?.avgConfidence || 0),
-                    },
-                    flat: {
-                        count: Number(consensusDecision.breakdown?.flat?.count || 0),
-                        avgConfidence: Number(consensusDecision.breakdown?.flat?.avgConfidence || 0),
-                    },
-                },
-                strategyIds: Array.isArray(consensusDecision.strategyIds)
-                    ? [...consensusDecision.strategyIds]
-                    : [],
-                shouldTrade: consensusEngine.shouldTrade(consensusDecision),
-            });
-
-            const hardStop = resolvedRiskState === RiskState.HALTED || resolvedRiskState === RiskState.KILL_SWITCH;
-            if (hardStop) {
-                if (resolvedOrchestratorDecision.intent !== 'HOLD' || resolvedOrchestratorDecision.orders.length > 0) {
-                    log('STRATEGY_CONSENSUS_HARD_STOP', {
-                        symbol: s,
-                        riskState: resolvedRiskState,
-                        previousIntent: resolvedOrchestratorDecision.intent,
-                        previousSide: resolvedOrchestratorDecision.side,
-                    });
-                }
-                resolvedOrchestratorDecision = {
-                    ...resolvedOrchestratorDecision,
-                    intent: 'HOLD',
-                    side: null,
-                    allGatesPassed: false,
-                    orders: [],
-                    readiness: {
-                        ready: false,
-                        reasons: [`RISK_${resolvedRiskState}_NO_TRADE`],
-                    },
-                };
-            } else {
-                const preTradeIntent = resolvedOrchestratorDecision.intent === 'ENTRY'
-                    || resolvedOrchestratorDecision.intent === 'ADD';
-                if (preTradeIntent) {
-                    const consensusAllowsTrade = consensusEngine.shouldTrade(consensusDecision);
-                    const consensusSide = consensusDecision.side === StrategySignalSide.LONG
-                        ? 'BUY'
-                        : consensusDecision.side === StrategySignalSide.SHORT
-                            ? 'SELL'
-                            : null;
-                    if (!consensusAllowsTrade) {
-                        log('STRATEGY_CONSENSUS_REJECTED', {
-                            symbol: s,
-                            reason: 'consensus_not_ready',
-                            intent: resolvedOrchestratorDecision.intent,
-                            orchestratorSide: resolvedOrchestratorDecision.side,
-                            consensusSide: consensusDecision.side,
-                            confidence: consensusDecision.confidence,
-                            quorumMet: consensusDecision.quorumMet,
-                            riskGatePassed: consensusDecision.riskGatePassed,
-                        });
-                        resolvedOrchestratorDecision = {
-                            ...resolvedOrchestratorDecision,
-                            intent: 'HOLD',
-                            side: null,
-                            allGatesPassed: false,
-                            orders: [],
-                            readiness: {
-                                ready: false,
-                                reasons: ['CONSENSUS_NOT_READY'],
-                            },
-                        };
-                    } else if (!consensusSide || resolvedOrchestratorDecision.side !== consensusSide) {
-                        log('STRATEGY_CONSENSUS_REJECTED', {
-                            symbol: s,
-                            reason: 'side_mismatch',
-                            intent: resolvedOrchestratorDecision.intent,
-                            orchestratorSide: resolvedOrchestratorDecision.side,
-                            consensusSide: consensusDecision.side,
-                            confidence: consensusDecision.confidence,
-                        });
-                        resolvedOrchestratorDecision = {
-                            ...resolvedOrchestratorDecision,
-                            intent: 'HOLD',
-                            side: null,
-                            allGatesPassed: false,
-                            orders: [],
-                            readiness: {
-                                ready: false,
-                                reasons: ['CONSENSUS_SIDE_MISMATCH'],
-                            },
-                        };
-                    }
-                }
-            }
-        } catch (error) {
-            log('STRATEGY_CONSENSUS_EVAL_ERROR', {
-                symbol: s,
-                error: (error as Error)?.message || 'strategy_consensus_eval_failed',
-            });
-        }
-    } else {
+    try {
+        const strategyTelemetry = buildStrategyTelemetryFromDecision(
+            s,
+            decision,
+            rawStrategyPosition,
+            Number(mid || legacyForUse?.price || 0),
+            canonicalTimeMs
+        );
+        strategySignals = strategyTelemetry.signals;
+        consensusDecision = strategyTelemetry.consensus;
+        strategySignalsBySymbol.set(s, strategySignals.map((signal) => ({ ...signal })));
+        observabilityMetrics.recordDecisionConfidence(
+            Math.max(0, Math.min(1, Number(consensusDecision.confidence || 0)))
+        );
+        strategyConsensusBySymbol.set(s, {
+            ...consensusDecision,
+            strategyIds: [...consensusDecision.strategyIds],
+            breakdown: {
+                long: { ...consensusDecision.breakdown.long },
+                short: { ...consensusDecision.breakdown.short },
+                flat: { ...consensusDecision.breakdown.flat },
+            },
+        });
+    } catch (error) {
         strategySignalsBySymbol.delete(s);
         strategyConsensusBySymbol.delete(s);
+        log('STRATEGY_TELEMETRY_BUILD_ERROR', {
+            symbol: s,
+            error: (error as Error)?.message || 'strategy_telemetry_build_failed',
+        });
     }
 
     if (RESILIENCE_PATCHES_ENABLED && resilienceGuardResult) {
@@ -3260,52 +2633,10 @@ function broadcastMetrics(
                 { symbol: s, timestampMs: canonicalTimeMs }
             );
         }
-
-        const preTradeIntent = resolvedOrchestratorDecision.intent === 'ENTRY'
-            || resolvedOrchestratorDecision.intent === 'ADD';
-        const suppressesPreTrade = preTradeIntent
-            && (
-                !resilienceGuardResult.allow
-                || resilienceGuardResult.action === 'NO_TRADE'
-                || resilienceGuardResult.action === 'HALT'
-                || resilienceGuardResult.action === 'KILL_SWITCH'
-                || (
-                    resilienceGuardResult.action === 'SUPPRESS'
-                    && resilienceGuardResult.confidenceMultiplier < RESILIENCE_SUPPRESS_MIN_MULTIPLIER
-                )
-            );
-
-        if (suppressesPreTrade) {
-            log('RESILIENCE_GUARD_BLOCKED', {
-                symbol: s,
-                action: resilienceGuardResult.action,
-                confidenceMultiplier: resilienceGuardResult.confidenceMultiplier,
-                reasons: resilienceGuardResult.reasons,
-                previousIntent: resolvedOrchestratorDecision.intent,
-                previousSide: resolvedOrchestratorDecision.side,
-            });
-            resolvedOrchestratorDecision = {
-                ...resolvedOrchestratorDecision,
-                intent: 'HOLD',
-                side: null,
-                allGatesPassed: false,
-                orders: [],
-                readiness: {
-                    ready: false,
-                    reasons: [
-                        'RESILIENCE_SUPPRESS',
-                        ...resilienceGuardResult.reasons,
-                    ],
-                },
-            };
-        }
     }
 
-    const orchestratorDebug = updateOrchestratorDiagnostics(s, resolvedOrchestratorDecision, canonicalTimeMs);
-    const decisionView = buildDecisionViewFromOrchestrator(resolvedOrchestratorDecision);
-    const strategyPosition = decisionView.suppressDryRunPosition && rawPositionSource === 'dryrun'
-        ? null
-        : rawStrategyPosition;
+    const decisionView = buildSignalDisplayFromStrategyDecision(decision);
+    const strategyPosition = rawStrategyPosition;
     const hasOpenStrategyPosition = Boolean(
         strategyPosition
         && (strategyPosition.side === 'LONG' || strategyPosition.side === 'SHORT')
@@ -3350,35 +2681,17 @@ function broadcastMetrics(
         bootstrap: bootstrapSnapshot,
         orderbookIntegrity: integrity,
         signalDisplay: decisionView.signalDisplay,
-        orchestratorV1: {
-            intent: resolvedOrchestratorDecision.intent,
-            side: resolvedOrchestratorDecision.side,
-            readiness: resolvedOrchestratorDecision.readiness,
-            gateA: resolvedOrchestratorDecision.gateA,
-            gateB: resolvedOrchestratorDecision.gateB,
-            gateC: resolvedOrchestratorDecision.gateC,
-            allGatesPassed: resolvedOrchestratorDecision.allGatesPassed,
-            impulse: resolvedOrchestratorDecision.impulse,
-            add: resolvedOrchestratorDecision.add,
-            exitRisk: resolvedOrchestratorDecision.exitRisk,
-            position: resolvedOrchestratorDecision.position,
-            orders: resolvedOrchestratorDecision.orders,
-            chase: resolvedOrchestratorDecision.chase,
-            chaseDebug: resolvedOrchestratorDecision.chaseDebug,
-            telemetry: resolvedOrchestratorDecision.telemetry,
-            debug: orchestratorDebug,
-        },
-        strategyConsensus: strategyFrameworkEnabled
+        strategyConsensus: consensusDecision
             ? {
-                timestampMs: consensusDecision?.timestamp ?? canonicalTimeMs,
-                side: consensusDecision?.side ?? StrategySignalSide.FLAT,
-                confidence: Number(consensusDecision?.confidence || 0),
-                quorumMet: Boolean(consensusDecision?.quorumMet),
-                riskGatePassed: Boolean(consensusDecision?.riskGatePassed),
-                contributingStrategies: Number(consensusDecision?.contributingStrategies || 0),
-                totalStrategies: Number(consensusDecision?.totalStrategies || strategyRegistry.size()),
-                vetoApplied: Boolean(consensusDecision?.vetoApplied),
-                shouldTrade: consensusDecision ? consensusEngine.shouldTrade(consensusDecision) : false,
+                timestampMs: consensusDecision.timestampMs,
+                side: consensusDecision.side,
+                confidence: Number(consensusDecision.confidence || 0),
+                quorumMet: Boolean(consensusDecision.quorumMet),
+                riskGatePassed: Boolean(consensusDecision.riskGatePassed),
+                contributingStrategies: Number(consensusDecision.contributingStrategies || 0),
+                totalStrategies: Number(consensusDecision.totalStrategies || 1),
+                vetoApplied: Boolean(consensusDecision.vetoApplied),
+                shouldTrade: Boolean(consensusDecision.shouldTrade),
                 signals: strategySignals.map((signal) => ({
                     strategyId: signal.strategyId,
                     strategyName: signal.strategyName,
@@ -3459,13 +2772,10 @@ function broadcastMetrics(
             bestAsk: bestAsk(ob),
             obiWeighted: legacyForUse?.obiWeighted ?? null,
             obiDeep: legacyForUse?.obiDeep ?? null,
-            bookLevels: { bids: ob.bids.size, asks: ob.asks.size }
+            bookLevels: { bids: ob.bids.length, asks: ob.asks.length }
         });
     }
 
-    if (eventTimeMs > 0) {
-        applyOrchestratorOrders(s, resolvedOrchestratorDecision);
-    }
 }
 
 
@@ -3600,45 +2910,16 @@ app.get('/api/health', (req, res) => {
         ok: true,
         executionEnabled: EXECUTION_ENABLED,
         killSwitch: KILL_SWITCH,
-        decisionMode: 'orchestrator_v1',
+        decisionMode: 'strategy_v11',
         decisionEnabled: true,
         riskEngineEnabled: RISK_ENGINE_ENABLED,
         riskEngine: RISK_ENGINE_ENABLED ? institutionalRiskEngine.getRiskSummary() : null,
         resilienceEnabled: RESILIENCE_PATCHES_ENABLED,
         resilience: RESILIENCE_PATCHES_ENABLED ? resiliencePatches.getStatus(Date.now()) : null,
         decisionRuntime: {
-            legacyDecisionCalls: decisionRuntimeStats.legacyDecisionCalls,
-            executorEntrySkipped: decisionRuntimeStats.executorEntrySkipped,
-            orchestratorEvaluations: decisionRuntimeStats.orchestratorEvaluations,
-            ordersAttempted: decisionRuntimeStats.ordersAttempted,
-            makerOrdersPlaced: decisionRuntimeStats.makerOrdersPlaced,
-            takerOrdersPlaced: decisionRuntimeStats.takerOrdersPlaced,
-            entryTakerNotionalPct: decisionRuntimeStats.entryTakerNotionalPct,
-            addsUsed: decisionRuntimeStats.addsUsed,
-            exitRiskTriggeredCount: decisionRuntimeStats.exitRiskTriggeredCount,
-            gateB_fail_cvd_count: decisionRuntimeStats.gateB_fail_cvd_count,
-            gateB_fail_obi_count: decisionRuntimeStats.gateB_fail_obi_count,
-            gateB_fail_deltaZ_count: decisionRuntimeStats.gateB_fail_deltaZ_count,
-            gateA_fail_trendiness_count: decisionRuntimeStats.gateA_fail_trendiness_count,
-            allGatesTrue_count: decisionRuntimeStats.allGatesTrue_count,
-            entryCandidateCount: decisionRuntimeStats.entryCandidateCount,
-            chaseStartedCount: decisionRuntimeStats.chaseStartedCount,
-            chaseTimedOutCount: decisionRuntimeStats.chaseTimedOutCount,
-            impulseTrueCount: decisionRuntimeStats.impulseTrueCount,
-            fallbackEligibleCount: decisionRuntimeStats.fallbackEligibleCount,
-            fallbackTriggeredCount: decisionRuntimeStats.fallbackTriggeredCount,
-            fallbackBlockedReasonTop: topFallbackBlockedReason(),
-            fallbackBlockedReasonCounts: decisionRuntimeStats.fallbackBlockedReasonCounts,
-            makerFillsCount: decisionRuntimeStats.makerFillsCount,
-            takerFillsCount: decisionRuntimeStats.takerFillsCount,
-            positionSide: decisionRuntimeStats.positionSide,
-            positionQty: decisionRuntimeStats.positionQty,
-            entryVwap: decisionRuntimeStats.entryVwap,
-            postOnlyRejectCount: decisionRuntimeStats.postOnlyRejectCount,
-            cancelCount: decisionRuntimeStats.cancelCount,
-            replaceCount: decisionRuntimeStats.replaceCount,
-            blockReasonCountsBySymbol: Object.fromEntries(orchestratorDiagState.blockReasonCountsBySymbol.entries()),
-            orchestratorRuntime: orchestratorV1.getRuntimeSnapshot(),
+            engine: STRATEGY_ENGINE_NAME,
+            activeStrategyInstances: strategyMap.size,
+            activeSymbols: Array.from(activeSymbols),
         },
         bootstrapRuntime: {
             limit1m: BOOTSTRAP_1M_LIMIT,
@@ -3721,8 +3002,8 @@ app.get('/api/status', (req, res) => {
             desyncCount: meta.desyncCount,
             lastSeenU_u: ob.lastSeenU_u,
             bookLevels: {
-                bids: ob.bids.size,
-                asks: ob.asks.size,
+                bids: ob.bids.length,
+                asks: ob.asks.length,
                 bestBid: bestBid(ob),
                 bestAsk: bestAsk(ob)
             },
@@ -3835,21 +3116,49 @@ app.post('/api/execution/symbol', async (req, res) => {
     }
 });
 
-app.post('/api/execution/settings', async (req, res) => {
-    const rawPairMargins = (req.body && typeof req.body.pairInitialMargins === 'object' && req.body.pairInitialMargins !== null)
-        ? req.body.pairInitialMargins
-        : {};
-    const pairInitialMargins: Record<string, number> = {};
-    Object.entries(rawPairMargins).forEach(([symbol, raw]) => {
-        const margin = Number(raw);
-        if (Number.isFinite(margin) && margin > 0) {
-            pairInitialMargins[String(symbol).toUpperCase()] = margin;
-        }
+function extractSymbolCapitalConfigsFromBody(body: any, symbols: string[], totalWalletUsdt: number): SymbolCapitalConfig[] {
+    const defaultInitialMarginUsdt = Number(body?.initialMarginUsdt ?? 200);
+    const defaultLeverage = Number(body?.leverage ?? 10);
+    const normalized = normalizeSymbolCapitalConfigs({
+        symbols,
+        symbolConfigs: body?.symbolConfigs,
+        defaultInitialMarginUsdt,
+        defaultLeverage,
+        defaultReserveUsdt: Number(body?.sharedWalletStartUsdt ?? body?.walletBalanceStartUsdt ?? totalWalletUsdt ?? 0) / Math.max(1, symbols.length || 1),
     });
 
+    if (normalized.length > 0) {
+        return normalized;
+    }
+
+    const rawPairMargins = (body && typeof body.pairInitialMargins === 'object' && body.pairInitialMargins !== null)
+        ? body.pairInitialMargins
+        : {};
+    const legacyLeverage = Math.max(1, Math.trunc(Number(body?.leverage ?? 10)));
+    return symbols.map((symbol) => {
+        const legacyMargin = Number(rawPairMargins[symbol] ?? body?.initialMarginUsdt ?? 0);
+        const reserve = legacyMargin > 0 ? legacyMargin : Math.max(0, totalWalletUsdt / Math.max(1, symbols.length || 1));
+        return {
+            symbol,
+            enabled: true,
+            walletReserveUsdt: reserve,
+            initialMarginUsdt: legacyMargin > 0 ? legacyMargin : reserve,
+            leverage: legacyLeverage,
+        };
+    });
+}
+
+app.post('/api/execution/settings', async (req, res) => {
+    const selectedSymbols = orchestrator.getExecutionStatus().selectedSymbols || [];
+    const symbolConfigs = extractSymbolCapitalConfigsFromBody(
+        req.body,
+        selectedSymbols,
+        Math.max(0, orchestrator.getExecutionStatus().wallet?.totalWalletUsdt || 0),
+    );
     const settings = await orchestrator.updateCapitalSettings({
+        symbolConfigs,
         leverage: Number(req.body?.leverage),
-        pairInitialMargins,
+        pairInitialMargins: req.body?.pairInitialMargins,
     });
     res.json({ ok: true, settings, status: orchestrator.getExecutionStatus() });
 });
@@ -3880,12 +3189,7 @@ app.get('/api/dry-run/symbols', async (req, res) => {
 });
 
 function withRuntimeStrategyConfig(status: any): any {
-    if (!status || typeof status !== 'object') return status;
-    const cfg = status.config && typeof status.config === 'object' ? status.config : null;
-    return {
-        ...status,
-        config: cfg ? { ...cfg, superScalpEnabled: SUPER_SCALP_ENABLED } : cfg,
-    };
+    return status;
 }
 
 app.get('/api/dry-run/status', (req, res) => {
@@ -3928,9 +3232,6 @@ app.post('/api/dry-run/load', async (req, res) => {
 
 app.post('/api/dry-run/start', async (req, res) => {
     try {
-        if (typeof req.body?.superScalpEnabled !== 'undefined') {
-            SUPER_SCALP_ENABLED = Boolean(req.body.superScalpEnabled);
-        }
         const rawSymbols = Array.isArray(req.body?.symbols)
             ? req.body.symbols.map((s: any) => String(s || '').toUpperCase())
             : [];
@@ -3957,10 +3258,18 @@ app.post('/api/dry-run/start', async (req, res) => {
             fundingRates[symbol] = lastFunding.get(symbol)?.rate ?? Number(req.body?.fundingRate ?? 0);
         }
 
+        const sharedWalletStartUsdt = Number(req.body?.sharedWalletStartUsdt ?? req.body?.walletBalanceStartUsdt ?? 5000);
+        const symbolConfigs = extractSymbolCapitalConfigsFromBody(req.body, symbolsRequested, sharedWalletStartUsdt);
+        const legacyConfigMigrated = !Array.isArray(req.body?.symbolConfigs);
+        resetDryRunRuntimeState(sharedWalletStartUsdt);
+
         const status = dryRunSession.start({
             symbols: symbolsRequested,
             runId: req.body?.runId ? String(req.body.runId) : undefined,
-            walletBalanceStartUsdt: Number(req.body?.walletBalanceStartUsdt ?? 5000),
+            sharedWalletStartUsdt,
+            symbolConfigs,
+            startupMode: 'WAIT_MICRO_WARMUP',
+            walletBalanceStartUsdt: Number(req.body?.walletBalanceStartUsdt ?? sharedWalletStartUsdt),
             initialMarginUsdt: Number(req.body?.initialMarginUsdt ?? 200),
             leverage: Number(req.body?.leverage ?? 10),
             makerFeeRate: req.body?.makerFeeRate != null ? Number(req.body.makerFeeRate) : undefined,
@@ -3969,7 +3278,6 @@ app.post('/api/dry-run/start', async (req, res) => {
             fundingRates,
             fundingIntervalMs: Number(req.body?.fundingIntervalMs ?? (8 * 60 * 60 * 1000)),
             heartbeatIntervalMs: Number(req.body?.heartbeatIntervalMs ?? 10_000),
-            debugAggressiveEntry: Boolean(req.body?.debugAggressiveEntry),
         });
 
         updateDryRunHealthFlag();
@@ -3989,7 +3297,7 @@ app.post('/api/dry-run/start', async (req, res) => {
             }
         }
 
-        res.json({ ok: true, status: withRuntimeStrategyConfig(status) });
+        res.json({ ok: true, status: withRuntimeStrategyConfig(status), legacyConfigMigrated });
     } catch (e: any) {
         res.status(500).json({ ok: false, error: e?.message || 'dry_run_start_failed' });
     }
@@ -4009,7 +3317,10 @@ app.post('/api/dry-run/stop', (req, res) => {
 
 app.post('/api/dry-run/reset', (req, res) => {
     try {
+        const currentStatus = dryRunSession.getStatus();
+        const resetEquity = Number(currentStatus.config?.sharedWalletStartUsdt || RISK_ENGINE_DEFAULT_EQUITY_USDT);
         const status = dryRunSession.reset();
+        resetDryRunRuntimeState(resetEquity);
         updateDryRunHealthFlag();
         dryRunForcedSymbols.clear();
         updateStreams();
@@ -4121,14 +3432,14 @@ app.use('/api/telemetry', createTelemetryRoutes({
 }));
 
 app.use('/api/strategy', createStrategyRoutes({
-    consensusEngine,
+    consensusEngine: strategyApiConsensusEngine,
     getCurrentSignals: (symbol?: string) => getDashboardStrategySignals(symbol),
     getCurrentConsensus: (symbol?: string) => getDashboardStrategyConsensus(symbol),
     getCurrentRiskState: (_symbol?: string) => getDashboardRiskState(),
 }));
 
 app.use('/api/risk', createRiskRoutes({
-    riskStateManager: institutionalRiskEngine.getStateManager(),
+    getRiskStateManager: () => institutionalRiskEngine.getStateManager(),
     killSwitchManager: {
         isActive: () => institutionalRiskEngine.getGuards().killSwitch.isKillSwitchActive(),
         getLastTrigger: () => {
@@ -4154,17 +3465,20 @@ app.use('/api/risk', createRiskRoutes({
             marginUtilizationPercent,
         };
     },
-    riskLimits: {
+    getRiskLimits: () => ({
         maxPositionNotional: Number(RISK_ENGINE_CONFIG.position.maxPositionNotional || 0),
         maxLeverage: Number(RISK_ENGINE_CONFIG.position.maxLeverage || 0),
         maxPositionQty: Number(RISK_ENGINE_CONFIG.position.maxPositionQty || 0),
         dailyLossLimit: Number(RISK_ENGINE_CONFIG.drawdown.dailyLossLimitRatio || 0) * riskEngineLastKnownEquity,
         reducedRiskPositionMultiplier: Number(RISK_ENGINE_CONFIG.state.reducedRiskPositionMultiplier || 1),
-    },
+    }),
 }));
 
 app.use('/api/resilience', createResilienceRoutes({
+    antiSpoofGuards: resiliencePatches.getAntiSpoofGuards(),
+    deltaBurstFilters: resiliencePatches.getDeltaBurstFilters(),
     latencyTracker,
+    flashCrashDetector: resiliencePatches.getFlashCrashDetector(),
     getGuardActions: () => resilienceGuardActions,
     getTriggerCounters: () => ({ ...resilienceTriggerCounters }),
 }));
@@ -4631,3 +3945,4 @@ orchestrator.start().catch((e) => {
     log('ORCHESTRATOR_START_ERROR', { error: e.message });
 });
 // trigger restart
+

@@ -47,6 +47,8 @@ export interface DryRunOrderRequest {
   reasonCode?: DryRunReasonCode;
   addonIndex?: number;
   repriceAttempt?: number;
+  minFillRatio?: number;
+  cancelOnMinFillMiss?: boolean;
 }
 
 export interface DryRunEventInput {
@@ -154,6 +156,8 @@ export interface DryRunStateSnapshot {
     reasonCode?: DryRunReasonCode | null;
     addonIndex?: number | null;
     repriceAttempt?: number | null;
+    minFillRatio?: number | null;
+    cancelOnMinFillMiss?: boolean | null;
   }>;
   lastFundingBoundaryTsUTC: number;
   marginHealth: number;

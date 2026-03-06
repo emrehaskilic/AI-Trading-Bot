@@ -7,9 +7,46 @@
 
 import { Request, Response } from 'express';
 import { Router } from 'express';
-import { ConsensusEngine } from '../consensus/ConsensusEngine';
 import { StrategySignal, SignalSide } from '../strategies/StrategyInterface';
 import { RiskState } from '../risk/RiskStateManager';
+
+export interface StrategyConsensusEvaluator {
+  evaluate: (
+    signals: StrategySignal[],
+    riskState: RiskState,
+    timestamp: number,
+  ) => {
+    side: 'LONG' | 'SHORT' | 'FLAT';
+    confidence: number;
+    quorumMet: boolean;
+    vetoApplied: boolean;
+    riskGatePassed: boolean;
+    contributingStrategies: number;
+    totalStrategies: number;
+    breakdown: {
+      long: { count: number; avgConfidence: number };
+      short: { count: number; avgConfidence: number };
+      flat: { count: number; avgConfidence: number };
+    };
+    strategyIds: string[];
+  };
+  getConfig?: () => {
+    minQuorumSize: number;
+    minConfidenceThreshold: number;
+    maxSignalAgeMs: number;
+    minActionConfidence: number;
+    longWeight: number;
+    shortWeight: number;
+  };
+  config?: {
+    minQuorumSize: number;
+    minConfidenceThreshold: number;
+    maxSignalAgeMs: number;
+    minActionConfidence: number;
+    longWeight: number;
+    shortWeight: number;
+  };
+}
 
 // Types for strategy snapshot response
 export interface StrategySnapshotResponse {
@@ -55,7 +92,7 @@ export interface StrategySnapshotResponse {
 
 // Options for creating strategy routes
 export interface StrategyRoutesOptions {
-  consensusEngine: ConsensusEngine;
+  consensusEngine: StrategyConsensusEvaluator;
   getCurrentSignals: (symbol?: string) => StrategySignal[];
   getCurrentConsensus?: (symbol?: string) => {
     timestampMs: number;

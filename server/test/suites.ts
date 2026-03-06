@@ -8,7 +8,6 @@ import * as FundingTests from './FundingMonitor.test';
 import * as SessionVwapTrackerTests from './SessionVwapTracker.test';
 import * as BackfillCoordinatorTests from './BackfillCoordinator.test';
 import * as HtfStructureMonitorTests from './HtfStructureMonitor.test';
-import * as OrchestratorV1Tests from './OrchestratorV1.test';
 import * as LatencyTests from './Latency.test';
 import * as SequenceRuleTests from './SequenceRule.test';
 import * as ReconnectTests from './ReconnectContinuity.test';
@@ -18,11 +17,13 @@ import * as FreezePolicyTests from './FreezeEmergencyPolicy.test';
 import * as ProfitLockTests from './ProfitLock.test';
 import * as OrderPlanTests from './OrderPlan.test';
 import * as DryRunEngineTests from './DryRunEngine.test';
+import * as DryRunSizingModelTests from './DryRunSizingModel.test';
 import * as DryRunSessionServiceTests from './DryRunSessionService.test';
 import * as NormalizationTests from './Normalization.test';
 import * as RegimeSelectorTests from './RegimeSelector.test';
 import * as StrategyHysteresisTests from './StrategyHysteresis.test';
 import * as HardReversalTests from './HardReversal.test';
+import * as StrategyRiskTuningTests from './StrategyRiskTuning.test';
 import * as MarketImpactSimulatorTests from './MarketImpactSimulator.test';
 import * as OrderbookIntegrityMonitorTests from './OrderbookIntegrityMonitor.test';
 // StrategyEngine removed; NEW_STRATEGY_V1.1 tests below.
@@ -30,7 +31,9 @@ import * as DryRunClockTests from './DryRunClock.test';
 import * as FreezeControllerTests from './FreezeController.test';
 import * as PositionSizerTests from './PositionSizer.test';
 import * as ResiliencePatchesTests from './ResiliencePatches.test';
+import * as FlashCrashGuardTests from './FlashCrashGuard.test';
 import * as StrategyApiConsensusTests from './StrategyApiConsensus.test';
+import * as RiskApiRoutesTests from './RiskApiRoutes.test';
 import * as AnalyticsEngineMetricsTests from './AnalyticsEngineMetrics.test';
 import * as TelemetryApiTests from './TelemetryApi.test';
 import * as AnalyticsApiFallbackTests from './AnalyticsApiFallback.test';
@@ -46,7 +49,6 @@ export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'SessionVwapTracker', fn: SessionVwapTrackerTests.runTests },
     { name: 'BackfillCoordinator', fn: BackfillCoordinatorTests.runTests },
     { name: 'HtfStructureMonitor', fn: HtfStructureMonitorTests.runTests },
-    { name: 'OrchestratorV1', fn: OrchestratorV1Tests.runTests },
     { name: 'LatencyClamp', fn: LatencyTests.runTests },
     { name: 'SequenceRule', fn: SequenceRuleTests.runTests },
     { name: 'ReconnectContinuity', fn: ReconnectTests.runTests },
@@ -56,6 +58,7 @@ export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'ProfitLock', fn: ProfitLockTests.runTests },
     { name: 'OrderPlan', fn: OrderPlanTests.runTests },
     { name: 'DryRunEngine', fn: DryRunEngineTests.runTests },
+    { name: 'DryRunSizingModel', fn: DryRunSizingModelTests.runTests },
     { name: 'DryRunSessionService', fn: DryRunSessionServiceTests.runTests },
     { name: 'Normalization', fn: NormalizationTests.runTests },
     { name: 'RegimeSelector', fn: RegimeSelectorTests.runTests },
@@ -63,11 +66,14 @@ export const testSuites: { name: string; fn: () => void | Promise<void> }[] = [
     { name: 'OrderbookIntegrityMonitor', fn: OrderbookIntegrityMonitorTests.runTests },
     { name: 'StrategyHysteresis', fn: StrategyHysteresisTests.runTests },
     { name: 'HardReversal', fn: HardReversalTests.runTests },
+    { name: 'StrategyRiskTuning', fn: StrategyRiskTuningTests.runTests },
     { name: 'DryRunClock', fn: DryRunClockTests.runTests },
     { name: 'FreezeController', fn: FreezeControllerTests.runTests },
     { name: 'PositionSizer', fn: PositionSizerTests.runTests },
     { name: 'ResiliencePatches', fn: ResiliencePatchesTests.runTests },
+    { name: 'FlashCrashGuard', fn: FlashCrashGuardTests.runTests },
     { name: 'StrategyApiConsensus', fn: StrategyApiConsensusTests.runTests },
+    { name: 'RiskApiRoutes', fn: RiskApiRoutesTests.runTests },
     { name: 'AnalyticsEngineMetrics', fn: AnalyticsEngineMetricsTests.runTests },
     { name: 'TelemetryApi', fn: TelemetryApiTests.runTests },
     { name: 'AnalyticsApiFallback', fn: AnalyticsApiFallbackTests.runTests },

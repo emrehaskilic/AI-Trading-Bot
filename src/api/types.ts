@@ -239,24 +239,84 @@ export interface ResilienceStatus {
 // Dry Run Types
 // =============================================================================
 
+export interface SymbolCapitalConfig {
+  symbol: string;
+  enabled: boolean;
+  walletReserveUsdt: number;
+  initialMarginUsdt: number;
+  leverage: number;
+}
+
+export type DryRunTrendState =
+  | 'UPTREND'
+  | 'DOWNTREND'
+  | 'PULLBACK_UP'
+  | 'PULLBACK_DOWN'
+  | 'RANGE'
+  | 'EXHAUSTION_UP'
+  | 'EXHAUSTION_DOWN';
+
+export interface WarmupState {
+  bootstrapDone: boolean;
+  bootstrapBars1m: number;
+  htfReady: boolean;
+  orderflow1mReady: boolean;
+  orderflow5mReady: boolean;
+  orderflow15mReady: boolean;
+  tradeReady: boolean;
+  addonReady: boolean;
+  vetoReason: string | null;
+}
+
 export interface DryRunStatus {
   running: boolean;
   runId: string | null;
   symbols: string[];
+  config?: {
+    sharedWalletStartUsdt: number;
+    reserveScale: number;
+    totalConfiguredReserveUsdt: number;
+    totalEffectiveReserveUsdt: number;
+    leverage?: number;
+    makerFeeRate?: number;
+    takerFeeRate?: number;
+    maintenanceMarginRate?: number;
+    fundingIntervalMs?: number;
+    heartbeatIntervalMs?: number;
+    startupMode?: 'WAIT_MICRO_WARMUP';
+    symbolConfigs?: SymbolCapitalConfig[];
+  };
   summary: {
     totalEquity: number;
     walletBalance: number;
-    totalUnrealizedPnl: number;
-    totalRealizedPnl: number;
-    totalFees: number;
+    unrealizedPnl?: number;
+    realizedPnl?: number;
+    feePaid?: number;
+    fundingPnl?: number;
+    marginHealth?: number;
+    totalUnrealizedPnl?: number;
+    totalRealizedPnl?: number;
+    totalFees?: number;
   };
   perSymbol: Record<string, DryRunSymbolStatus>;
-  config?: {
-    superScalpEnabled?: boolean;
-  };
 }
 
 export interface DryRunSymbolStatus {
+  symbol?: string;
+  capital?: {
+    configuredReserveUsdt: number;
+    effectiveReserveUsdt: number;
+    initialMarginUsdt: number;
+    leverage: number;
+    reserveScale: number;
+  };
+  warmup?: WarmupState;
+  trend?: {
+    state: DryRunTrendState;
+    confidence: number;
+    bias15m: 'UP' | 'DOWN' | 'NEUTRAL';
+    veto1h: 'NONE' | 'UP' | 'DOWN' | 'EXHAUSTION';
+  };
   position: {
     side: 'LONG' | 'SHORT' | null;
     qty: number;
@@ -276,12 +336,16 @@ export interface DryRunSymbolStatus {
     dynamicLeverage: number;
     liquidationDistancePct: number;
   };
+  warnings?: string[];
 }
 
 export interface DryRunStartRequest {
   symbols?: string[];
   symbol?: string;
   runId?: string;
+  sharedWalletStartUsdt?: number;
+  symbolConfigs?: SymbolCapitalConfig[];
+  startupMode?: 'WAIT_MICRO_WARMUP';
   walletBalanceStartUsdt?: number;
   initialMarginUsdt?: number;
   leverage?: number;
@@ -291,8 +355,6 @@ export interface DryRunStartRequest {
   fundingRates?: Record<string, number>;
   fundingIntervalMs?: number;
   heartbeatIntervalMs?: number;
-  debugAggressiveEntry?: boolean;
-  superScalpEnabled?: boolean;
 }
 
 // =============================================================================
@@ -309,8 +371,15 @@ export interface ExecutionStatus {
   };
   symbols: string[];
   settings: {
-    leverage: number;
+    leverage?: number;
+    reserveScale?: number;
+    totalConfiguredReserveUsdt?: number;
+    totalEffectiveReserveUsdt?: number;
+    totalMarginBudgetUsdt?: number;
+    symbolConfigs: SymbolCapitalConfig[];
     pairInitialMargins: Record<string, number>;
+    pairWalletReserves?: Record<string, number>;
+    pairLeverageCaps?: Record<string, number>;
   };
 }
 
@@ -320,6 +389,7 @@ export interface ExecutionConnectRequest {
 }
 
 export interface ExecutionSettingsRequest {
+  symbolConfigs?: SymbolCapitalConfig[];
   leverage?: number;
   pairInitialMargins?: Record<string, number>;
 }

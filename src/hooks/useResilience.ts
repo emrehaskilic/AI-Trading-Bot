@@ -1,34 +1,27 @@
-﻿import { useCallback, useMemo } from 'react';
+import { useCallback, useMemo } from 'react';
 import { usePolling } from './usePolling';
 import { withProxyApiKey } from '../services/proxyAuth';
 import { fetchApiJson } from '../services/apiFetch';
 
-export type GuardActionType =
-  | 'rate_limit_triggered'
-  | 'circuit_breaker_opened'
-  | 'circuit_breaker_closed'
-  | 'throttle_applied'
-  | 'request_dropped'
-  | 'error_spike_detected'
-  | 'recovery_initiated';
+export type GuardActionType = 'anti_spoof' | 'delta_burst' | 'latency' | 'flash_crash' | 'general';
 
 export interface GuardAction {
   id: string;
   timestamp: string;
   type: GuardActionType;
   source: string;
+  action: string;
   reason: string;
-  duration?: number;
+  severity: 'low' | 'medium' | 'high';
   metadata?: Record<string, unknown>;
 }
 
 export interface TriggerCounters {
-  rateLimit: number;
-  circuitBreaker: number;
-  throttle: number;
-  requestDrop: number;
-  errorSpike: number;
-  recovery: number;
+  antiSpoof: number;
+  deltaBurst: number;
+  latencySpike: number;
+  flashCrash: number;
+  total: number;
 }
 
 export interface ResilienceSnapshot {
@@ -36,6 +29,31 @@ export interface ResilienceSnapshot {
   guardActions: GuardAction[];
   triggerCounters: TriggerCounters;
   activeGuards: string[];
+  guards: {
+    antiSpoof: {
+      totalDetections: number;
+      activeSuspectedLevels: number;
+      totalLevelsTracked: number;
+      avgSpoofScore: number;
+      lastDetectionAt: number | null;
+    };
+    deltaBurst: {
+      totalBurstsDetected: number;
+      currentCooldownActive: boolean;
+      cooldownRemainingMs: number;
+      meanDelta: number;
+      stdDelta: number;
+      lastBurstAt: number | null;
+    };
+    latency: {
+      totalSamples: number;
+    };
+    flashCrash: {
+      totalDetections: number;
+      lastDetectionAt: number | null;
+      activeProtections: boolean;
+    };
+  };
   systemHealth: {
     status: 'healthy' | 'degraded' | 'unhealthy';
     message?: string;
@@ -49,19 +67,20 @@ export interface ResilienceSnapshot {
 
 interface BackendResilienceSnapshot {
   timestamp: number;
-  guards: {
-    deltaBurst: { currentCooldownActive: boolean };
-    flashCrash: { activeProtections: boolean };
+  guards: ResilienceSnapshot['guards'] & {
+    latency: {
+      stages: Record<string, {
+        avgMs: number;
+        p95Ms: number;
+        maxMs: number;
+        samples: number;
+      }>;
+      totalSamples: number;
+    };
   };
-  triggerCounters: {
-    antiSpoof: number;
-    deltaBurst: number;
-    latencySpike: number;
-    flashCrash: number;
-    total: number;
-  };
+  triggerCounters: TriggerCounters;
   recentActions: Array<{
-    guardType: 'anti_spoof' | 'delta_burst' | 'latency' | 'flash_crash' | 'general';
+    guardType: GuardActionType;
     timestamp: number;
     symbol?: string;
     action: string;
@@ -69,28 +88,6 @@ interface BackendResilienceSnapshot {
     severity: 'low' | 'medium' | 'high';
     metadata?: Record<string, unknown>;
   }>;
-}
-
-function mapActionType(
-  action: BackendResilienceSnapshot['recentActions'][number],
-): GuardActionType {
-  if (action.guardType === 'anti_spoof') return 'throttle_applied';
-  if (action.guardType === 'delta_burst') return 'rate_limit_triggered';
-  if (action.guardType === 'flash_crash') {
-    return String(action.action || '').toUpperCase().includes('ALLOW')
-      ? 'circuit_breaker_closed'
-      : 'circuit_breaker_opened';
-  }
-  if (action.guardType === 'latency') return 'error_spike_detected';
-
-  const reason = String(action.reason || '').toLowerCase();
-  if (reason.includes('recover') || reason.includes('healthy') || reason.includes('allow')) {
-    return 'recovery_initiated';
-  }
-  if (reason.includes('drop') || reason.includes('block') || reason.includes('no_trade')) {
-    return 'request_dropped';
-  }
-  return 'recovery_initiated';
 }
 
 export function useResilience(): {
@@ -110,64 +107,74 @@ export function useResilience(): {
     );
 
     const snapshotTs = Number(raw?.timestamp || Date.now());
-    const recentWindowMs = 45_000;
-    const recentActionsRaw = ((raw?.recentActions) || []).filter((action) => {
-      const actionTs = Number(action?.timestamp || 0);
-      if (!Number.isFinite(actionTs) || actionTs <= 0) return false;
-      const ageMs = snapshotTs - actionTs;
-      return ageMs >= 0 && ageMs <= recentWindowMs;
-    });
-
-    const guardActions: GuardAction[] = recentActionsRaw.map((action, index) => ({
+    const guardActions: GuardAction[] = ((raw?.recentActions) || []).map((action, index) => ({
       id: `${action.guardType}-${action.timestamp}-${index}`,
       timestamp: new Date(action.timestamp).toISOString(),
-      type: mapActionType(action),
+      type: action.guardType,
       source: action.symbol || action.guardType,
+      action: action.action,
       reason: action.reason,
-      duration: undefined,
+      severity: action.severity,
       metadata: action.metadata,
     }));
 
-    const triggerCounters: TriggerCounters = {
-      rateLimit: guardActions.filter((a) => a.type === 'rate_limit_triggered').length,
-      circuitBreaker: guardActions.filter((a) => a.type === 'circuit_breaker_opened').length,
-      throttle: guardActions.filter((a) => a.type === 'throttle_applied').length,
-      requestDrop: guardActions.filter((a) => a.type === 'request_dropped').length,
-      errorSpike: guardActions.filter((a) => a.type === 'error_spike_detected').length,
-      recovery: guardActions.filter((a) => a.type === 'recovery_initiated' || a.type === 'circuit_breaker_closed').length,
-    };
-
     const activeGuards: string[] = [];
+    if (raw?.guards?.antiSpoof?.activeSuspectedLevels > 0) activeGuards.push('anti_spoof');
     if (raw?.guards?.deltaBurst?.currentCooldownActive) activeGuards.push('delta_burst');
     if (raw?.guards?.flashCrash?.activeProtections) activeGuards.push('flash_crash');
 
-    const highSeverityRecent = recentActionsRaw.some((action) => action.severity === 'high');
-    const mediumOrHighNonGeneral = recentActionsRaw.filter((action) => (
-      action.guardType !== 'general' && action.severity !== 'low'
-    )).length;
-    const hasActiveProtection = Boolean(raw?.guards?.deltaBurst?.currentCooldownActive || raw?.guards?.flashCrash?.activeProtections);
-
     const status = raw?.guards?.flashCrash?.activeProtections
       ? 'unhealthy'
-      : (hasActiveProtection || highSeverityRecent || mediumOrHighNonGeneral >= 3)
+      : activeGuards.length > 0
         ? 'degraded'
         : 'healthy';
 
     return {
       timestamp: new Date(snapshotTs).toISOString(),
       guardActions,
-      triggerCounters,
+      triggerCounters: raw?.triggerCounters || {
+        antiSpoof: 0,
+        deltaBurst: 0,
+        latencySpike: 0,
+        flashCrash: 0,
+        total: 0,
+      },
       activeGuards,
+      guards: {
+        antiSpoof: raw?.guards?.antiSpoof || {
+          totalDetections: 0,
+          activeSuspectedLevels: 0,
+          totalLevelsTracked: 0,
+          avgSpoofScore: 0,
+          lastDetectionAt: null,
+        },
+        deltaBurst: raw?.guards?.deltaBurst || {
+          totalBurstsDetected: 0,
+          currentCooldownActive: false,
+          cooldownRemainingMs: 0,
+          meanDelta: 0,
+          stdDelta: 0,
+          lastBurstAt: null,
+        },
+        latency: {
+          totalSamples: Number(raw?.guards?.latency?.totalSamples || 0),
+        },
+        flashCrash: raw?.guards?.flashCrash || {
+          totalDetections: 0,
+          lastDetectionAt: null,
+          activeProtections: false,
+        },
+      },
       systemHealth: {
         status,
         message: status === 'healthy'
           ? 'No active resilience suppressions'
           : status === 'unhealthy'
-            ? 'Critical resilience protections active'
-            : 'Recent resilience suppressions detected',
+            ? 'Flash-crash protections active'
+            : 'Resilience guards recently active',
       },
-      recentEvents: recentActionsRaw.slice(-10).map((action) => ({
-        timestamp: new Date(action.timestamp).toISOString(),
+      recentEvents: guardActions.slice(-10).map((action) => ({
+        timestamp: action.timestamp,
         event: action.reason,
         severity: action.severity === 'high'
           ? 'error'
@@ -197,10 +204,8 @@ export function useResilience(): {
   }, [polling.data?.guardActions]);
 
   const totalTriggers = useMemo(() => {
-    const counters = polling.data?.triggerCounters;
-    if (!counters) return 0;
-    return Object.values(counters).reduce((sum, count) => sum + count, 0);
-  }, [polling.data?.triggerCounters]);
+    return Number(polling.data?.triggerCounters.total || 0);
+  }, [polling.data?.triggerCounters.total]);
 
   return useMemo(() => ({
     data: polling.data ?? null,

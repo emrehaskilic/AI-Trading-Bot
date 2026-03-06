@@ -51,7 +51,8 @@ export interface RiskSnapshotResponse {
 
 // Options for creating risk routes
 export interface RiskRoutesOptions {
-  riskStateManager: RiskStateManager;
+  riskStateManager?: RiskStateManager;
+  getRiskStateManager?: () => RiskStateManager;
   killSwitchManager?: {
     isActive: () => boolean;
     getLastTrigger: () => { timestamp: number; reason: string } | null;
@@ -62,7 +63,14 @@ export interface RiskRoutesOptions {
     availableMargin: number;
     marginUtilizationPercent: number;
   };
-  riskLimits: {
+  riskLimits?: {
+    maxPositionNotional: number;
+    maxLeverage: number;
+    maxPositionQty: number;
+    dailyLossLimit: number;
+    reducedRiskPositionMultiplier: number;
+  };
+  getRiskLimits?: () => {
     maxPositionNotional: number;
     maxLeverage: number;
     maxPositionQty: number;
@@ -77,10 +85,12 @@ export interface RiskRoutesOptions {
 export function createRiskRoutes(options: RiskRoutesOptions): Router {
   const router = Router();
   const { 
-    riskStateManager, 
+    riskStateManager,
+    getRiskStateManager,
     killSwitchManager, 
     getPositionExposure,
-    riskLimits 
+    riskLimits,
+    getRiskLimits,
   } = options;
 
   /**
@@ -90,16 +100,21 @@ export function createRiskRoutes(options: RiskRoutesOptions): Router {
   router.get('/snapshot', (_req: Request, res: Response) => {
     try {
       const now = Date.now();
+      const resolvedRiskStateManager = getRiskStateManager ? getRiskStateManager() : riskStateManager;
+      const resolvedRiskLimits = getRiskLimits ? getRiskLimits() : riskLimits;
+      if (!resolvedRiskStateManager || !resolvedRiskLimits) {
+        throw new Error('risk_routes_not_configured');
+      }
       
       // Get current state
-      const currentState = riskStateManager.getCurrentState();
-      const canTrade = riskStateManager.canTrade();
-      const canOpenPosition = riskStateManager.canOpenPosition();
-      const isReducedRisk = riskStateManager.isReducedRisk();
-      const positionSizeMultiplier = riskStateManager.getPositionSizeMultiplier();
+      const currentState = resolvedRiskStateManager.getCurrentState();
+      const canTrade = resolvedRiskStateManager.canTrade();
+      const canOpenPosition = resolvedRiskStateManager.canOpenPosition();
+      const isReducedRisk = resolvedRiskStateManager.isReducedRisk();
+      const positionSizeMultiplier = resolvedRiskStateManager.getPositionSizeMultiplier();
       
       // Get transition history
-      const transitionHistory = riskStateManager.getTransitionHistory();
+      const transitionHistory = resolvedRiskStateManager.getTransitionHistory();
       const lastTrigger = transitionHistory.length > 0 
         ? transitionHistory[transitionHistory.length - 1] 
         : null;
@@ -132,7 +147,7 @@ export function createRiskRoutes(options: RiskRoutesOptions): Router {
           isReducedRisk,
           positionSizeMultiplier,
         },
-        limits: riskLimits,
+        limits: resolvedRiskLimits,
         triggers: {
           lastTrigger,
           recentTriggers,
@@ -157,11 +172,15 @@ export function createRiskRoutes(options: RiskRoutesOptions): Router {
    */
   router.get('/state', (_req: Request, res: Response) => {
     try {
-      const currentState = riskStateManager.getCurrentState();
-      const canTrade = riskStateManager.canTrade();
-      const canOpenPosition = riskStateManager.canOpenPosition();
-      const isReducedRisk = riskStateManager.isReducedRisk();
-      const positionSizeMultiplier = riskStateManager.getPositionSizeMultiplier();
+      const resolvedRiskStateManager = getRiskStateManager ? getRiskStateManager() : riskStateManager;
+      if (!resolvedRiskStateManager) {
+        throw new Error('risk_routes_not_configured');
+      }
+      const currentState = resolvedRiskStateManager.getCurrentState();
+      const canTrade = resolvedRiskStateManager.canTrade();
+      const canOpenPosition = resolvedRiskStateManager.canOpenPosition();
+      const isReducedRisk = resolvedRiskStateManager.isReducedRisk();
+      const positionSizeMultiplier = resolvedRiskStateManager.getPositionSizeMultiplier();
       
       res.status(200).json({
         timestamp: Date.now(),
@@ -185,9 +204,13 @@ export function createRiskRoutes(options: RiskRoutesOptions): Router {
    */
   router.get('/limits', (_req: Request, res: Response) => {
     try {
+      const resolvedRiskLimits = getRiskLimits ? getRiskLimits() : riskLimits;
+      if (!resolvedRiskLimits) {
+        throw new Error('risk_routes_not_configured');
+      }
       res.status(200).json({
         timestamp: Date.now(),
-        limits: riskLimits,
+        limits: resolvedRiskLimits,
       });
     } catch (error: any) {
       res.status(500).json({
@@ -203,7 +226,11 @@ export function createRiskRoutes(options: RiskRoutesOptions): Router {
    */
   router.get('/triggers', (_req: Request, res: Response) => {
     try {
-      const transitionHistory = riskStateManager.getTransitionHistory();
+      const resolvedRiskStateManager = getRiskStateManager ? getRiskStateManager() : riskStateManager;
+      if (!resolvedRiskStateManager) {
+        throw new Error('risk_routes_not_configured');
+      }
+      const transitionHistory = resolvedRiskStateManager.getTransitionHistory();
       
       // Count triggers by type
       const triggerCounts: Record<string, number> = {};

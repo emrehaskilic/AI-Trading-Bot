@@ -6,6 +6,7 @@ import { IExecutor } from '../execution/types';
 import { TradeLogger } from '../logger/TradeLogger';
 import { FundingRateMonitor } from '../metrics/FundingRateMonitor';
 import { AlertService } from '../notifications/AlertService';
+import { SymbolCapitalConfig, materializeSymbolCapitalConfigs } from '../types/capital';
 import { logger } from '../utils/logger';
 import { SymbolActor } from './Actor';
 import { DecisionEngine } from './Decision';
@@ -70,7 +71,13 @@ export class Orchestrator {
   private capitalSettings = {
     leverage: 10,
     totalMarginBudgetUsdt: 0,
+    reserveScale: 1,
+    totalConfiguredReserveUsdt: 0,
+    totalEffectiveReserveUsdt: 0,
+    symbolConfigs: [] as SymbolCapitalConfig[],
     pairInitialMargins: {} as Record<string, number>,
+    pairWalletReserves: {} as Record<string, number>,
+    pairLeverageCaps: {} as Record<string, number>,
   };
 
   constructor(
@@ -325,8 +332,14 @@ export class Orchestrator {
       selectedSymbols,
       settings: {
         leverage: this.capitalSettings.leverage,
+        reserveScale: this.capitalSettings.reserveScale,
+        totalConfiguredReserveUsdt: this.capitalSettings.totalConfiguredReserveUsdt,
+        totalEffectiveReserveUsdt: this.capitalSettings.totalEffectiveReserveUsdt,
         totalMarginBudgetUsdt: this.capitalSettings.totalMarginBudgetUsdt,
+        symbolConfigs: [...this.capitalSettings.symbolConfigs],
         pairInitialMargins: { ...this.capitalSettings.pairInitialMargins },
+        pairWalletReserves: { ...this.capitalSettings.pairWalletReserves },
+        pairLeverageCaps: { ...this.capitalSettings.pairLeverageCaps },
       },
       wallet: {
         totalWalletUsdt: totalWallet,
@@ -364,6 +377,7 @@ export class Orchestrator {
   }
 
   async updateCapitalSettings(input: {
+    symbolConfigs?: SymbolCapitalConfig[];
     leverage?: number;
     pairInitialMargins?: Record<string, number>;
   }) {
@@ -372,7 +386,35 @@ export class Orchestrator {
       this.connector.setPreferredLeverage(this.capitalSettings.leverage);
     }
 
-    if (input.pairInitialMargins && typeof input.pairInitialMargins === 'object') {
+    this.capitalSettings.totalMarginBudgetUsdt = Math.max(0, this.connector.getWalletBalance() || 0);
+    if (Array.isArray(input.symbolConfigs) && input.symbolConfigs.length > 0) {
+      const materialized = materializeSymbolCapitalConfigs({
+        configs: input.symbolConfigs,
+        totalWalletUsdt: this.capitalSettings.totalMarginBudgetUsdt,
+      });
+      const pairInitialMargins: Record<string, number> = {};
+      const pairWalletReserves: Record<string, number> = {};
+      const pairLeverageCaps: Record<string, number> = {};
+      for (const row of materialized.symbolConfigs) {
+        pairInitialMargins[row.symbol] = row.effectiveInitialMarginUsdt;
+        pairWalletReserves[row.symbol] = row.effectiveReserveUsdt;
+        pairLeverageCaps[row.symbol] = Math.min(this.config.maxLeverage, Math.max(1, Math.trunc(row.leverage)));
+      }
+      this.capitalSettings.reserveScale = materialized.reserveScale;
+      this.capitalSettings.totalConfiguredReserveUsdt = materialized.totalConfiguredReserveUsdt;
+      this.capitalSettings.totalEffectiveReserveUsdt = materialized.totalEffectiveReserveUsdt;
+      this.capitalSettings.symbolConfigs = materialized.symbolConfigs.map((row) => ({
+        symbol: row.symbol,
+        enabled: row.enabled,
+        walletReserveUsdt: row.walletReserveUsdt,
+        initialMarginUsdt: row.initialMarginUsdt,
+        leverage: row.leverage,
+      }));
+      this.capitalSettings.pairInitialMargins = pairInitialMargins;
+      this.capitalSettings.pairWalletReserves = pairWalletReserves;
+      this.capitalSettings.pairLeverageCaps = pairLeverageCaps;
+      this.connector.setSymbolLeverageCaps(pairLeverageCaps);
+    } else if (input.pairInitialMargins && typeof input.pairInitialMargins === 'object') {
       const normalized: Record<string, number> = {};
       for (const [symbol, rawMargin] of Object.entries(input.pairInitialMargins)) {
         const margin = Number(rawMargin);
@@ -381,14 +423,33 @@ export class Orchestrator {
         }
       }
       this.capitalSettings.pairInitialMargins = normalized;
+      this.capitalSettings.pairWalletReserves = { ...normalized };
+      this.capitalSettings.pairLeverageCaps = Object.fromEntries(
+        Object.keys(normalized).map((symbol) => [symbol, this.capitalSettings.leverage]),
+      );
+      this.capitalSettings.symbolConfigs = Object.entries(normalized).map(([symbol, margin]) => ({
+        symbol,
+        enabled: true,
+        walletReserveUsdt: margin,
+        initialMarginUsdt: margin,
+        leverage: this.capitalSettings.leverage,
+      }));
+      this.capitalSettings.reserveScale = 1;
+      this.capitalSettings.totalConfiguredReserveUsdt = Object.values(normalized).reduce((sum, value) => sum + value, 0);
+      this.capitalSettings.totalEffectiveReserveUsdt = this.capitalSettings.totalConfiguredReserveUsdt;
+      this.connector.setSymbolLeverageCaps(this.capitalSettings.pairLeverageCaps);
     }
-
-    this.capitalSettings.totalMarginBudgetUsdt = Math.max(0, this.connector.getWalletBalance() || 0);
 
     return {
       leverage: this.capitalSettings.leverage,
+      reserveScale: this.capitalSettings.reserveScale,
+      totalConfiguredReserveUsdt: this.capitalSettings.totalConfiguredReserveUsdt,
+      totalEffectiveReserveUsdt: this.capitalSettings.totalEffectiveReserveUsdt,
       totalMarginBudgetUsdt: this.capitalSettings.totalMarginBudgetUsdt,
+      symbolConfigs: [...this.capitalSettings.symbolConfigs],
       pairInitialMargins: { ...this.capitalSettings.pairInitialMargins },
+      pairWalletReserves: { ...this.capitalSettings.pairWalletReserves },
+      pairLeverageCaps: { ...this.capitalSettings.pairLeverageCaps },
     };
   }
 
@@ -512,7 +573,7 @@ export class Orchestrator {
     const decisionEngine = new DecisionEngine({
       expectedPrice: (sym, side, type, limitPrice) => this.connector.expectedPrice(sym, side, type, limitPrice),
       getCurrentMarginBudgetUsdt: (sym) => this.getCurrentMarginBudgetUsdt(sym),
-      getMaxLeverage: () => this.getEffectiveLeverage(),
+      getMaxLeverage: () => this.getEffectiveLeverage(normalized),
       hardStopLossPct: this.config.hardStopLossPct,
       liquidationEmergencyMarginRatio: this.config.liquidationEmergencyMarginRatio,
       allowedSides: this.config.plan.allowedSides,
@@ -570,7 +631,7 @@ export class Orchestrator {
       getStartingMarginUsdt: () => this.getStartingMarginUsdt(normalized),
       getCurrentMarginBudgetUsdt: () => this.getCurrentMarginBudgetUsdt(normalized),
       getRampMult: () => 1,
-      getEffectiveLeverage: () => this.getEffectiveLeverage(),
+      getEffectiveLeverage: () => this.getEffectiveLeverage(normalized),
       getExecutionReady: () => this.getExecutionGateState().ready,
       getBackoffActive: () => this.connector.isRateLimitBackoffActive(),
       getFundingShortBlocked: () => this.isFundingShortBlocked(normalized),
@@ -596,7 +657,8 @@ export class Orchestrator {
   }
 
   private getStartingMarginUsdt(symbol: string): number {
-    const override = Number(this.capitalSettings.pairInitialMargins[symbol]);
+    const normalized = symbol.toUpperCase();
+    const override = Number(this.capitalSettings.pairInitialMargins[normalized]);
     if (Number.isFinite(override) && override > 0) {
       return override;
     }
@@ -604,7 +666,12 @@ export class Orchestrator {
   }
 
   private getCurrentMarginBudgetUsdt(symbol: string): number {
-    const override = Number(this.capitalSettings.pairInitialMargins[symbol]);
+    const normalized = symbol.toUpperCase();
+    const reserveOverride = Number(this.capitalSettings.pairWalletReserves[normalized]);
+    if (Number.isFinite(reserveOverride) && reserveOverride > 0) {
+      return reserveOverride;
+    }
+    const override = Number(this.capitalSettings.pairInitialMargins[normalized]);
     if (Number.isFinite(override) && override > 0) {
       return override;
     }
@@ -618,7 +685,12 @@ export class Orchestrator {
     return budget;
   }
 
-  private getEffectiveLeverage(): number {
+  private getEffectiveLeverage(symbol?: string): number {
+    const normalized = String(symbol || '').toUpperCase();
+    const override = normalized ? Number(this.capitalSettings.pairLeverageCaps[normalized]) : NaN;
+    if (Number.isFinite(override) && override > 0) {
+      return Math.min(override, this.config.maxLeverage);
+    }
     return Math.min(this.capitalSettings.leverage, this.config.maxLeverage);
   }
 
@@ -644,7 +716,7 @@ export class Orchestrator {
       void this.triggerDailyKillSwitch('daily_drawdown', daily.drawdownPct);
     }
 
-    const leverage = this.getEffectiveLeverage();
+    const leverage = this.getEffectiveLeverage(symbol);
     const notional = close.entryPrice * close.qty;
     const margin = leverage > 0 ? notional / leverage : notional;
     const feeRate = this.config.takerFeeBps / 10_000;
@@ -776,7 +848,7 @@ export class Orchestrator {
 
   private async executePlannedOrder(order: PlannedOrder) {
     let side = order.side;
-    const leverage = this.getEffectiveLeverage();
+    const leverage = this.getEffectiveLeverage(order.symbol);
     const marginBudget = this.getCurrentMarginBudgetUsdt(order.symbol);
     const bufferBps = 0;
 
@@ -1031,7 +1103,7 @@ export class Orchestrator {
 
       const expectedPrice = action.expectedPrice ?? this.connector.expectedPrice(symbol, side, 'MARKET');
       const price = typeof expectedPrice === 'number' && Number.isFinite(expectedPrice) ? expectedPrice : 0;
-      const leverage = this.getEffectiveLeverage();
+      const leverage = this.getEffectiveLeverage(symbol);
       const marginBudget = this.getCurrentMarginBudgetUsdt(symbol);
       const bufferBps = 0;
       const auditBase = {

@@ -25,6 +25,13 @@ export interface ResiliencePatchesConfig {
   churn?: Partial<ChurnDetectionConfig>;
   latency?: Partial<LatencyGuardConfig>;
   flashCrash?: Partial<FlashCrashConfig>;
+  onGuardAction?: (event: {
+    symbol?: string;
+    action: 'ALLOW' | 'SUPPRESS' | 'NO_TRADE' | 'HALT' | 'KILL_SWITCH';
+    reason: string;
+    timestampMs: number;
+    metadata?: Record<string, unknown>;
+  }) => void;
   // Global settings
   enableAll: boolean;
   autoKillSwitch: boolean;
@@ -70,6 +77,7 @@ const DEFAULT_CONFIG: ResiliencePatchesConfig = {
  */
 export class ResiliencePatches {
   private readonly config: ResiliencePatchesConfig;
+  private readonly onGuardAction?: ResiliencePatchesConfig['onGuardAction'];
   
   // Patch registries
   private antiSpoofRegistry: AntiSpoofGuardRegistry;
@@ -91,6 +99,7 @@ export class ResiliencePatches {
 
   constructor(config?: Partial<ResiliencePatchesConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.onGuardAction = this.config.onGuardAction;
     
     // Initialize registries with config
     this.antiSpoofRegistry = new AntiSpoofGuardRegistry(this.config.antiSpoof);
@@ -210,6 +219,7 @@ export class ResiliencePatches {
     const result = this.latencyGuard.recordLatency(latencyMs, timestampMs, type);
     
     if (result.shouldTriggerKillSwitch && this.config.autoKillSwitch) {
+      this.emitGuardAction(undefined, 'KILL_SWITCH', `latency_violation_${result.reason}`, timestampMs, { type, latencyMs });
       this.triggerKillSwitch(RiskStateTrigger.LATENCY_SPIKE, `Latency violation: ${result.reason}`, timestampMs);
     }
   }
@@ -231,6 +241,13 @@ export class ResiliencePatches {
     const result = guard.recordTick({ price, volume, timestampMs, bestBid, bestAsk });
     
     if (result.shouldKillSwitch) {
+      this.emitGuardAction(symbol, 'KILL_SWITCH', result.reason, timestampMs, {
+        price,
+        volume,
+        bestBid,
+        bestAsk,
+        gapPercent: result.gapPercent,
+      });
       this.triggerKillSwitch(RiskStateTrigger.VOLATILITY_SPIKE, `Flash crash on ${symbol}: ${result.reason}`, timestampMs);
     }
   }
@@ -250,6 +267,11 @@ export class ResiliencePatches {
     const result = guard.recordOrderbook(bestBid, bestAsk, timestampMs);
     
     if (result.shouldKillSwitch) {
+      this.emitGuardAction(symbol, 'KILL_SWITCH', result.reason, timestampMs, {
+        bestBid,
+        bestAsk,
+        spreadPercent: result.spreadPercent,
+      });
       this.triggerKillSwitch(RiskStateTrigger.VOLATILITY_SPIKE, `Liquidity vacuum on ${symbol}: ${result.reason}`, timestampMs);
     }
   }
@@ -259,8 +281,8 @@ export class ResiliencePatches {
    */
   getOBI(
     symbol: string,
-    bids: Map<number, number>,
-    asks: Map<number, number>,
+    bids: Map<number, number> | [number, number][],
+    asks: Map<number, number> | [number, number][],
     depth: number,
     timestampMs: number
   ): { obi: number; obiWeighted: number; spoofAdjusted: boolean } {
@@ -435,6 +457,26 @@ export class ResiliencePatches {
     this.flashCrashRegistry.stopAll();
   }
 
+  getAntiSpoofGuards(): Map<string, AntiSpoofGuard> {
+    return this.antiSpoofRegistry.getGuardMap();
+  }
+
+  getDeltaBurstFilters(): Map<string, DeltaBurstFilter> {
+    return this.deltaBurstRegistry.getFilterMap();
+  }
+
+  getFlashCrashDetector(): {
+    getDetectionCount: () => number;
+    getLastDetectionTime: () => number | null;
+    isProtectionActive: () => boolean;
+  } {
+    return {
+      getDetectionCount: () => this.flashCrashRegistry.getDetectionCount(),
+      getLastDetectionTime: () => this.flashCrashRegistry.getLastDetectionTime(),
+      isProtectionActive: () => this.flashCrashRegistry.isProtectionActive(),
+    };
+  }
+
   // Private helpers
 
   private checkKillSwitchTriggers(timestampMs: number): void {
@@ -465,6 +507,22 @@ export class ResiliencePatches {
     } else if (this.stateManager) {
       this.stateManager.transition(trigger, reason, { timestamp: timestampMs });
     }
+  }
+
+  private emitGuardAction(
+    symbol: string | undefined,
+    action: 'ALLOW' | 'SUPPRESS' | 'NO_TRADE' | 'HALT' | 'KILL_SWITCH',
+    reason: string,
+    timestampMs: number,
+    metadata?: Record<string, unknown>
+  ): void {
+    this.onGuardAction?.({
+      symbol,
+      action,
+      reason,
+      timestampMs,
+      metadata,
+    });
   }
 
   private getAggregatedAntiSpoofStatus(timestampMs: number): { 

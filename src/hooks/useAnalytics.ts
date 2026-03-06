@@ -48,6 +48,7 @@ export interface OpenPositionSummary {
 
 export interface AnalyticsSnapshot {
   timestamp: string;
+  source: 'analytics' | 'dry_run_fallback';
   pnl: PnLMetrics;
   fees: FeeMetrics;
   slippage: SlippageMetrics;
@@ -65,6 +66,7 @@ export interface AnalyticsSnapshot {
 
 interface BackendAnalyticsSnapshot {
   timestamp: number;
+  source?: 'analytics' | 'dry_run_fallback';
   pnl: {
     totalRealizedPnl: number;
     totalFees: number;
@@ -128,6 +130,7 @@ export function useAnalytics(): {
 
     return {
       timestamp: new Date(raw?.timestamp || Date.now()).toISOString(),
+      source: raw?.source === 'dry_run_fallback' ? 'dry_run_fallback' : 'analytics',
       pnl: {
         realized: totalRealized,
         unrealized: Number(raw?.pnl?.unrealizedPnl || 0),

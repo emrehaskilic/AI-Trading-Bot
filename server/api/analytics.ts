@@ -10,6 +10,7 @@ import { AnalyticsEngine } from '../analytics/AnalyticsEngine';
 
 export interface AnalyticsSnapshotResponse {
   timestamp: number;
+  source: 'analytics' | 'dry_run_fallback';
   session: {
     sessionId: string;
     startTime: number;
@@ -299,6 +300,7 @@ export function createAnalyticsRoutes(options: AnalyticsRoutesOptions): Router {
 
       const response: AnalyticsSnapshotResponse = {
         timestamp: Date.now(),
+        source: useFallback ? 'dry_run_fallback' : 'analytics',
         session: {
           sessionId: snapshot.metadata.sessionId,
           startTime: snapshot.metadata.startTime,

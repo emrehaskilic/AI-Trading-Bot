@@ -33,8 +33,8 @@ interface ReorderBufferEntry {
 
 export interface OrderbookState {
   lastUpdateId: number;
-  bids: Map<number, number>;
-  asks: Map<number, number>;
+  bids: [number, number][];
+  asks: [number, number][];
   lastDepthTime: number;
   uiState: OrderbookUiState;
   resyncPromise: Promise<void> | null;
@@ -99,8 +99,8 @@ export function getOrCreateOrderbookState(stateMap: OrderbookStateMap, symbol: s
 export function createOrderbookState(): OrderbookState {
   return {
     lastUpdateId: 0,
-    bids: new Map(),
-    asks: new Map(),
+    bids: [],
+    asks: [],
     lastDepthTime: 0,
     uiState: 'INIT',
     resyncPromise: null,
@@ -114,8 +114,8 @@ export function createOrderbookState(): OrderbookState {
 
 export function resetOrderbookState(state: OrderbookState, options: ResetOrderbookOptions = {}): void {
   state.lastUpdateId = 0;
-  state.bids.clear();
-  state.asks.clear();
+  state.bids = [];
+  state.asks = [];
   state.lastDepthTime = 0;
   state.resyncPromise = null;
   state.buffer = [];
@@ -150,14 +150,18 @@ export function applySnapshot(state: OrderbookState, snapshot: DepthCache): Snap
     return result;
   }
 
-  state.bids.clear();
-  state.asks.clear();
+  state.bids = [];
+  state.asks = [];
 
   for (const [priceStr, qtyStr] of snapshot.bids || []) {
     const price = Number(priceStr);
     const qty = Number(qtyStr);
     if (Number.isFinite(price) && price > 0 && Number.isFinite(qty) && qty > 0) {
-      state.bids.set(price, qty);
+      let insertIndex = 0;
+      while (insertIndex < state.bids.length && state.bids[insertIndex][0] > price) {
+        insertIndex++;
+      }
+      state.bids.splice(insertIndex, 0, [price, qty]);
     }
   }
 
@@ -165,7 +169,11 @@ export function applySnapshot(state: OrderbookState, snapshot: DepthCache): Snap
     const price = Number(priceStr);
     const qty = Number(qtyStr);
     if (Number.isFinite(price) && price > 0 && Number.isFinite(qty) && qty > 0) {
-      state.asks.set(price, qty);
+      let insertIndex = 0;
+      while (insertIndex < state.asks.length && state.asks[insertIndex][0] < price) {
+        insertIndex++;
+      }
+      state.asks.splice(insertIndex, 0, [price, qty]);
     }
   }
 
@@ -221,18 +229,8 @@ export function applyDepthUpdate(state: OrderbookState, update: BufferedDepthUpd
 
   if (update.u <= state.lastUpdateId) {
     state.stats.dropped++;
-  return { ok: true, applied: false, dropped: true, buffered: false, gapDetected: false };
-}
-
-function bufferSnapshotBridgeUpdate(state: OrderbookState, update: BufferedDepthUpdate): void {
-  if (state.buffer.length >= SNAPSHOT_BRIDGE_BUFFER_MAX) {
-    // Keep most recent updates during prolonged snapshot waits.
-    state.buffer.shift();
-    state.stats.dropped++;
+    return { ok: true, applied: false, dropped: true, buffered: false, gapDetected: false };
   }
-  state.buffer.push(update);
-  state.stats.buffered++;
-}
 
   const expected = state.lastUpdateId + 1;
   if (evictExpiredReorderEntries(state, now, expected)) {
@@ -265,6 +263,16 @@ function bufferSnapshotBridgeUpdate(state: OrderbookState, update: BufferedDepth
     return { ok: false, applied: apply.applied, dropped: false, buffered: false, gapDetected: true };
   }
   return { ok: true, applied: apply.applied, dropped: false, buffered: false, gapDetected: false };
+}
+
+function bufferSnapshotBridgeUpdate(state: OrderbookState, update: BufferedDepthUpdate): void {
+  if (state.buffer.length >= SNAPSHOT_BRIDGE_BUFFER_MAX) {
+    // Keep most recent updates during prolonged snapshot waits.
+    state.buffer.shift();
+    state.stats.dropped++;
+  }
+  state.buffer.push(update);
+  state.stats.buffered++;
 }
 
 function canApplyDeltaInState(uiState: OrderbookUiState): boolean {
@@ -401,8 +409,7 @@ function applyDelta(state: OrderbookState, update: BufferedDepthUpdate): { appli
     if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(qty) || qty < 0) {
       continue;
     }
-    if (qty === 0) state.bids.delete(price);
-    else state.bids.set(price, qty);
+    upsertLevel(state.bids, price, qty, false);
   }
 
   for (const [p, q] of update.a) {
@@ -411,8 +418,7 @@ function applyDelta(state: OrderbookState, update: BufferedDepthUpdate): { appli
     if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(qty) || qty < 0) {
       continue;
     }
-    if (qty === 0) state.asks.delete(price);
-    else state.asks.set(price, qty);
+    upsertLevel(state.asks, price, qty, true);
   }
 
   // Keep depth maps bounded to prevent unbounded memory/CPU growth.
@@ -426,44 +432,56 @@ function applyDelta(state: OrderbookState, update: BufferedDepthUpdate): { appli
   return { applied: true, dropped: false };
 }
 
-function pruneLevels(levels: Map<number, number>, isAsk: boolean): void {
-  if (levels.size <= MAX_LEVELS_PER_SIDE) return;
-  const prices = Array.from(levels.keys()).sort((a, b) => isAsk ? a - b : b - a);
-  for (let i = MAX_LEVELS_PER_SIDE; i < prices.length; i += 1) {
-    levels.delete(prices[i]);
+function upsertLevel(levels: [number, number][], price: number, qty: number, isAsk: boolean): void {
+  const index = levels.findIndex((level) => level[0] === price);
+  if (qty === 0) {
+    if (index !== -1) {
+      levels.splice(index, 1);
+    }
+    return;
   }
+
+  if (index !== -1) {
+    levels[index][1] = qty;
+    return;
+  }
+
+  let insertIndex = 0;
+  while (
+    insertIndex < levels.length
+    && (isAsk ? levels[insertIndex][0] < price : levels[insertIndex][0] > price)
+  ) {
+    insertIndex += 1;
+  }
+  levels.splice(insertIndex, 0, [price, qty]);
+}
+
+function pruneLevels(levels: [number, number][], _isAsk: boolean): void {
+  if (levels.length <= MAX_LEVELS_PER_SIDE) return;
+  levels.splice(MAX_LEVELS_PER_SIDE);
 }
 
 export function bestBid(state: OrderbookState): number | null {
-  if (state.bids.size === 0) return null;
-  let max = -Infinity;
-  for (const p of state.bids.keys()) {
-    if (p > max) max = p;
-  }
-  return max;
+  if (state.bids.length === 0) return null;
+  return state.bids[0][0];
 }
 
 export function bestAsk(state: OrderbookState): number | null {
-  if (state.asks.size === 0) return null;
-  let min = Infinity;
-  for (const p of state.asks.keys()) {
-    if (p < min) min = p;
-  }
-  return min;
+  if (state.asks.length === 0) return null;
+  return state.asks[0][0];
 }
 
 export function getLevelSize(state: OrderbookState, price: number): number | undefined {
-  const bid = state.bids.get(price);
+  const bid = state.bids.find((level) => level[0] === price)?.[1];
   if (bid !== undefined) return bid;
-  return state.asks.get(price);
+  return state.asks.find((level) => level[0] === price)?.[1];
 }
 
 export function getTopLevels(
   state: OrderbookState,
   depth: number
 ): { bids: [number, number, number][]; asks: [number, number, number][] } {
-  const sortedBids = Array.from(state.bids.entries())
-    .sort((a, b) => b[0] - a[0])
+  const sortedBids = state.bids
     .slice(0, depth);
 
   let cumulativeBid = 0;
@@ -472,8 +490,7 @@ export function getTopLevels(
     return [price, size, cumulativeBid];
   });
 
-  const sortedAsks = Array.from(state.asks.entries())
-    .sort((a, b) => a[0] - b[0])
+  const sortedAsks = state.asks
     .slice(0, depth);
 
   let cumulativeAsk = 0;

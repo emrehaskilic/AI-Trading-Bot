@@ -5,19 +5,13 @@ import { formatDuration } from '../../utils/prometheusParser';
 interface TriggerCounterProps {
   label: string;
   count: number;
-  icon: React.ReactNode;
   colorClass: string;
 }
 
-const TriggerCounter = memo<TriggerCounterProps>(({ label, count, icon, colorClass }) => (
-  <div className="bg-zinc-800/50 rounded-lg p-3 flex items-center space-x-3">
-    <div className={`w-10 h-10 rounded-lg ${colorClass} bg-opacity-20 flex items-center justify-center`}>
-      {icon}
-    </div>
-    <div>
-      <div className="text-2xl font-bold text-zinc-200">{count}</div>
-      <div className="text-xs text-zinc-500">{label}</div>
-    </div>
+const TriggerCounter = memo<TriggerCounterProps>(({ label, count, colorClass }) => (
+  <div className="bg-zinc-800/50 rounded-lg p-3">
+    <div className={`text-2xl font-bold ${colorClass}`}>{count}</div>
+    <div className="text-xs text-zinc-500">{label}</div>
   </div>
 ));
 
@@ -29,92 +23,25 @@ interface GuardActionItemProps {
     timestamp: string;
     type: GuardActionType;
     source: string;
+    actionType: string;
     reason: string;
-    duration?: number;
+    severity: 'low' | 'medium' | 'high';
   };
 }
 
 const GuardActionItem = memo<GuardActionItemProps>(({ action }) => {
-  const typeConfig = useMemo(() => {
+  const config = useMemo(() => {
     switch (action.type) {
-      case 'rate_limit_triggered':
-        return {
-          icon: (
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-          ),
-          colorClass: 'text-yellow-400',
-          bgClass: 'bg-yellow-900/20',
-          label: 'Rate Limit',
-        };
-      case 'circuit_breaker_opened':
-      case 'circuit_breaker_closed':
-        return {
-          icon: (
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-            </svg>
-          ),
-          colorClass: action.type === 'circuit_breaker_opened' ? 'text-red-400' : 'text-green-400',
-          bgClass: action.type === 'circuit_breaker_opened' ? 'bg-red-900/20' : 'bg-green-900/20',
-          label: action.type === 'circuit_breaker_opened' ? 'Circuit Open' : 'Circuit Close',
-        };
-      case 'throttle_applied':
-        return {
-          icon: (
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 17l-5-5m0 0l5-5m-5 5h12" />
-            </svg>
-          ),
-          colorClass: 'text-orange-400',
-          bgClass: 'bg-orange-900/20',
-          label: 'Throttle',
-        };
-      case 'request_dropped':
-        return {
-          icon: (
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          ),
-          colorClass: 'text-red-400',
-          bgClass: 'bg-red-900/20',
-          label: 'Dropped',
-        };
-      case 'error_spike_detected':
-        return {
-          icon: (
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-            </svg>
-          ),
-          colorClass: 'text-red-400',
-          bgClass: 'bg-red-900/20',
-          label: 'Error Spike',
-        };
-      case 'recovery_initiated':
-        return {
-          icon: (
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-            </svg>
-          ),
-          colorClass: 'text-blue-400',
-          bgClass: 'bg-blue-900/20',
-          label: 'Recovery',
-        };
+      case 'flash_crash':
+        return { label: 'Flash Crash', colorClass: 'text-red-400', bgClass: 'bg-red-900/20' };
+      case 'latency':
+        return { label: 'Latency', colorClass: 'text-orange-400', bgClass: 'bg-orange-900/20' };
+      case 'delta_burst':
+        return { label: 'Delta Burst', colorClass: 'text-yellow-400', bgClass: 'bg-yellow-900/20' };
+      case 'anti_spoof':
+        return { label: 'Anti-Spoof', colorClass: 'text-blue-400', bgClass: 'bg-blue-900/20' };
       default:
-        return {
-          icon: (
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-          ),
-          colorClass: 'text-zinc-400',
-          bgClass: 'bg-zinc-800',
-          label: 'Unknown',
-        };
+        return { label: 'General', colorClass: 'text-zinc-400', bgClass: 'bg-zinc-800' };
     }
   }, [action.type]);
 
@@ -129,23 +56,13 @@ const GuardActionItem = memo<GuardActionItemProps>(({ action }) => {
   }, [action.timestamp]);
 
   return (
-    <div className={`flex items-start space-x-3 p-3 rounded-lg ${typeConfig.bgClass}`}>
-      <div className={`mt-0.5 ${typeConfig.colorClass}`}>{typeConfig.icon}</div>
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center justify-between">
-          <span className={`text-sm font-medium ${typeConfig.colorClass}`}>
-            {typeConfig.label}
-          </span>
-          <span className="text-xs text-zinc-500">{timeAgo}</span>
-        </div>
-        <div className="text-xs text-zinc-400 mt-1">{action.source}</div>
-        <div className="text-xs text-zinc-500 mt-0.5 truncate">{action.reason}</div>
-        {action.duration && (
-          <div className="text-xs text-zinc-600 mt-1">
-            Duration: {formatDuration(action.duration)}
-          </div>
-        )}
+    <div className={`rounded-lg p-3 ${config.bgClass}`}>
+      <div className="flex items-center justify-between">
+        <span className={`text-sm font-medium ${config.colorClass}`}>{config.label}</span>
+        <span className="text-xs text-zinc-500">{timeAgo}</span>
       </div>
+      <div className="mt-1 text-xs text-zinc-400">{action.source} | {action.actionType}</div>
+      <div className="mt-1 text-xs text-zinc-500 break-all">{action.reason}</div>
     </div>
   );
 });
@@ -157,44 +74,28 @@ export interface ResiliencePanelProps {
   maxActions?: number;
 }
 
-/**
- * Resilience Panel - Displays guard actions and trigger counters
- * Optimized with React.memo and useMemo for performance
- */
 export const ResiliencePanel = memo<ResiliencePanelProps>(({ className = '', maxActions = 5 }) => {
   const { data, isLoading, error, lastUpdated, getRecentActions, totalTriggers } = useResilience();
 
-  const recentActions = useMemo(() => getRecentActions(maxActions), [getRecentActions, maxActions]);
+  const recentActions = useMemo(() => (
+    getRecentActions(maxActions).map((action) => ({
+      ...action,
+      actionType: action.action,
+    }))
+  ), [getRecentActions, maxActions]);
 
   const counters = data?.triggerCounters;
-
   const systemHealthStatus = data?.systemHealth.status ?? 'unknown';
   const healthConfig = useMemo(() => {
     switch (systemHealthStatus) {
       case 'healthy':
-        return {
-          bgClass: 'bg-green-900/40',
-          textClass: 'text-green-400',
-          icon: '✓',
-        };
+        return { bgClass: 'bg-green-900/40', textClass: 'text-green-400', icon: 'OK' };
       case 'degraded':
-        return {
-          bgClass: 'bg-yellow-900/40',
-          textClass: 'text-yellow-400',
-          icon: '!',
-        };
+        return { bgClass: 'bg-yellow-900/40', textClass: 'text-yellow-400', icon: 'WARN' };
       case 'unhealthy':
-        return {
-          bgClass: 'bg-red-900/40',
-          textClass: 'text-red-400',
-          icon: '✕',
-        };
+        return { bgClass: 'bg-red-900/40', textClass: 'text-red-400', icon: 'HALT' };
       default:
-        return {
-          bgClass: 'bg-zinc-800',
-          textClass: 'text-zinc-500',
-          icon: '?',
-        };
+        return { bgClass: 'bg-zinc-800', textClass: 'text-zinc-500', icon: 'N/A' };
     }
   }, [systemHealthStatus]);
 
@@ -229,10 +130,9 @@ export const ResiliencePanel = memo<ResiliencePanelProps>(({ className = '', max
         )}
       </div>
 
-      {/* System Health */}
       <div className={`mb-4 p-3 rounded-lg ${healthConfig.bgClass} flex items-center justify-between`}>
         <div className="flex items-center space-x-2">
-          <span className={`text-lg ${healthConfig.textClass}`}>{healthConfig.icon}</span>
+          <span className={`text-xs font-semibold ${healthConfig.textClass}`}>{healthConfig.icon}</span>
           <span className={`text-sm font-medium ${healthConfig.textClass}`}>
             System {systemHealthStatus.charAt(0).toUpperCase() + systemHealthStatus.slice(1)}
           </span>
@@ -242,80 +142,74 @@ export const ResiliencePanel = memo<ResiliencePanelProps>(({ className = '', max
         )}
       </div>
 
-      {/* Total Triggers */}
       <div className="mb-4 p-4 bg-zinc-800/50 rounded-lg text-center">
         <div className="text-4xl font-bold text-zinc-200">{totalTriggers}</div>
         <div className="text-sm text-zinc-500">Total Triggers</div>
       </div>
 
-      {/* Trigger Counters */}
       <div className="mb-4">
         <h4 className="text-sm font-medium text-zinc-400 mb-2">Trigger Counters</h4>
-        <div className="grid grid-cols-2 gap-2">
-          <TriggerCounter
-            label="Rate Limit"
-            count={counters?.rateLimit ?? 0}
-            icon={
-              <svg className="w-5 h-5 text-yellow-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-            }
-            colorClass="text-yellow-400"
-          />
-          <TriggerCounter
-            label="Circuit Breaker"
-            count={counters?.circuitBreaker ?? 0}
-            icon={
-              <svg className="w-5 h-5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-              </svg>
-            }
-            colorClass="text-red-400"
-          />
-          <TriggerCounter
-            label="Throttle"
-            count={counters?.throttle ?? 0}
-            icon={
-              <svg className="w-5 h-5 text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 17l-5-5m0 0l5-5m-5 5h12" />
-              </svg>
-            }
-            colorClass="text-orange-400"
-          />
-          <TriggerCounter
-            label="Request Drop"
-            count={counters?.requestDrop ?? 0}
-            icon={
-              <svg className="w-5 h-5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-              </svg>
-            }
-            colorClass="text-red-400"
-          />
-          <TriggerCounter
-            label="Error Spike"
-            count={counters?.errorSpike ?? 0}
-            icon={
-              <svg className="w-5 h-5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-              </svg>
-            }
-            colorClass="text-red-400"
-          />
-          <TriggerCounter
-            label="Recovery"
-            count={counters?.recovery ?? 0}
-            icon={
-              <svg className="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-              </svg>
-            }
-            colorClass="text-blue-400"
-          />
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
+          <TriggerCounter label="Anti-Spoof" count={counters?.antiSpoof ?? 0} colorClass="text-blue-400" />
+          <TriggerCounter label="Delta Burst" count={counters?.deltaBurst ?? 0} colorClass="text-yellow-400" />
+          <TriggerCounter label="Latency" count={counters?.latencySpike ?? 0} colorClass="text-orange-400" />
+          <TriggerCounter label="Flash Crash" count={counters?.flashCrash ?? 0} colorClass="text-red-400" />
         </div>
       </div>
 
-      {/* Active Guards */}
+      <div className="mb-4 grid grid-cols-1 lg:grid-cols-2 gap-2 text-xs">
+        <div className="bg-zinc-800/40 rounded-lg p-3">
+          <div className="text-zinc-500">Flash Crash Guard</div>
+          <div className="mt-2 flex items-center justify-between text-zinc-300">
+            <span>Detections</span>
+            <span>{data?.guards.flashCrash.totalDetections ?? 0}</span>
+          </div>
+          <div className="mt-1 flex items-center justify-between text-zinc-300">
+            <span>Protection</span>
+            <span className={(data?.guards.flashCrash.activeProtections ?? false) ? 'text-red-400' : 'text-green-400'}>
+              {(data?.guards.flashCrash.activeProtections ?? false) ? 'active' : 'inactive'}
+            </span>
+          </div>
+        </div>
+        <div className="bg-zinc-800/40 rounded-lg p-3">
+          <div className="text-zinc-500">Delta Burst Guard</div>
+          <div className="mt-2 flex items-center justify-between text-zinc-300">
+            <span>Detections</span>
+            <span>{data?.guards.deltaBurst.totalBurstsDetected ?? 0}</span>
+          </div>
+          <div className="mt-1 flex items-center justify-between text-zinc-300">
+            <span>Cooldown</span>
+            <span>
+              {(data?.guards.deltaBurst.currentCooldownActive ?? false)
+                ? formatDuration(data?.guards.deltaBurst.cooldownRemainingMs ?? 0)
+                : 'inactive'}
+            </span>
+          </div>
+        </div>
+        <div className="bg-zinc-800/40 rounded-lg p-3">
+          <div className="text-zinc-500">Anti-Spoof Guard</div>
+          <div className="mt-2 flex items-center justify-between text-zinc-300">
+            <span>Suspected Levels</span>
+            <span>{data?.guards.antiSpoof.activeSuspectedLevels ?? 0}</span>
+          </div>
+          <div className="mt-1 flex items-center justify-between text-zinc-300">
+            <span>Total Detections</span>
+            <span>{data?.guards.antiSpoof.totalDetections ?? 0}</span>
+          </div>
+        </div>
+        <div className="bg-zinc-800/40 rounded-lg p-3">
+          <div className="text-zinc-500">Latency Guard</div>
+          <div className="mt-2 flex items-center justify-between text-zinc-300">
+            <span>Samples</span>
+            <span>{data?.guards.latency.totalSamples ?? 0}</span>
+          </div>
+          <div className="mt-1 flex items-center justify-between text-zinc-300">
+            <span>Triggered</span>
+            <span>{counters?.latencySpike ?? 0}</span>
+          </div>
+        </div>
+      </div>
+
       {data?.activeGuards && data.activeGuards.length > 0 && (
         <div className="mb-4">
           <h4 className="text-sm font-medium text-zinc-400 mb-2">
@@ -334,7 +228,6 @@ export const ResiliencePanel = memo<ResiliencePanelProps>(({ className = '', max
         </div>
       )}
 
-      {/* Recent Guard Actions */}
       <div>
         <h4 className="text-sm font-medium text-zinc-400 mb-2">
           Recent Actions ({recentActions.length})

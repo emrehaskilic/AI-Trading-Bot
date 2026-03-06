@@ -2,6 +2,7 @@ import React, { memo, useState, useCallback, useRef } from 'react';
 import { PanelErrorBoundary } from '../ErrorBoundary';
 import { useHealth } from '../../hooks/useHealth';
 import { useMetrics } from '../../hooks/useMetrics';
+import { useDryRunStatus } from '../../hooks/useDryRunStatus';
 import SystemStatusPanel from './SystemStatusPanel';
 import TelemetryPanel from './TelemetryPanel';
 import AnalyticsPanel from './AnalyticsPanel';
@@ -67,9 +68,10 @@ DashboardHeader.displayName = 'DashboardHeader';
 
 interface ConnectionStatusBarProps {
   state: 'connected' | 'degraded' | 'disconnected' | 'connecting';
+  dryRunActive: boolean;
 }
 
-const ConnectionStatusBar = memo<ConnectionStatusBarProps>(({ state }) => (
+const ConnectionStatusBar = memo<ConnectionStatusBarProps>(({ state, dryRunActive }) => (
   <div className={`px-4 py-1 text-xs text-center ${
     state === 'connected'
       ? 'bg-green-900/20 text-green-400'
@@ -91,11 +93,11 @@ const ConnectionStatusBar = memo<ConnectionStatusBarProps>(({ state }) => (
       }`}></span>
       <span>{
         state === 'connected'
-          ? 'Connected to trading system'
+          ? (dryRunActive ? 'Connected to trading system | dry run active' : 'Connected to trading system')
           : state === 'connecting'
             ? 'Connecting to trading system'
           : state === 'degraded'
-            ? 'Connected, waiting telemetry data'
+            ? (dryRunActive ? 'Connected | dry run active, telemetry partial' : 'Connected, waiting telemetry data')
             : 'Disconnected from trading system'
       }</span>
     </div>
@@ -124,14 +126,16 @@ const Dashboard: React.FC = () => {
   const mountedAtRef = useRef<number>(Date.now());
   const { health, error: healthError } = useHealth();
   const { data: metricsData, error: metricsError } = useMetrics();
+  const { data: dryRunData } = useDryRunStatus();
   const hasHealthData = Boolean(health);
   const hasTelemetryData = Boolean(metricsData);
-  const hasAnyData = hasHealthData || hasTelemetryData;
+  const hasDryRunData = Boolean(dryRunData?.running);
+  const hasAnyData = hasHealthData || hasTelemetryData || hasDryRunData;
   const hasAnyError = Boolean(healthError || metricsError);
   const isWithinGrace = Date.now() - mountedAtRef.current < 15000;
 
   const connectionState: 'connected' | 'degraded' | 'disconnected' | 'connecting' = (
-    hasHealthData && hasTelemetryData
+    hasHealthData && (hasTelemetryData || hasDryRunData)
       ? 'connected'
       : hasAnyData
         ? 'degraded'
@@ -153,7 +157,7 @@ const Dashboard: React.FC = () => {
   return (
     <div className="min-h-screen bg-zinc-950">
       <DashboardHeader onRefresh={handleRefresh} isRefreshing={isRefreshing} />
-      <ConnectionStatusBar state={connectionState} />
+      <ConnectionStatusBar state={connectionState} dryRunActive={hasDryRunData} />
       
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
         {/* Top Row - System Status & Telemetry */}

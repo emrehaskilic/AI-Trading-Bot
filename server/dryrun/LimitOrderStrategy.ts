@@ -17,6 +17,16 @@ const DEFAULT_CONFIG: LimitOrderStrategyConfig = {
   passiveOffsetBps: 2,
   maxSlices: 4,
 };
+const DEFAULT_LIMIT_TTL_MS = (() => {
+  const raw = Number(process.env.LIMIT_TTL_MS || 4000);
+  if (!Number.isFinite(raw)) return 4000;
+  return Math.max(250, Math.min(10_000, Math.trunc(raw)));
+})();
+const DEFAULT_MIN_FILL_RATIO = (() => {
+  const raw = Number(process.env.LIMIT_MIN_FILL_RATIO || 0.35);
+  if (!Number.isFinite(raw)) return 0.35;
+  return Math.max(0, Math.min(1, raw));
+})();
 
 function roundTo(value: number, decimals: number): number {
   const m = Math.pow(10, Math.max(0, decimals));
@@ -88,6 +98,9 @@ export class LimitOrderStrategy {
         price: roundTo(target, 6),
         timeInForce: 'GTC',
         reduceOnly: false,
+        ttlMs: DEFAULT_LIMIT_TTL_MS,
+        minFillRatio: DEFAULT_MIN_FILL_RATIO,
+        cancelOnMinFillMiss: true,
       }];
     }
 
@@ -106,6 +119,9 @@ export class LimitOrderStrategy {
         price: roundTo(price, 6),
         timeInForce: 'GTC',
         reduceOnly: false,
+        ttlMs: DEFAULT_LIMIT_TTL_MS,
+        minFillRatio: DEFAULT_MIN_FILL_RATIO,
+        cancelOnMinFillMiss: true,
       });
     }
     return orders;
@@ -145,6 +161,9 @@ export class LimitOrderStrategy {
           timeInForce: 'GTC',
           reduceOnly: false,
           postOnly: false,
+          ttlMs: DEFAULT_LIMIT_TTL_MS,
+          minFillRatio: DEFAULT_MIN_FILL_RATIO,
+          cancelOnMinFillMiss: true,
         }];
       }
       return fallbackMarket;
@@ -195,6 +214,9 @@ export class LimitOrderStrategy {
         timeInForce: 'GTC',
         reduceOnly: false,
         postOnly: true,
+        ttlMs: DEFAULT_LIMIT_TTL_MS,
+        minFillRatio: DEFAULT_MIN_FILL_RATIO,
+        cancelOnMinFillMiss: true,
       });
       return orders;
     }
@@ -220,6 +242,9 @@ export class LimitOrderStrategy {
         timeInForce: 'GTC',
         reduceOnly: false,
         postOnly: true,
+        ttlMs: DEFAULT_LIMIT_TTL_MS,
+        minFillRatio: DEFAULT_MIN_FILL_RATIO,
+        cancelOnMinFillMiss: true,
       });
     }
 

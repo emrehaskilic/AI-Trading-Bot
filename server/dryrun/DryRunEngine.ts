@@ -52,6 +52,8 @@ type PendingLimitOrder = {
   reasonCode?: DryRunReasonCode;
   addonIndex?: number;
   repriceAttempt?: number;
+  minFillRatio: number | null;
+  cancelOnMinFillMiss: boolean;
 };
 
 type FillComputation = {
@@ -251,6 +253,8 @@ export class DryRunEngine {
       reasonCode: o.reasonCode ?? null,
       addonIndex: o.addonIndex ?? null,
       repriceAttempt: o.repriceAttempt ?? null,
+      minFillRatio: o.minFillRatio ?? null,
+      cancelOnMinFillMiss: o.cancelOnMinFillMiss,
     }));
     return {
       walletBalance: fpRoundTo(this.walletBalance, 8),
@@ -301,12 +305,69 @@ export class DryRunEngine {
         reasonCode: (order.reasonCode as DryRunReasonCode) ?? undefined,
         addonIndex: Number.isFinite(order.addonIndex as number) ? Number(order.addonIndex) : undefined,
         repriceAttempt: Number.isFinite(order.repriceAttempt as number) ? Number(order.repriceAttempt) : undefined,
+        minFillRatio: Number.isFinite(order.minFillRatio as number) ? Number(order.minFillRatio) : null,
+        cancelOnMinFillMiss: Boolean(order.cancelOnMinFillMiss),
       });
     }
     if (Number.isFinite(snapshot.lastFundingBoundaryTsUTC)) {
       this.lastFundingBoundaryTsUTC = snapshot.lastFundingBoundaryTsUTC;
       this.fundingBoundaryInitialized = true;
     }
+  }
+
+  cancelPendingLimits(
+    timestampMs: number,
+    predicate?: (order: DryRunStateSnapshot['openLimitOrders'][number]) => boolean,
+    reason = 'MANUAL_CANCEL',
+    reasonCodeOverride?: DryRunReasonCode
+  ): DryRunOrderResult[] {
+    if (!Number.isFinite(timestampMs) || timestampMs <= 0) {
+      return [];
+    }
+
+    const canceled: DryRunOrderResult[] = [];
+    for (const pending of Array.from(this.pendingLimits.values())) {
+      const orderView: DryRunStateSnapshot['openLimitOrders'][number] = {
+        orderId: pending.orderId,
+        side: pending.side,
+        price: fpRoundTo(pending.price, 8),
+        remainingQty: fpRoundTo(pending.remainingQty, 8),
+        reduceOnly: pending.reduceOnly,
+        createdTsMs: pending.createdTsMs,
+        clientOrderId: pending.clientOrderId ?? null,
+        postOnly: pending.postOnly,
+        ttlMs: pending.ttlMs ?? null,
+        reasonCode: pending.reasonCode ?? null,
+        addonIndex: pending.addonIndex ?? null,
+        repriceAttempt: pending.repriceAttempt ?? null,
+        minFillRatio: pending.minFillRatio ?? null,
+        cancelOnMinFillMiss: pending.cancelOnMinFillMiss,
+      };
+      if (predicate && !predicate(orderView)) {
+        continue;
+      }
+
+      canceled.push(
+        this.makeCanceled(
+          pending.orderId,
+          pending.side,
+          'LIMIT',
+          fromFp(pending.remainingQty),
+          fromFp(pending.remainingQty),
+          reason,
+          reasonCodeOverride ?? pending.reasonCode,
+          {
+            clientOrderId: pending.clientOrderId,
+            postOnly: pending.postOnly,
+            reasonCode: reasonCodeOverride ?? pending.reasonCode,
+            addonIndex: pending.addonIndex,
+            repriceAttempt: pending.repriceAttempt,
+          }
+        )
+      );
+      this.pendingLimits.delete(pending.orderId);
+    }
+    return canceled;
   }
 
   private normalizeBook(orderBook: DryRunOrderBook): DryRunOrderBook {
@@ -388,6 +449,8 @@ export class DryRunEngine {
         reasonCode: pending.reasonCode,
         addonIndex: pending.addonIndex,
         repriceAttempt: pending.repriceAttempt,
+        minFillRatio: pending.minFillRatio,
+        cancelOnMinFillMiss: pending.cancelOnMinFillMiss,
       });
       out.push({
         result: execution.result,
@@ -429,6 +492,10 @@ export class DryRunEngine {
     const reasonCode = input.reasonCode ?? undefined;
     const addonIndex = Number.isFinite(input.addonIndex as number) ? Number(input.addonIndex) : undefined;
     const repriceAttempt = Number.isFinite(input.repriceAttempt as number) ? Number(input.repriceAttempt) : undefined;
+    const minFillRatio = Number.isFinite(input.minFillRatio as number)
+      ? Math.max(0, Math.min(1, Number(input.minFillRatio)))
+      : null;
+    const cancelOnMinFillMiss = Boolean(input.cancelOnMinFillMiss);
     const orderId = this.idGen.nextOrderId({
       timestampMs,
       side,
@@ -530,6 +597,8 @@ export class DryRunEngine {
       reasonCode,
       addonIndex,
       repriceAttempt,
+      minFillRatio,
+      cancelOnMinFillMiss,
     });
 
     if (type === 'LIMIT' && tif === 'GTC' && execution.remainingAfter > 0n) {
@@ -546,6 +615,8 @@ export class DryRunEngine {
         reasonCode,
         addonIndex,
         repriceAttempt,
+        minFillRatio,
+        cancelOnMinFillMiss,
       });
     }
 
@@ -573,6 +644,8 @@ export class DryRunEngine {
     reasonCode?: DryRunReasonCode;
     addonIndex?: number;
     repriceAttempt?: number;
+    minFillRatio?: number | null;
+    cancelOnMinFillMiss?: boolean;
   }): { result: DryRunOrderResult; remainingAfter: Fp; realizedPnlFp: Fp; feeFp: Fp } {
     const requestedQty = input.qty;
     const allowedQty = this.applyPositionCapBeforeExecution(input.side, requestedQty, input.reduceOnly, input.price, input.type, input.book);
@@ -601,6 +674,35 @@ export class DryRunEngine {
       forceFullClose: input.forced,
       markPriceFallback: input.type === 'LIMIT' ? input.price : this.bestMarketPrice(input.side, input.book),
     });
+
+    if (
+      fill.fillQty > 0n
+      && (input.minFillRatio ?? 0) > 0
+      && input.cancelOnMinFillMiss
+      && fromFp(fpDiv(fill.fillQty, requestedQty)) < Number(input.minFillRatio)
+    ) {
+      return {
+        result: this.makeCanceled(
+          input.orderId,
+          input.side,
+          input.type,
+          fromFp(requestedQty),
+          fromFp(requestedQty),
+          'MIN_FILL_NOT_MET',
+          input.reasonCode ?? undefined,
+          {
+            clientOrderId: input.clientOrderId,
+            postOnly: input.postOnly,
+            reasonCode: input.reasonCode,
+            addonIndex: input.addonIndex,
+            repriceAttempt: input.repriceAttempt,
+          }
+        ),
+        remainingAfter: fpZero,
+        realizedPnlFp: fpZero,
+        feeFp: fpZero,
+      };
+    }
 
     const pnlAndTrades = this.applyFillToPosition(input.side, fill.fillQty, fill.avgPrice, input.timestampMs);
     const feeRate = fill.fillQty > 0n

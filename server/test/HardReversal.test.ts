@@ -40,6 +40,12 @@ function makeInput(nowMs: number, overrides: Partial<StrategyInput> = {}): Strat
     },
     openInterest: null,
     absorption: { value: 1, side: 'sell' },
+    bootstrap: { backfillDone: true, barsLoaded1m: 1440 },
+    htf: {
+      m15: { close: 99, atr: 1, lastSwingHigh: 101, lastSwingLow: 98, structureBreakUp: false, structureBreakDn: false },
+      h1: { close: 100, atr: 2, lastSwingHigh: 102, lastSwingLow: 97, structureBreakUp: false, structureBreakDn: false },
+    },
+    execution: { tradeReady: true, addonReady: true, vetoReason: null },
     volatility: 1.5,
     position: null,
     ...overrides,
@@ -120,4 +126,39 @@ export function runTests() {
   const hasHardEntry = decision.actions.some((a) => a.reason === 'HARD_REVERSAL_ENTRY');
   assert(hasHardExit, 'persistent opposite pressure should emit EXIT_HARD');
   assert(!hasHardEntry, 'immediate reverse entry should remain suppressed');
+
+  const protectedFreshDecision = strategy.evaluate(makeInput(now + 2_000, {
+    position: {
+      side: 'LONG',
+      qty: 1,
+      entryPrice: 101,
+      unrealizedPnlPct: -0.002,
+      addsUsed: 0,
+      timeInPositionMs: 45_000,
+    },
+    market: {
+      price: 98.9,
+      vwap: 100.0,
+      delta1s: -4.5,
+      delta5s: -4.0,
+      deltaZ: -4.2,
+      cvdSlope: -2.0,
+      obiWeighted: -0.9,
+      obiDeep: -1.0,
+      obiDivergence: -0.5,
+    },
+    trades: {
+      lastUpdatedMs: now + 2_000,
+      printsPerSecond: 12,
+      tradeCount: 40,
+      aggressiveBuyVolume: 4,
+      aggressiveSellVolume: 30,
+      consecutiveBurst: { side: 'sell', count: 10 },
+    },
+    absorption: { value: 1, side: 'sell' },
+  }));
+  assert(
+    !protectedFreshDecision.actions.some((a) => a.reason === 'HARD_REVERSAL_ENTRY'),
+    'fresh positions should not flip immediately on the first opposite burst'
+  );
 }

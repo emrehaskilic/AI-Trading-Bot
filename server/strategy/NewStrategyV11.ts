@@ -15,6 +15,13 @@ import { DirectionalFlowScore } from './DirectionalFlowScore';
 import { RegimeSelector } from './RegimeSelector';
 
 const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
+const WINNER_ADD_MIN_UPNL_PCT = 0.0025;
+const WINNER_ADD_MIN_HOLD_MS = 30_000;
+const DEFAULT_FRESH_EXIT_PROTECT_MS = 90_000;
+const DEFAULT_FRESH_REVERSAL_PROTECT_MS = 180_000;
+const DEFAULT_FRESH_SOFT_REDUCE_PROTECT_MS = 180_000;
+const DEFAULT_SOFT_REDUCE_COOLDOWN_MS = 180_000;
+const DEFAULT_FRESH_EXIT_OVERRIDE_LOSS_PCT = -0.004;
 
 export class NewStrategyV11 {
   private readonly config: StrategyConfig;
@@ -30,6 +37,8 @@ export class NewStrategyV11 {
   private lastExitTs = 0;
   private lastExitSide: StrategySide | null = null;
   private lastAddTs = 0;
+  private lastSoftReduceTs = 0;
+  private lastSoftReduceSide: StrategySide | null = null;
   private lastDfsPercentile = 0.5;
   private lastDeltaZ = 0;
   private prevPrice: number | null = null;
@@ -98,6 +107,10 @@ export class NewStrategyV11 {
     }
 
     if (!gate.passed) {
+      if (!input.position) {
+        this.lastSoftReduceTs = 0;
+        this.lastSoftReduceSide = null;
+      }
       if (input.position) {
         const reduceAction = this.maybeSoftReduce(input, dfsOut.dfsPercentile, thresholds);
         if (reduceAction) {
@@ -112,6 +125,8 @@ export class NewStrategyV11 {
     }
 
     if (!input.position) {
+      this.lastSoftReduceTs = 0;
+      this.lastSoftReduceSide = null;
       const entryAction = this.evaluateEntry(input, dfsOut.dfsPercentile, dfsOut.dfs, regimeOut.regime, regimeOut.volLevel, thresholds, reasons);
       if (entryAction) {
         actions.push(entryAction);
@@ -189,6 +204,16 @@ export class NewStrategyV11 {
 
   private dataQualityGate(input: StrategyInput): { passed: boolean; reason: DecisionReason | null; details: Record<string, unknown> } {
     const details: Record<string, unknown> = {};
+    if (!input.bootstrap?.backfillDone || Number(input.bootstrap?.barsLoaded1m || 0) <= 0) {
+      return {
+        passed: false,
+        reason: 'GATE_PAUSED',
+        details: {
+          bootstrapDone: Boolean(input.bootstrap?.backfillDone),
+          barsLoaded1m: Number(input.bootstrap?.barsLoaded1m || 0),
+        },
+      };
+    }
     if (input.source !== 'real' || (input.openInterest?.source && input.openInterest.source !== 'real')) {
       return { passed: false, reason: 'GATE_SOURCE_NOT_REAL', details: { source: input.source } };
     }
@@ -257,6 +282,22 @@ export class NewStrategyV11 {
     regime: StrategyRegime,
     thresholds: { longEntry: number; shortEntry: number }
   ): StrategySide | null {
+    const bias15m = this.bias15m(input);
+    const veto1h = this.veto1h(input);
+    if (bias15m === 'UP' && veto1h !== 'DOWN') {
+      return 'LONG';
+    }
+    if (bias15m === 'DOWN' && veto1h !== 'UP') {
+      return 'SHORT';
+    }
+    if (bias15m === 'NEUTRAL') {
+      if (veto1h !== 'DOWN' && this.allowNeutralBiasContinuation(input, 'LONG', dfsP, regime, thresholds)) {
+        return 'LONG';
+      }
+      if (veto1h !== 'UP' && this.allowNeutralBiasContinuation(input, 'SHORT', dfsP, regime, thresholds)) {
+        return 'SHORT';
+      }
+    }
     if (regime === 'EV') {
       if (dfsP >= Math.max(0.9, thresholds.longEntry)) return 'LONG';
       if (dfsP <= Math.min(0.1, thresholds.shortEntry)) return 'SHORT';
@@ -278,23 +319,44 @@ export class NewStrategyV11 {
   ): boolean {
     const price = input.market.price;
     const vwap = input.market.vwap;
+    const bias15m = this.bias15m(input);
+    const veto1h = this.veto1h(input);
+    const pullbackDistancePct = vwap > 0 ? Math.abs(price - vwap) / vwap : 0;
+    const liquidTrendContext = this.isLiquidTrendContext(input);
+    const withinContinuationZone = pullbackDistancePct <= (liquidTrendContext ? 0.012 : 0.009);
+    const neutralBiasContinuationAllowed = bias15m === 'NEUTRAL'
+      && this.allowNeutralBiasContinuation(input, desiredSide, dfsP, regime, thresholds);
+
+    if (desiredSide === 'LONG' && (!(bias15m === 'UP' || neutralBiasContinuationAllowed) || veto1h === 'DOWN')) {
+      return false;
+    }
+    if (desiredSide === 'SHORT' && (!(bias15m === 'DOWN' || neutralBiasContinuationAllowed) || veto1h === 'UP')) {
+      return false;
+    }
+    if (!withinContinuationZone) {
+      return false;
+    }
 
     if (regime === 'TR') {
       if (desiredSide === 'LONG') {
         return (
-          price >= vwap &&
-          dfsP >= thresholds.longEntry &&
+          price >= (vwap * (liquidTrendContext ? 0.9985 : 0.999)) &&
+          dfsP >= Math.max(liquidTrendContext ? 0.55 : 0.6, thresholds.longEntry - (liquidTrendContext ? 0.25 : 0.2)) &&
+          input.market.deltaZ > 0 &&
+          input.market.obiWeighted > (liquidTrendContext ? -0.02 : 0) &&
           input.market.cvdSlope > 0 &&
           input.market.delta5s > 0 &&
-          input.market.obiDeep > 0
+          input.market.obiDeep > (liquidTrendContext ? -0.12 : -0.05)
         );
       }
       return (
-        price <= vwap &&
-        dfsP <= thresholds.shortEntry &&
+        price <= (vwap * (liquidTrendContext ? 1.0015 : 1.001)) &&
+        dfsP <= Math.min(liquidTrendContext ? 0.45 : 0.4, thresholds.shortEntry + (liquidTrendContext ? 0.25 : 0.2)) &&
+        input.market.deltaZ < 0 &&
+        input.market.obiWeighted < (liquidTrendContext ? 0.02 : 0) &&
         input.market.cvdSlope < 0 &&
         input.market.delta5s < 0 &&
-        input.market.obiDeep < 0
+        input.market.obiDeep < (liquidTrendContext ? 0.12 : 0.05)
       );
     }
 
@@ -324,29 +386,74 @@ export class NewStrategyV11 {
     return false;
   }
 
+  private isLiquidTrendContext(input: StrategyInput): boolean {
+    const spreadPct = Number(input.orderbook.spreadPct ?? 0);
+    const printsPerSecond = Number(input.trades.printsPerSecond || 0);
+    const tradeCount = Number(input.trades.tradeCount || 0);
+    return spreadPct > 0
+      && spreadPct <= 0.0004
+      && printsPerSecond >= 4
+      && tradeCount >= 12;
+  }
+
+  private allowNeutralBiasContinuation(
+    input: StrategyInput,
+    side: StrategySide,
+    dfsP: number,
+    regime: StrategyRegime,
+    thresholds: { longEntry: number; shortEntry: number }
+  ): boolean {
+    if (!this.isLiquidTrendContext(input)) return false;
+    if (regime === 'MR') return false;
+    const price = input.market.price;
+    const vwap = input.market.vwap;
+    const pullbackDistancePct = vwap > 0 ? Math.abs(price - vwap) / vwap : 0;
+    if (pullbackDistancePct > 0.012) return false;
+    if (side === 'LONG') {
+      return (
+        price >= (vwap * 0.9985) &&
+        dfsP >= Math.max(0.68, thresholds.longEntry - 0.15) &&
+        input.market.deltaZ > 0.75 &&
+        input.market.delta5s > 0 &&
+        input.market.cvdSlope > 0 &&
+        input.market.obiWeighted > -0.02 &&
+        input.market.obiDeep > -0.12
+      );
+    }
+    return (
+      price <= (vwap * 1.0015) &&
+      dfsP <= Math.min(0.32, thresholds.shortEntry + 0.15) &&
+      input.market.deltaZ < -0.75 &&
+      input.market.delta5s < 0 &&
+      input.market.cvdSlope < 0 &&
+      input.market.obiWeighted < 0.02 &&
+      input.market.obiDeep < 0.12
+    );
+  }
+
   private maybeAdd(input: StrategyInput, dfsP: number, volLevel: number): StrategyAction | null {
     if (!input.position) return null;
+    if (input.execution && !input.execution.addonReady) return null;
     if (input.position.addsUsed >= this.config.addSizing.length) return null;
     const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
-    const defensiveAddEnabled = Boolean(this.config.defensiveAddEnabled);
+    const timeInPositionMs = Math.max(0, Number(input.position.timeInPositionMs || 0));
     const isWinnerAdd = unrealizedPnlPct > 0;
-    if (!isWinnerAdd && !defensiveAddEnabled) return null;
+    if (!isWinnerAdd) return null;
     const side = input.position.side;
     const sideStrength = side === 'LONG' ? dfsP : (1 - dfsP);
     const lastSideStrength = side === 'LONG' ? this.lastDfsPercentile : (1 - this.lastDfsPercentile);
+    const bias15m = this.bias15m(input);
+    const veto1h = this.veto1h(input);
+    if (side === 'LONG' && (bias15m !== 'UP' || veto1h === 'DOWN')) return null;
+    if (side === 'SHORT' && (bias15m !== 'DOWN' || veto1h === 'UP')) return null;
     if (isWinnerAdd) {
+      if (unrealizedPnlPct < WINNER_ADD_MIN_UPNL_PCT) return null;
+      if (timeInPositionMs < WINNER_ADD_MIN_HOLD_MS) return null;
       if (sideStrength < 0.75 || sideStrength < lastSideStrength) return null;
-    } else {
-      const configuredMaxLossPct = Number.isFinite(this.config.maxLossPct as number)
-        ? Math.min(-0.0001, Number(this.config.maxLossPct))
-        : -0.02;
-      const defensiveAddFloorPct = configuredMaxLossPct * 0.7;
-      if (unrealizedPnlPct <= defensiveAddFloorPct) return null;
-      if (sideStrength < 0.62 || sideStrength < (lastSideStrength - 0.02)) return null;
     }
     if (side === 'LONG' && input.market.cvdSlope <= 0) return null;
     if (side === 'SHORT' && input.market.cvdSlope >= 0) return null;
-    if (Math.abs(input.market.price - input.market.vwap) > Math.abs(input.market.vwap) * 0.01) return null;
+    if (Math.abs(input.market.price - input.market.vwap) > Math.abs(input.market.vwap) * 0.0075) return null;
 
     const maxPositionSizePct = this.config.maxPositionSizePct ?? 0.25;
     const currentPositionPct = input.position.sizePct ?? 0;
@@ -354,13 +461,13 @@ export class NewStrategyV11 {
     const proposedAddSize = this.config.addSizing[addIndex] ?? 0.4;
     const newPositionPct = currentPositionPct + proposedAddSize;
     if (newPositionPct > maxPositionSizePct) return null;
-    const sizeMultiplier = isWinnerAdd ? proposedAddSize : (proposedAddSize * 0.5);
+    const sizeMultiplier = proposedAddSize;
     this.lastAddTs = input.nowMs;
 
     return {
       type: StrategyActionType.ADD,
       side: input.position.side,
-      reason: isWinnerAdd ? 'ADD_WINNER' : 'STRAT_ADD',
+      reason: 'ADD_WINNER',
       sizeMultiplier: clamp(sizeMultiplier, 0.1, 1),
       expectedPrice: input.market.price,
       metadata: {
@@ -380,20 +487,59 @@ export class NewStrategyV11 {
     thresholds: { longBreak: number; shortBreak: number }
   ): StrategyAction | null {
     if (!input.position) return null;
+    const side = input.position.side;
+    if (this.isFreshPosition(input, this.getFreshSoftReduceProtectMs())) return null;
+    if (
+      this.lastSoftReduceSide === side
+      && this.lastSoftReduceTs > 0
+      && (input.nowMs - this.lastSoftReduceTs) < this.getSoftReduceCooldownMs()
+    ) {
+      return null;
+    }
+    const bias15m = this.bias15m(input);
+    const veto1h = this.veto1h(input);
     const softReduceRequireProfit = this.config.softReduceRequireProfit ?? true;
     const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
     if (softReduceRequireProfit && unrealizedPnlPct <= 0) return null;
-    const side = input.position.side;
-    const weakening = this.lastDfsPercentile >= 0.85 && dfsP <= 0.6;
-    const breakLevel = side === 'LONG' ? dfsP <= thresholds.longBreak : dfsP >= thresholds.shortBreak;
-    if (weakening || breakLevel) {
+    if (side === 'LONG' && (bias15m === 'DOWN' || veto1h === 'DOWN')) {
+      this.lastSoftReduceTs = input.nowMs;
+      this.lastSoftReduceSide = side;
       return {
         type: StrategyActionType.REDUCE,
         side,
         reason: 'REDUCE_SOFT',
-        reducePct: weakening ? 0.5 : 0.3,
+        reducePct: 0.5,
         expectedPrice: input.market.price,
-        metadata: { unrealizedPnlPct },
+        metadata: { unrealizedPnlPct, mode: 'OPPOSITE_TREND' },
+      };
+    }
+    if (side === 'SHORT' && (bias15m === 'UP' || veto1h === 'UP')) {
+      this.lastSoftReduceTs = input.nowMs;
+      this.lastSoftReduceSide = side;
+      return {
+        type: StrategyActionType.REDUCE,
+        side,
+        reason: 'REDUCE_SOFT',
+        reducePct: 0.5,
+        expectedPrice: input.market.price,
+        metadata: { unrealizedPnlPct, mode: 'OPPOSITE_TREND' },
+      };
+    }
+    const weakening = this.lastDfsPercentile >= 0.85 && dfsP <= 0.6;
+    const breakLevel = side === 'LONG' ? dfsP <= thresholds.longBreak : dfsP >= thresholds.shortBreak;
+    const timeStop = Number(input.position.timeInPositionMs || 0) >= (18 * 3 * 60 * 1000) && side === 'LONG'
+      ? (bias15m !== 'UP' || dfsP < 0.58)
+      : Number(input.position.timeInPositionMs || 0) >= (18 * 3 * 60 * 1000) && (bias15m !== 'DOWN' || dfsP > 0.42);
+    if (weakening || breakLevel || timeStop) {
+      this.lastSoftReduceTs = input.nowMs;
+      this.lastSoftReduceSide = side;
+      return {
+        type: StrategyActionType.REDUCE,
+        side,
+        reason: 'REDUCE_SOFT',
+        reducePct: (weakening || timeStop) ? 0.5 : 0.3,
+        expectedPrice: input.market.price,
+        metadata: { unrealizedPnlPct, timeStop },
       };
     }
     return null;
@@ -408,6 +554,8 @@ export class NewStrategyV11 {
     const side = input.position.side;
     const price = input.market.price;
     const vwap = input.market.vwap;
+    const bias15m = this.bias15m(input);
+    const veto1h = this.veto1h(input);
     const vwapHoldTicks = this.config.hardRevTicks;
     const configuredMaxLossPct = Number.isFinite(this.config.maxLossPct as number)
       ? Math.min(-0.0001, Number(this.config.maxLossPct))
@@ -432,13 +580,22 @@ export class NewStrategyV11 {
         },
       };
     }
+    if (this.shouldProtectFreshExit(input, dfsP, thresholds)) {
+      return null;
+    }
     if (side === 'LONG') {
+      if (bias15m === 'DOWN' || veto1h === 'DOWN') {
+        return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
+      }
       const vwapHold = this.vwapBelowTicks >= Math.max(3, Math.floor(vwapHoldTicks / 2));
       if (price < vwap && vwapHold && dfsP <= thresholds.longBreak) {
         return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
       }
     }
     if (side === 'SHORT') {
+      if (bias15m === 'UP' || veto1h === 'UP') {
+        return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
+      }
       const vwapHold = this.vwapAboveTicks >= Math.max(3, Math.floor(vwapHoldTicks / 2));
       if (price > vwap && vwapHold && dfsP >= thresholds.shortBreak) {
         return { type: StrategyActionType.EXIT, side, reason: 'EXIT_HARD', expectedPrice: price };
@@ -452,6 +609,9 @@ export class NewStrategyV11 {
     dfsP: number
   ): { valid: boolean; reason: DecisionReason } {
     if (!input.position) return { valid: false, reason: 'HARD_REVERSAL_REJECTED' };
+    if (this.isFreshPosition(input, this.getFreshReversalProtectMs())) {
+      return { valid: false, reason: 'HARD_REVERSAL_REJECTED' };
+    }
     const side = input.position.side;
     const price = input.market.price;
     const vwap = input.market.vwap;
@@ -490,6 +650,96 @@ export class NewStrategyV11 {
     return { valid: false, reason: 'HARD_REVERSAL_REJECTED' };
   }
 
+  private shouldProtectFreshExit(
+    input: StrategyInput,
+    dfsP: number,
+    thresholds: { longBreak: number; shortBreak: number }
+  ): boolean {
+    if (!input.position) return false;
+    if (!this.isFreshPosition(input, this.getFreshExitProtectMs())) return false;
+    const unrealizedPnlPct = input.position.unrealizedPnlPct ?? 0;
+    if (unrealizedPnlPct <= this.getFreshExitOverrideLossPct()) {
+      return false;
+    }
+    return !this.hasSevereOppositePressure(input, dfsP, thresholds);
+  }
+
+  private hasSevereOppositePressure(
+    input: StrategyInput,
+    dfsP: number,
+    thresholds: { longBreak: number; shortBreak: number }
+  ): boolean {
+    if (!input.position) return false;
+    const side = input.position.side;
+    const bias15m = this.bias15m(input);
+    const veto1h = this.veto1h(input);
+    const burstSide = input.trades.consecutiveBurst.side;
+    const printsStrong = this.norm.percentile('prints', input.trades.printsPerSecond) >= 0.7 || input.trades.printsPerSecond >= 8;
+    const flowAligned = side === 'LONG'
+      ? input.market.deltaZ <= -1.2
+        && input.market.delta5s < 0
+        && input.market.cvdSlope < 0
+        && input.market.obiWeighted < -0.05
+        && input.market.obiDeep < -0.02
+      : input.market.deltaZ >= 1.2
+        && input.market.delta5s > 0
+        && input.market.cvdSlope > 0
+        && input.market.obiWeighted > 0.05
+        && input.market.obiDeep > 0.02;
+    const burstAligned = side === 'LONG' ? burstSide === 'sell' : burstSide === 'buy';
+    const dfsBroken = side === 'LONG'
+      ? dfsP <= Math.min(0.25, thresholds.longBreak - 0.1)
+      : dfsP >= Math.max(0.75, thresholds.shortBreak + 0.1);
+    const vwapPersist = side === 'LONG'
+      ? this.vwapBelowTicks >= Math.max(4, Math.floor(this.config.hardRevTicks / 2))
+      : this.vwapAboveTicks >= Math.max(4, Math.floor(this.config.hardRevTicks / 2));
+    const htfOpposes = side === 'LONG'
+      ? (bias15m === 'DOWN' || veto1h === 'DOWN')
+      : (bias15m === 'UP' || veto1h === 'UP');
+    return htfOpposes && flowAligned && dfsBroken && vwapPersist && (printsStrong || burstAligned);
+  }
+
+  private getPositionAgeMs(input: StrategyInput): number | null {
+    const ageMs = Number(input.position?.timeInPositionMs);
+    if (!Number.isFinite(ageMs) || ageMs <= 0) return null;
+    return ageMs;
+  }
+
+  private isFreshPosition(input: StrategyInput, protectMs: number): boolean {
+    const ageMs = this.getPositionAgeMs(input);
+    return ageMs !== null && ageMs < protectMs;
+  }
+
+  private getFreshExitProtectMs(): number {
+    const configured = Number(this.config.freshExitProtectS);
+    if (Number.isFinite(configured) && configured > 0) return configured * 1000;
+    return DEFAULT_FRESH_EXIT_PROTECT_MS;
+  }
+
+  private getFreshSoftReduceProtectMs(): number {
+    const configured = Number(this.config.freshSoftReduceProtectS);
+    if (Number.isFinite(configured) && configured > 0) return configured * 1000;
+    return DEFAULT_FRESH_SOFT_REDUCE_PROTECT_MS;
+  }
+
+  private getSoftReduceCooldownMs(): number {
+    const configured = Number(this.config.softReduceCooldownS);
+    if (Number.isFinite(configured) && configured > 0) return configured * 1000;
+    return DEFAULT_SOFT_REDUCE_COOLDOWN_MS;
+  }
+
+  private getFreshReversalProtectMs(): number {
+    const configured = Number(this.config.freshReversalProtectS);
+    if (Number.isFinite(configured) && configured > 0) return configured * 1000;
+    return DEFAULT_FRESH_REVERSAL_PROTECT_MS;
+  }
+
+  private getFreshExitOverrideLossPct(): number {
+    const configured = Number(this.config.freshExitOverrideLossPct);
+    if (Number.isFinite(configured) && configured < 0) return configured;
+    return DEFAULT_FRESH_EXIT_OVERRIDE_LOSS_PCT;
+  }
+
   private isInCooldown(side: StrategySide, nowMs: number, volLevel: number): boolean {
     if (this.lastExitTs <= 0 || !this.lastExitSide) return false;
     const flip = this.lastExitSide !== side;
@@ -521,6 +771,18 @@ export class NewStrategyV11 {
 
   private flipSide(side: StrategySide): StrategySide {
     return side === 'LONG' ? 'SHORT' : 'LONG';
+  }
+
+  private bias15m(input: StrategyInput): 'UP' | 'DOWN' | 'NEUTRAL' {
+    if (input.htf?.m15?.structureBreakUp) return 'UP';
+    if (input.htf?.m15?.structureBreakDn) return 'DOWN';
+    return 'NEUTRAL';
+  }
+
+  private veto1h(input: StrategyInput): 'NONE' | 'UP' | 'DOWN' {
+    if (input.htf?.h1?.structureBreakDn) return 'DOWN';
+    if (input.htf?.h1?.structureBreakUp) return 'UP';
+    return 'NONE';
   }
 
   private mhtBaseMs(regime: StrategyRegime): number {

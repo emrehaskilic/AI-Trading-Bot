@@ -11,10 +11,8 @@ export function runTests() {
   // Test OBI weighted and deep using a small synthetic orderbook
   const ob = createOrderbookState();
   // Bids at 100:10 and 99:5, asks at 101:7 and 102:3
-  ob.bids.set(100, 10);
-  ob.bids.set(99, 5);
-  ob.asks.set(101, 7);
-  ob.asks.set(102, 3);
+  ob.bids.push([100, 10], [99, 5]);
+  ob.asks.push([101, 7], [102, 3]);
   const legacy = new LegacyCalculator();
   const metrics = legacy.computeMetrics(ob);
   // Weighted OBI and deep OBI are normalized to [-1, +1]

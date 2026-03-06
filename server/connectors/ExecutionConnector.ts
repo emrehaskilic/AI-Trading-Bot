@@ -76,6 +76,7 @@ export interface ExecutionConnectorStatus {
   dualSidePosition: boolean | null;
   rateLimitWeightUsed: number;
   rateLimitBackoffUntilMs: number;
+  symbolLeverageCaps: Record<string, number>;
   updatedAtMs: number;
 }
 
@@ -105,6 +106,7 @@ export class ExecutionConnector {
   private readonly quotes = new Map<string, TestnetQuote>();
   private readonly readyBySymbol = new Map<string, { ready: boolean; reason: string | null }>();
   private readonly symbolRules = new Map<string, SymbolRules>();
+  private readonly preferredLeverageBySymbol = new Map<string, number>();
 
   private userWs: WebSocket | null = null;
   private marketWs: WebSocket | null = null;
@@ -172,6 +174,7 @@ export class ExecutionConnector {
       dualSidePosition: this.dualSidePosition,
       rateLimitWeightUsed: this.rateLimitState.weightUsed,
       rateLimitBackoffUntilMs: this.rateLimitState.backoffUntilMs,
+      symbolLeverageCaps: Object.fromEntries(Array.from(this.preferredLeverageBySymbol.entries())),
       updatedAtMs: Date.now(),
     };
   }
@@ -197,7 +200,24 @@ export class ExecutionConnector {
     this.emitStatus();
   }
 
-  getPreferredLeverage(): number {
+  setSymbolLeverageCaps(caps: Record<string, number>) {
+    this.preferredLeverageBySymbol.clear();
+    for (const [symbol, raw] of Object.entries(caps || {})) {
+      const leverage = Number(raw);
+      if (!Number.isFinite(leverage) || leverage <= 0) continue;
+      this.preferredLeverageBySymbol.set(symbol.toUpperCase(), Math.max(1, Math.trunc(leverage)));
+    }
+    this.emitStatus();
+  }
+
+  getPreferredLeverage(symbol?: string): number {
+    const normalized = String(symbol || '').toUpperCase();
+    if (normalized) {
+      const override = this.preferredLeverageBySymbol.get(normalized);
+      if (Number.isFinite(override as number) && Number(override) > 0) {
+        return Number(override);
+      }
+    }
     return this.preferredLeverage;
   }
 
@@ -533,7 +553,7 @@ export class ExecutionConnector {
         baseUrl: this.config.restBaseUrl,
         path: '/fapi/v1/order',
         params,
-        effective_leverage: this.preferredLeverage,
+        effective_leverage: this.getPreferredLeverage(symbol),
       },
     });
 
@@ -1176,7 +1196,7 @@ export class ExecutionConnector {
       throw new Error(`symbol_not_in_testnet_exchange_info:${symbol}`);
     }
 
-    const leverage = this.preferredLeverage;
+    const leverage = this.getPreferredLeverage(symbol);
     const leverageResponse = await this.signedRequest({
       path: '/fapi/v1/leverage',
       method: 'POST',
